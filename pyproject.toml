@@ -1,0 +1,18 @@
+[project]
+name = "build-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=2.1.1",
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+build-mcp = "build_mcp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
