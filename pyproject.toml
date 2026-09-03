@@ -1,18 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "build-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "构建 MCP 服务器"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
-    "httpx>=0.28.1",
-    "mcp[cli]>=2.1.1",
-    "pytest>=9.1.1",
+  "httpx>=0.28.1",
+  "mcp[cli]>=1.9.4",
+  "openai>=3.7.0",
+  "pydantic>=2.13.5",
+  "pytest>=8.4.1",
+  "pytest-asyncio>=1.0.0",
+  "pyyaml>=6.0.2",
 ]
 
-[project.scripts]
-build-mcp = "build_mcp:main"
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
-[build-system]
-requires = ["uv_build>=0.12.7,<0.13.0"]
-build-backend = "uv_build"
+[project.scripts]
+build_mcp = "build_mcp.__main__:main"
+conver_mcp = "build_mcp.client.conversation:cli_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/build_mcp"]
