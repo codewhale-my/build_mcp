@@ -16,6 +16,10 @@ dependencies = [
   "pytest>=8.4.1",
   "pytest-asyncio>=1.0.0",
   "pyyaml>=6.0.2",
+  "fastapi>=0.112",
+  "uvicorn[standard]",
+  "pydantic>=2",
+  "prompt-toolkit>=3.0.53",
 ]
 
 [tool.pytest.ini_options]
