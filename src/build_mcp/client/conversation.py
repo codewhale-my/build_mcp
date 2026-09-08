@@ -51,12 +51,12 @@ FILESYSTEM_ARGS = [
     FILESYSTEM_WORKSPACE
 ]
 
-TERMINAL_ARGS = ["--yes", "mcp-server-terminal"]
+TERMINAL_ARGS = ["--yes", "mcp-server-terminal", "--headless"]
 TERMINAL_ENV = {
     "NO_COLOR": "1",
     "FORCE_COLOR": "0",
-    # mcp SDK 只继承白名单 env(HOME/PATH/...),DISPLAY 会被过滤;
-    # visual 模式的 xterm 需要它连上 WSLg X server,故显式补回
+    # --headless 模式在 tmux 会话中静默执行命令、不弹 xterm 窗口，无需 DISPLAY；
+    # 保留 DISPLAY 仅为将来切回 visual 模式时兼容
     "DISPLAY": os.environ.get("DISPLAY") or ":0",
     "MCP_TERMINAL_ALLOWED_PATHS": str(Path.home() / "build-mcp"),
     "MCP_TERMINAL_BLOCKED_COMMANDS": "rm,rm‑rf,format,dd,mkfs",
@@ -98,7 +98,7 @@ MCP_SERVERS = [
             command="bash",
             args=[
                 "-c",
-                r'''npx --yes mcp-server-terminal 2>&1 | while IFS= read -r line; do if [[ "$line" == "{"* ]]; then echo "$line"; else >&2 echo "$line"; fi; done'''
+                r'''npx --yes mcp-server-terminal --headless 2>&1 | while IFS= read -r line; do if [[ "$line" == "{"* ]]; then echo "$line"; else >&2 echo "$line"; fi; done'''
             ],
             env=TERMINAL_ENV
         )
@@ -268,7 +268,7 @@ async def agent_loop_stream(
     )
 
     thinking_parts: List[str] = []   # 各轮思考文本，done 时合并
-    max_round = 50
+    max_round = 1000
 
     for _ in range(max_round):
         req = _build_llm_request(work_messages, openai_tools)

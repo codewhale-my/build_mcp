@@ -179,29 +179,6 @@ header{
 .bubble pre::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:6px}
 /* ---------- 错误气泡 ---------- */
 .bubble.err{background:var(--err-bg);border:1px solid var(--err-bd);color:var(--err-tx)}
-/* ---------- 思考过程面板 ---------- */
-.think{
-  width:100%;margin:0 0 8px;border:1px solid var(--border);
-  border-radius:12px;background:var(--code-bg);overflow:hidden;
-}
-.think summary{
-  cursor:pointer;list-style:none;display:flex;align-items:center;gap:7px;
-  padding:7px 12px;font-size:12.5px;color:var(--text2);user-select:none;
-  background:var(--panel-solid);transition:color .15s;
-}
-.think summary::-webkit-details-marker{display:none}
-.think summary:hover{color:var(--text1)}
-.think[open] summary{border-bottom:1px solid var(--border)}
-.think .t-ico{flex:none}
-.think .t-arrow{margin-left:auto;font-size:9px;opacity:.6;transition:transform .2s}
-.think[open] .t-arrow{transform:rotate(180deg)}
-.think-body{
-  padding:10px 13px;max-height:300px;overflow:auto;
-  font-size:12.8px;line-height:1.65;color:var(--text2);
-}
-.think-body p{margin:0 0 8px}.think-body p:last-child{margin-bottom:0}
-.think-body pre{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px}
-.think-body code{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--border);padding:1px 5px;border-radius:5px}
 /* ---------- 思考动画 ---------- */
 .typing{display:flex;align-items:center;gap:10px}
 .dots{display:inline-flex;gap:4px;padding:2px 0}
@@ -224,7 +201,7 @@ header{
   padding:2px 8px;transition:.15s;display:flex;align-items:center;gap:3px;
 }
 .stop-mini:hover{color:var(--err-tx);border-color:var(--err-bd)}
-.bubble.live{color:var(--text2)}
+.bubble.live{color:var(--text2);white-space:pre-wrap;word-break:break-word;line-height:1.6}
 .tool-chips{display:flex;flex-wrap:wrap;gap:6px;width:100%;margin:0 0 8px}
 .tchip{
   font-size:12px;padding:3px 10px;border-radius:999px;
@@ -235,6 +212,15 @@ header{
 .tchip.run::after{content:'…';animation:blink 1.2s infinite}
 .tchip.ok{color:#16a34a;border-color:rgba(22,163,74,.4);background:rgba(22,163,74,.07)}
 .tchip.err{color:var(--err-tx);border-color:var(--err-bd);background:var(--err-bg)}
+/* 流式时气泡下方的工具动作行（浅色小字日志） */
+.live-acts{width:100%;margin-top:6px;display:flex;flex-direction:column;gap:4px}
+.live-act{display:flex;align-items:center;gap:7px;font-size:12.2px;color:var(--text2)}
+.live-act .a-dot{width:6px;height:6px;border-radius:50%;background:var(--accent1);flex:none;animation:a-pulse 1.1s ease-in-out infinite}
+.live-act .a-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.live-act.done{opacity:.5}
+.live-act.done .a-dot{background:#16a34a;animation:none}
+.live-act.fail .a-dot{background:var(--err-tx);animation:none}
+@keyframes a-pulse{0%,100%{opacity:.3}50%{opacity:1}}
 /* ============ 欢迎页 ============ */
 .welcome{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 8px 6vh}
 .welcome .wlogo{
@@ -549,13 +535,7 @@ function buildMsg(item){
     }else if(item.role==='error'){
       body='<div class="bubble err">'+esc(item.text)+'</div>';
     }else{
-      // 有思考过程则在其上方放一个可折叠的"思考过程"面板（默认收起）
-      let think='';
-      if(item.thinking&&String(item.thinking).trim()){
-        think='<details class="think"><summary><span class="t-ico">🧠</span>思考过程<span class="t-arrow">▼</span></summary>'+
-              '<div class="think-body">'+renderMarkdown(String(item.thinking))+'</div></details>';
-      }
-      body=think+'<div class="bubble">'+renderMarkdown(item.text)+'</div>';
+      body='<div class="bubble">'+renderMarkdown(item.text)+'</div>';
     }
     wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+now()+'</div>'+body+'</div>';
   }
@@ -616,9 +596,10 @@ function showWelcome(){
 }
 
 /* ================= 发送逻辑（SSE 流式） ================= */
-let liveMsgEl=null,liveBubbleEl=null,liveThinkBox=null,liveThinkBodyEl=null,liveChipsEl=null;
+let liveMsgEl=null,liveBubbleEl=null,liveChipsEl=null,liveActsEl=null;
+let liveActLines={}; // 工具名 -> 最近一条动作行元素
 function liveCleanup(){
-  liveMsgEl=null;liveBubbleEl=null;liveThinkBox=null;liveThinkBodyEl=null;liveChipsEl=null;
+  liveMsgEl=null;liveBubbleEl=null;liveChipsEl=null;liveActsEl=null;liveActLines={};
 }
 function pinnedToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight<160}
 function scrollKeep(){if(pinnedToBottom())scrollBottom()}
@@ -630,16 +611,10 @@ function ensureLiveMsg(){
   chatBox.appendChild(liveMsgEl);
   liveBubbleEl=liveMsgEl.querySelector('#liveBubble');
   liveBubbleEl.textContent='⏳ 正在思考…';
+  liveActsEl=document.createElement('div');liveActsEl.className='live-acts';
+  liveBubbleEl.parentNode.appendChild(liveActsEl);
   liveMsgEl.querySelector('#liveStop').onclick=()=>controller&&controller.abort();
   scrollKeep();
-}
-function ensureThinkPanel(){
-  if(liveThinkBox)return;
-  liveThinkBox=document.createElement('details');
-  liveThinkBox.className='think';liveThinkBox.open=true;
-  liveThinkBox.innerHTML='<summary><span class="t-ico">🧠</span>思考过程<span class="t-arrow">▼</span></summary><div class="think-body"></div>';
-  liveThinkBodyEl=liveThinkBox.querySelector('.think-body');
-  liveBubbleEl.parentNode.insertBefore(liveThinkBox,liveBubbleEl);
 }
 function ensureChipsRow(){
   if(liveChipsEl)return;
@@ -662,7 +637,7 @@ async function send(){
   controller=new AbortController();
   ensureLiveMsg();
   const chips={};
-  let answer='',thinking='',hasThinkPanel=false;
+  let answer='';
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
@@ -688,7 +663,6 @@ async function send(){
       const el=liveMsgEl;el&&el.remove();liveCleanup();
       if(data&&typeof data.answer==='string'){
         const it={role:'assistant',text:data.answer};
-        if(data.thinking&&String(data.thinking).trim())it.thinking=String(data.thinking);
         history.push(it);saveHist();chatBox.appendChild(buildMsg(it));scrollKeep();
       }else{
         push({role:'error',text:'返回格式异常：'+JSON.stringify(data).slice(0,300)});
@@ -710,12 +684,7 @@ async function send(){
         const payload=raw.slice(5).trim();
         if(!payload||payload==='[DONE]')continue;
         let ev=null;try{ev=JSON.parse(payload)}catch(e){continue}
-        if(ev.type==='thinking'&&ev.delta){
-          thinking+=ev.delta;
-          if(!hasThinkPanel){hasThinkPanel=true;ensureThinkPanel()}
-          if(liveThinkBodyEl)liveThinkBodyEl.textContent=thinking;
-          scrollKeep();
-        }else if(ev.type==='answer'&&ev.delta){
+        if(ev.type==='answer'&&ev.delta){
           answer+=ev.delta;
           if(liveBubbleEl){
             if(liveBubbleEl.textContent==='⏳ 正在思考…')liveBubbleEl.textContent='';
@@ -725,6 +694,15 @@ async function send(){
         }else if(ev.type==='tool'&&ev.name){
           const name=ev.name;
           if(ev.status==='start'){
+            // 气泡下方追加一条浅色动作行；同名工具重试时先把上一条收尾
+            const prev=liveActLines[name];
+            if(prev&&prev.className==='live-act'){
+              prev.className='live-act done';
+              prev.querySelector('.a-txt').textContent='✓ '+name;
+            }
+            const line=document.createElement('div');line.className='live-act';
+            line.innerHTML='<span class="a-dot"></span><span class="a-txt">正在调用 '+esc(name)+'</span>';
+            liveActsEl.appendChild(line);liveActLines[name]=line;
             let chip=chips[name];
             if(chip){ // 同名工具重试：复用徽章，重置为运行态
               chip.className='tchip run';chip.textContent='🔧 '+name;chip.title='';
@@ -739,11 +717,16 @@ async function send(){
             const chip=chips[name];
             if(ev.status==='ok'){chip.className='tchip ok';chip.textContent='✅ '+name}
             else{chip.className='tchip err';chip.textContent='❌ '+name;if(ev.note)chip.title=ev.note}
+            // 同步更新气泡下方的动作行状态
+            const line=liveActLines[name];
+            if(line){
+              line.className='live-act '+(ev.status==='ok'?'done':'fail');
+              line.querySelector('.a-txt').textContent=(ev.status==='ok'?'✓ ':'✕ ')+name;
+            }
           }
           scrollKeep();
         }else if(ev.type==='done'){
           if(ev.answer!==undefined)answer=ev.answer;
-          if(ev.thinking!==undefined)thinking=ev.thinking;
           completed=true;
         }else if(ev.type==='error'){
           throw new Error(ev.message||'服务端流式错误');
@@ -753,7 +736,6 @@ async function send(){
     }
     // 结束：用最终全文渲染替换直播气泡
     const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）'};
-    if(thinking&&thinking.trim())it.thinking=thinking;
     finishLiveStream(it);
   }catch(err){
     const el=liveMsgEl;el&&el.remove();liveCleanup();
