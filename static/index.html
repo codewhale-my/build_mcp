@@ -108,6 +108,16 @@ header{
 }
 .hbtn:hover{color:var(--text);border-color:var(--border-strong);background:var(--panel-solid)}
 .hbtn svg{width:17px;height:17px}
+/* 当前登录用户徽标 */
+.user-badge{
+  display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 13px;
+  border-radius:999px;border:1px solid var(--border);background:var(--panel);
+  font-size:12.5px;color:var(--text2);max-width:150px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;
+}
+.user-badge::before{content:"👤";font-size:12px;flex:none}
+.user-badge[hidden]{display:none}
+@media (max-width:600px){.user-badge{max-width:92px;padding:0 10px;font-size:11.5px;height:31px}}
 /* ============ 消息区 ============ */
 /* 隐藏原生滚动条（长度由浏览器控制，无法自定义），改用自绘"米粒"指示条 */
 #chatBox{
@@ -202,25 +212,25 @@ header{
 }
 .stop-mini:hover{color:var(--err-tx);border-color:var(--err-bd)}
 .bubble.live{color:var(--text2);white-space:pre-wrap;word-break:break-word;line-height:1.6}
-.tool-chips{display:flex;flex-wrap:wrap;gap:6px;width:100%;margin:0 0 8px}
-.tchip{
-  font-size:12px;padding:3px 10px;border-radius:999px;
-  border:1px solid var(--border);background:var(--panel-solid);color:var(--text2);
-  display:inline-flex;align-items:center;gap:4px;
+/* 流式正文中穿插的工具动作行：紧跟所在段落，浅色小字 */
+.live-act{
+  display:flex;align-items:center;gap:8px;
+  margin:10px 0 12px;padding:2px 0;
+  font-size:12.4px;line-height:1.45;color:var(--text2);
+  user-select:none;
 }
-.tchip.run{border-color:var(--accent1);color:var(--accent1)}
-.tchip.run::after{content:'…';animation:blink 1.2s infinite}
-.tchip.ok{color:#16a34a;border-color:rgba(22,163,74,.4);background:rgba(22,163,74,.07)}
-.tchip.err{color:var(--err-tx);border-color:var(--err-bd);background:var(--err-bg)}
-/* 流式时气泡下方的工具动作行（浅色小字日志） */
-.live-acts{width:100%;margin-top:6px;display:flex;flex-direction:column;gap:4px}
-.live-act{display:flex;align-items:center;gap:7px;font-size:12.2px;color:var(--text2)}
-.live-act .a-dot{width:6px;height:6px;border-radius:50%;background:var(--accent1);flex:none;animation:a-pulse 1.1s ease-in-out infinite}
-.live-act .a-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.live-act.done{opacity:.5}
-.live-act.done .a-dot{background:#16a34a;animation:none}
-.live-act.fail .a-dot{background:var(--err-tx);animation:none}
-@keyframes a-pulse{0%,100%{opacity:.3}50%{opacity:1}}
+.live-act .a-ico{
+  flex:none;width:15px;height:15px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-size:9px;font-weight:700;color:#fff;
+}
+.live-act.run .a-ico{background:var(--accent1);animation:a-pulse 1.1s ease-in-out infinite}
+.live-act.done{opacity:.55}
+.live-act.done .a-ico{background:#16a34a}
+.live-act.fail{opacity:.7}
+.live-act.fail .a-ico{background:var(--err-tx)}
+.live-act .a-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@keyframes a-pulse{0%,100%{opacity:.35}50%{opacity:1}}
 /* ============ 欢迎页 ============ */
 .welcome{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 8px 6vh}
 .welcome .wlogo{
@@ -363,11 +373,13 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
       <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l2.3 7.7L22 12l-7.7 2.3L12 22l-2.3-7.7L2 12l7.7-2.3z" fill="#fff"/></svg>
     </div>
     <h2>MCP Agent</h2>
-    <p class="auth-sub">此服务包含文件读写与终端执行能力<br>请输入访问密码后使用</p>
-    <input id="authPwd" class="auth-input" type="password" placeholder="输入访问密码" autocomplete="current-password">
-    <button id="authLoginBtn" class="auth-btn">进 入</button>
+    <p class="auth-sub">此服务包含文件读写与终端执行能力<br>首次使用请填写邀请码完成注册</p>
+    <input id="authUser" class="auth-input" type="text" placeholder="用户名（2-24 位中文/字母/数字）" autocomplete="username">
+    <input id="authPwd" class="auth-input" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password">
+    <input id="authInvite" class="auth-input" type="text" placeholder="邀请码（新用户注册时填写）" autocomplete="off">
+    <button id="authLoginBtn" class="auth-btn">登 录 / 注 册</button>
     <p id="authErr" class="auth-err"></p>
-    <p class="auth-tip">演示服务 · 请勿将链接与密码转发给无关人员</p>
+    <p class="auth-tip">已有账号直接登录、无需邀请码<br>个人文件空间与历史消息相互隔离</p>
   </div>
 </div>
 
@@ -389,6 +401,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
       </div>
     </div>
     <div class="hbtns">
+      <span id="userBadge" class="user-badge" hidden></span>
       <button class="hbtn" id="clearBtn" title="清空对话">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14z"/></svg>
       </button>
@@ -421,11 +434,18 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 /* ================= 工具函数 ================= */
 const $ = s => document.querySelector(s);
 const chatBox = $('#chatBox'), inputBox = $('#inputBox'), sendBtn = $('#sendBtn');
-const THEME_KEY = 'mcp-theme', HIST_KEY = 'mcp-chat-history-v1';
+const THEME_KEY = 'mcp-theme';
 const TOKEN_KEY = 'mcp-auth-token';
-let authToken='';
+let authToken='', me={name:''};
 try{authToken=localStorage.getItem(TOKEN_KEY)||''}catch(e){}
-const authOverlay=$('#authOverlay'), authPwd=$('#authPwd'), authErr=$('#authErr'), authLoginBtn=$('#authLoginBtn');
+const authOverlay=$('#authOverlay'), authUser=$('#authUser'), authPwd=$('#authPwd'),
+      authInvite=$('#authInvite'), authErr=$('#authErr'), authLoginBtn=$('#authLoginBtn');
+const userBadge=$('#userBadge');
+function updateUserBadge(){
+  if(!userBadge)return;
+  if(me&&me.name){userBadge.textContent=me.name;userBadge.hidden=false}
+  else userBadge.hidden=true;
+}
 
 function esc(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -500,17 +520,31 @@ function renderMarkdown(src){
 }
 
 /* ================= 消息管理 ================= */
-let history=[];   // {role:'user'|'assistant'|'error'|'loading', text}
+let history=[];   // {role:'user'|'assistant'|'error'|'loading', text, ts?}
 let busy=false, controller=null;
 
-function loadHist(){
-  try{
-    const h=JSON.parse(localStorage.getItem(HIST_KEY)||'[]');
-    // 过滤掉历史上误存的 loading 残骸
-    history=Array.isArray(h)?h.filter(x=>x&&x.role&&x.role!=='loading'):[];
-  }catch(e){history=[]}
+// 显示用的时刻：历史消息显示其真实时间，当场新消息显示当前时间
+function fmtHM(ts){
+  if(!ts)return now();
+  const d=new Date(ts*1000);
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
 }
-function saveHist(){try{localStorage.setItem(HIST_KEY,JSON.stringify(history.slice(-200)))}catch(e){}}
+// 从服务端拉取“当前用户自己的”历史消息（按用户隔离）
+async function loadServerHistory(){
+  try{
+    const r=await fetch('/api/history',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok){throw new Error('HTTP '+r.status)}
+    const d=await r.json();
+    if(d&&d.username)me.name=d.username;
+    history=(d&&Array.isArray(d.messages)?d.messages:[])
+      .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
+      .map(m=>({role:m.role,text:m.text,ts:m.ts}));
+  }catch(e){
+    history=[];
+  }
+  updateUserBadge();
+  renderAll();
+}
 
 const STAR='<svg viewBox="0 0 24 24" fill="none"><path d="M12 2l2.3 7.7L22 12l-7.7 2.3L12 22l-2.3-7.7L2 12l7.7-2.3z" fill="#fff"/></svg>';
 
@@ -524,7 +558,7 @@ function buildMsg(item){
   const wrap=document.createElement('div');
   if(item.role==='user'){
     wrap.className='msg user';
-    wrap.innerHTML='<div class="col"><div class="time">'+now()+'</div><div class="bubble">'+esc(item.text)+'</div></div>';
+    wrap.innerHTML='<div class="col"><div class="time">'+fmtHM(item.ts)+'</div><div class="bubble">'+esc(item.text)+'</div></div>';
   }else{
     wrap.className='msg bot';
     if(item.role==='loading')wrap.id='loadingMsg'; // 标记 loading 气泡，便于回复后从 DOM 移除
@@ -537,11 +571,11 @@ function buildMsg(item){
     }else{
       body='<div class="bubble">'+renderMarkdown(item.text)+'</div>';
     }
-    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+now()+'</div>'+body+'</div>';
+    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+'</div>';
   }
   return wrap;
 }
-function push(item){history.push(item);chatBox.appendChild(buildMsg(item));saveHist();scrollBottom()}
+function push(item){history.push(item);chatBox.appendChild(buildMsg(item));scrollBottom()}
 function removeLoading(){
   // loading 仅是视觉态，不入 history；只删 DOM
   const el=document.getElementById('loadingMsg');
@@ -596,10 +630,10 @@ function showWelcome(){
 }
 
 /* ================= 发送逻辑（SSE 流式） ================= */
-let liveMsgEl=null,liveBubbleEl=null,liveChipsEl=null,liveActsEl=null;
-let liveActLines={}; // 工具名 -> 最近一条动作行元素
+let liveMsgEl=null,liveBubbleEl=null,liveTextNode=null;
+let liveActLines={}; // 工具名 -> 最近一条动作行元素（完成时更新 / 同名重试收尾）
 function liveCleanup(){
-  liveMsgEl=null;liveBubbleEl=null;liveChipsEl=null;liveActsEl=null;liveActLines={};
+  liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};
 }
 function pinnedToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight<160}
 function scrollKeep(){if(pinnedToBottom())scrollBottom()}
@@ -610,23 +644,66 @@ function ensureLiveMsg(){
     '<div class="bubble live" id="liveBubble"></div></div>';
   chatBox.appendChild(liveMsgEl);
   liveBubbleEl=liveMsgEl.querySelector('#liveBubble');
-  liveBubbleEl.textContent='⏳ 正在思考…';
-  liveActsEl=document.createElement('div');liveActsEl.className='live-acts';
-  liveBubbleEl.parentNode.appendChild(liveActsEl);
+  // 占位也放进文本节点流，保证正文/工具行能与它正确衔接
+  liveTextNode=document.createTextNode('⏳ 正在思考…');
+  liveBubbleEl.appendChild(liveTextNode);
   liveMsgEl.querySelector('#liveStop').onclick=()=>controller&&controller.abort();
   scrollKeep();
 }
-function ensureChipsRow(){
-  if(liveChipsEl)return;
-  liveChipsEl=document.createElement('div');liveChipsEl.className='tool-chips';
-  liveBubbleEl.parentNode.insertBefore(liveChipsEl,liveBubbleEl);
+// 工具名 -> 中文短名（未收录则显示原名）
+const TOOL_LABEL={
+  list_directory:'列出目录',read_text_file:'读取文件',write_file:'写入文件',
+  edit_file:'修改文件',search_files:'搜索文件',get_file_info:'查看文件信息',
+  directory_tree:'查看目录树',read_multiple_files:'批量读取文件',
+  create_directory:'新建目录',move_file:'移动文件',copy_file:'复制文件',
+  delete_file:'删除文件',run_command:'执行终端命令',
+  terminal_session_create:'开启终端',web_search:'联网搜索',fetch_page:'抓取网页'
+};
+function toolLabel(name){
+  const t=String(name||'');
+  if(t.startsWith('amap_'))return '地图·'+t.slice(5);
+  if(TOOL_LABEL[t])return TOOL_LABEL[t];
+  return t;
+}
+// 追加一段流式正文（始终在"当前文本段"的文本节点上续写）
+function liveAppend(s){
+  if(!liveTextNode){
+    liveTextNode=document.createTextNode(s);liveBubbleEl.appendChild(liveTextNode);
+  }else if(liveTextNode.data==='⏳ 正在思考…'){
+    liveTextNode.data=s; // 占位直接转正文
+  }else{
+    liveTextNode.appendData(s);
+  }
+}
+// 结束当前文本段：之后的正文会从工具行下方另起一段
+function liveBreakSegment(){
+  if(liveTextNode&&liveTextNode.data==='⏳ 正在思考…'){liveTextNode.remove();liveTextNode=null;}
+  liveTextNode=null;
+}
+// 在当前文本段正下方插入一条"正在执行"的工具行
+function addLiveToolLine(name){
+  const line=document.createElement('div');line.className='live-act run';
+  line.innerHTML='<span class="a-ico"></span><span class="a-txt"></span>';
+  liveBubbleEl.appendChild(line);
+  const label=toolLabel(name);
+  line.dataset.label=label;
+  line.querySelector('.a-txt').textContent='正在执行 '+label+' …';
+  return line;
+}
+// 工具行收尾：成功打勾变淡只留工具名，失败打叉带提示
+function settleLiveToolLine(line,ok,note){
+  if(!line)return;
+  line.className='live-act '+(ok?'done':'fail');
+  line.querySelector('.a-ico').textContent=ok?'✓':'✕';
+  line.querySelector('.a-txt').textContent=ok?(line.dataset.label||''):('失败：'+(line.dataset.label||''));
+  if(note)line.title=note;
 }
 function finishLiveStream(item){
-  // 用正式渲染替换直播节点，并写入历史（不重复 append）
+  // 用正式渲染替换直播节点，并写入页面历史（服务端已完成持久化，无需本地保存）
   const fresh=buildMsg(item);
   if(liveMsgEl)liveMsgEl.replaceWith(fresh);
   liveCleanup();
-  history.push(item);saveHist();scrollKeep();
+  history.push(item);scrollKeep();
 }
 async function send(){
   const q=inputBox.value.trim();
@@ -636,7 +713,6 @@ async function send(){
   busy=true;sendBtn.disabled=true;
   controller=new AbortController();
   ensureLiveMsg();
-  const chips={};
   let answer='';
   try{
     const resp=await fetch('/api/chat',{
@@ -663,7 +739,7 @@ async function send(){
       const el=liveMsgEl;el&&el.remove();liveCleanup();
       if(data&&typeof data.answer==='string'){
         const it={role:'assistant',text:data.answer};
-        history.push(it);saveHist();chatBox.appendChild(buildMsg(it));scrollKeep();
+        history.push(it);chatBox.appendChild(buildMsg(it));scrollKeep();
       }else{
         push({role:'error',text:'返回格式异常：'+JSON.stringify(data).slice(0,300)});
       }
@@ -686,43 +762,18 @@ async function send(){
         let ev=null;try{ev=JSON.parse(payload)}catch(e){continue}
         if(ev.type==='answer'&&ev.delta){
           answer+=ev.delta;
-          if(liveBubbleEl){
-            if(liveBubbleEl.textContent==='⏳ 正在思考…')liveBubbleEl.textContent='';
-            liveBubbleEl.textContent=answer;
-          }
+          if(liveBubbleEl)liveAppend(ev.delta);
           scrollKeep();
         }else if(ev.type==='tool'&&ev.name){
           const name=ev.name;
           if(ev.status==='start'){
-            // 气泡下方追加一条浅色动作行；同名工具重试时先把上一条收尾
+            // 结束当前文本段，把工具行插在这段文字正下方
             const prev=liveActLines[name];
-            if(prev&&prev.className==='live-act'){
-              prev.className='live-act done';
-              prev.querySelector('.a-txt').textContent='✓ '+name;
-            }
-            const line=document.createElement('div');line.className='live-act';
-            line.innerHTML='<span class="a-dot"></span><span class="a-txt">正在调用 '+esc(name)+'</span>';
-            liveActsEl.appendChild(line);liveActLines[name]=line;
-            let chip=chips[name];
-            if(chip){ // 同名工具重试：复用徽章，重置为运行态
-              chip.className='tchip run';chip.textContent='🔧 '+name;chip.title='';
-            }else{
-              ensureChipsRow();
-              chip=document.createElement('span');
-              chip.className='tchip run';chip.textContent='🔧 '+name;
-              liveChipsEl.appendChild(chip);
-              chips[name]=chip;
-            }
-          }else if(chips[name]){
-            const chip=chips[name];
-            if(ev.status==='ok'){chip.className='tchip ok';chip.textContent='✅ '+name}
-            else{chip.className='tchip err';chip.textContent='❌ '+name;if(ev.note)chip.title=ev.note}
-            // 同步更新气泡下方的动作行状态
-            const line=liveActLines[name];
-            if(line){
-              line.className='live-act '+(ev.status==='ok'?'done':'fail');
-              line.querySelector('.a-txt').textContent=(ev.status==='ok'?'✓ ':'✕ ')+name;
-            }
+            if(prev&&prev.className==='live-act')settleLiveToolLine(prev,true); // 同名重试：上一行先收尾
+            liveBreakSegment();
+            liveActLines[name]=addLiveToolLine(name);
+          }else{
+            settleLiveToolLine(liveActLines[name],ev.status==='ok',ev.note||'');
           }
           scrollKeep();
         }else if(ev.type==='done'){
@@ -774,40 +825,48 @@ function syncThemeIcon(){
   document.querySelector('.ic-moon').style.display=dark?'none':'';
   document.querySelector('.ic-sun').style.display=dark?'':'none';
 }
-$('#clearBtn').onclick=()=>{
+$('#clearBtn').onclick=async()=>{
   if(!history.length)return;
-  if(!confirm('确定清空当前对话吗？'))return;
-  history=[];saveHist();renderAll();inputBox.focus();
+  if(!confirm('确定清空当前对话吗？（只清你自己的历史）'))return;
+  try{await fetch('/api/history',{method:'DELETE',headers:{'Authorization':'Bearer '+authToken}})}catch(e){}
+  history=[];renderAll();inputBox.focus();
 };
 
 /* ================= 鉴权 ================= */
 function showAuth(msg){
   if(msg&&authErr)authErr.textContent=msg;
   authOverlay.hidden=false;
-  setTimeout(()=>{if(authPwd)authPwd.focus()},50);
+  setTimeout(()=>{if(authUser)authUser.focus()},50);
 }
 function hideAuth(){
   authOverlay.hidden=true;
   if(authErr)authErr.textContent='';
 }
-async function doLogin(){
-  const pwd=authPwd?authPwd.value:'';
-  if(!pwd||authLoginBtn.disabled)return;
+// 登录/注册二合一：用户名已存在→登录；不存在→带邀请码即注册
+async function doAuth(){
+  const username=authUser?(authUser.value||'').trim():'';
+  const pwd=authPwd?(authPwd.value||''):'';
+  const invite=authInvite?(authInvite.value||'').trim():'';
+  if(!username||!pwd||authLoginBtn.disabled)return;
   authLoginBtn.disabled=true;
   if(authErr)authErr.textContent='';
   try{
-    const r=await fetch('/api/login',{
+    const r=await fetch('/api/auth',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password:pwd})
+      body:JSON.stringify({username,password:pwd,invite})
     });
     let d=null;try{d=await r.json()}catch(e){}
     if(r.ok&&d&&d.token){
       authToken=d.token;
+      me.name=d.username||username;
       try{localStorage.setItem(TOKEN_KEY,authToken)}catch(e){}
+      if(authUser)authUser.value='';
       if(authPwd)authPwd.value='';
+      if(authInvite)authInvite.value='';
       hideAuth();
-      renderAll();inputBox.focus();
+      await loadServerHistory();   // 拉取该用户自己的历史
+      inputBox.focus();
       return;
     }
     const detail=(d&&d.detail)?d.detail:('登录失败（HTTP '+r.status+'）');
@@ -820,25 +879,36 @@ async function doLogin(){
     authLoginBtn.disabled=false;
   }
 }
-function doLogout(){
-  authToken='';
+async function doLogout(){
+  try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+authToken}})}catch(e){}
+  authToken='';me={name:''};
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}
-  history=[];saveHist();renderAll();
+  history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
+  if(authInvite)authInvite.value='';
   showAuth('已退出登录');
 }
-if(authLoginBtn)authLoginBtn.onclick=doLogin;
-if(authPwd)authPwd.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();doLogin()}});
+if(authLoginBtn)authLoginBtn.onclick=doAuth;
+[authUser,authPwd,authInvite].forEach(el=>{
+  if(el)el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();doAuth()}});
+});
 const logoutBtn=$('#logoutBtn');
 if(logoutBtn)logoutBtn.onclick=()=>{if(confirm('确定退出登录吗？'))doLogout()};
 
 /* ================= 初始化 ================= */
-loadHist();syncThemeIcon();renderAll();
+syncThemeIcon();renderAll();updateUserBadge();
 (async function initAuth(){
   if(!authToken){showAuth();return}
   try{
     const r=await fetch('/api/me',{headers:{'Authorization':'Bearer '+authToken}});
-    if(r.ok){hideAuth();inputBox.focus();return}
+    if(r.ok){
+      const d=await r.json();
+      me.name=(d&&d.username)||'';
+      hideAuth();
+      await loadServerHistory();   // 历史按登录用户加载，互不可见
+      inputBox.focus();
+      return;
+    }
   }catch(e){/* 网络错误走下方统一登出 */}
   authToken='';
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}

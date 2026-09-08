@@ -106,13 +106,17 @@ MCP_SERVERS = [
 ]
 
 # 初始化全部MCP服务：由调用方传入长期存活的 exit_stack，持有所有子进程资源
-async def init_all_mcp_sessions(exit_stack: AsyncExitStack):
+async def init_all_mcp_sessions(exit_stack: AsyncExitStack, include=None):
     """
-    初始化全部MCP服务。
+    初始化MCP服务（可按名过滤）。
 
     必须由调用方传入一个长期存活的 AsyncExitStack：所有 stdio_client 和
     ClientSession 的 context manager 都会注册到这个 exit_stack 上，保证
     MCP 子进程在整个服务生命周期内不被提前回收/关闭。
+
+    include: 只启动指定名称的服务（如 ["amap","websearch"]）；None=全部。
+            Web 端传入不含 filesystem 的列表，改为“每用户独立 filesystem
+            子进程”实现文件空间隔离；CLI 仍用默认全量（含共享 filesystem）。
 
     注意：不能像 `stdio_client(params).__aenter__()` 那样创建临时对象——
     临时 context manager 无人持有会被 GC，立刻关闭子进程管道，导致
@@ -128,7 +132,12 @@ async def init_all_mcp_sessions(exit_stack: AsyncExitStack):
     sessions: List[Dict[str, Any]] = []
     ok_count = 0
 
-    for server_cfg in MCP_SERVERS:
+    servers = MCP_SERVERS
+    if include is not None:
+        include_set = set(include)
+        servers = [s for s in MCP_SERVERS if s["name"] in include_set]
+
+    for server_cfg in servers:
         name = server_cfg["name"]
         params = server_cfg["params"]
         try:
