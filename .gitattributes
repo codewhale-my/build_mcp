@@ -1,0 +1,17 @@
+# 统一换行符规范：仓库内一律 LF；文本类文件检出为 LF，避免跨 Windows/Linux 时 .sh 带 \r
+* text=auto
+*.sh    text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.html  text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+
+# 运行时日志/产物：不作为文本参与换行转换，也不该被跟踪（配合 .gitignore 使用）
+*.log   -text
+*.db    -text
+
+# 规则文件自身也保持 LF
+.gitattributes text eol=lf
