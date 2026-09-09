@@ -36,6 +36,20 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fa5]{2,24}$")
 # 目录名里不允许的字符一律替换成下划线
 _DIR_BAD = re.compile(r"[^\w\u4e00-\u9fa5\-]")
 
+# 邀请码归一化：去首尾空白、剔除零宽/变体选择符（emoji 场景常见隐形字符）、统一大写。
+# 存储与查询必须走同一函数，保证 "🐶" 与 "🐶\ufe0f" 视为同一个码。
+_INVITE_INVISIBLE = re.compile(r"[\u200b\u200c\u200d\ufeff\ufe0e\ufe0f]")
+
+def normalize_code(code: str) -> str:
+    code = _INVITE_INVISIBLE.sub("", (code or "").strip()).upper()
+    return code
+
+def code_is_valid(code: str) -> bool:
+    """2~32 个可见字符；不允许内部空白与控制字符（emoji、字母数字、连字符、_ 均可）。"""
+    if not code or len(code) > 32:
+        return False
+    return not re.search(r"[\s\x00-\x1f\x7f]", code)
+
 PBKDF2_ITER = 260_000
 
 
@@ -88,10 +102,11 @@ def init_db(import_env_codes: str = ""):
         conn.executescript(SCHEMA)
         for item in [c.strip() for c in (import_env_codes or "").split(",") if c.strip()]:
             code, _, note = item.partition(":")
-            if code:
+            nc = normalize_code(code)
+            if nc and code_is_valid(nc):
                 conn.execute(
                     "INSERT OR IGNORE INTO invite_codes(code,note,created_at) VALUES(?,?,?)",
-                    (code.strip(), note.strip(), time.time()),
+                    (nc, note.strip(), time.time()),
                 )
         conn.commit()
     finally:
@@ -173,7 +188,7 @@ def find_invite(code: str) -> dict | None:
     try:
         row = conn.execute(
             "SELECT * FROM invite_codes WHERE code=? AND used_by IS NULL",
-            (code.strip().upper(),),
+            (normalize_code(code),),
         ).fetchone()
         return dict(row) if row else None
     finally:
@@ -210,7 +225,7 @@ def delete_invite(code: str) -> bool:
     conn = _conn()
     try:
         with conn:
-            cur = conn.execute("DELETE FROM invite_codes WHERE code=?", (code.strip().upper(),))
+            cur = conn.execute("DELETE FROM invite_codes WHERE code=?", (normalize_code(code),))
         return cur.rowcount > 0
     finally:
         conn.close()
@@ -223,7 +238,7 @@ def reset_invite(code: str) -> bool:
         with conn:
             cur = conn.execute(
                 "UPDATE invite_codes SET used_by=NULL, used_at=NULL WHERE code=?",
-                (code.strip().upper(),),
+                (normalize_code(code),),
             )
         return cur.rowcount > 0
     finally:
@@ -237,7 +252,7 @@ def set_invite_note(code: str, note: str) -> bool:
         with conn:
             cur = conn.execute(
                 "UPDATE invite_codes SET note=? WHERE code=?",
-                (note.strip(), code.strip().upper()),
+                (note.strip(), normalize_code(code)),
             )
         return cur.rowcount > 0
     finally:
@@ -327,9 +342,9 @@ def _main():
     init_db()
 
     if args.cmd == "invite":
-        code = args.code.strip().upper()
-        if not code or not re.match(r"^[A-Z0-9\-]{4,32}$", code):
-            print("❌ 邀请码需为 4~32 位大写字母/数字/连字符")
+        code = normalize_code(args.code)
+        if not code_is_valid(code):
+            print("❌ 邀请码需为 2~32 个可见字符（emoji/字母/数字/连字符均可，不含空格）")
             raise SystemExit(1)
         conn = _conn()
         try:

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>MCP Agent · 全能助手</title>
+<title>HJ_MCP Agent🐋 · 全能助手</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✨</text></svg>">
 <script>
 // 主题：localStorage 优先，其次跟随系统；提前执行防止闪烁
@@ -108,6 +108,58 @@ header{
 }
 .hbtn:hover{color:var(--text);border-color:var(--border-strong);background:var(--panel-solid)}
 .hbtn svg{width:17px;height:17px}
+/* 本机文件授权按钮(桌面 Chrome/Edge 目录授权, 其余浏览器降级上传) */
+.lbtn{
+  display:inline-flex;align-items:center;gap:6px;height:31px;padding:0 11px;border-radius:9px;
+  font-size:12.5px;cursor:pointer;white-space:nowrap;
+  border:1px solid var(--border);background:var(--panel-solid);color:var(--text2);
+  transition:border-color .15s,color .15s;
+}
+.lbtn:hover{color:var(--text);border-color:var(--border-strong)}
+.lbtn .dot{width:7px;height:7px;border-radius:50%;background:#f59e0b;flex:none}
+.lbtn.on{border-color:color-mix(in srgb,var(--accent1) 45%,var(--border));color:var(--accent1)}
+.lbtn.on .dot{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.16)}
+.lbtn .txt{max-width:150px;overflow:hidden;text-overflow:ellipsis}
+.lbtn.err .dot{background:var(--err-tx)}
+/* 输入框上方的工作空间条 */
+.wsbar{
+  display:flex;align-items:center;justify-content:flex-start;gap:8px;
+  padding:2px 2px 8px;flex:none;
+}
+.wsbar[hidden]{display:none}
+.ws-anchor{position:relative;display:inline-flex}
+.lbtn .chev{width:11px;height:11px;flex:none;opacity:.7;transition:transform .18s}
+.lbtn.open .chev{transform:rotate(180deg)}
+.ws-menu{
+  position:absolute;left:0;bottom:calc(100% + 8px);z-index:60;min-width:230px;max-width:320px;
+  max-height:min(58vh,400px);overflow-y:auto;
+  background:var(--panel-solid);border:1px solid var(--border-strong);border-radius:13px;
+  box-shadow:var(--shadow);padding:6px;display:flex;flex-direction:column;gap:2px;
+  animation:pop .16s ease;transform-origin:bottom left;
+}
+.ws-menu[hidden]{display:none}
+.ws-hd{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  font-size:11px;color:var(--text3);padding:5px 10px 6px;
+}
+.ws-item{
+  display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+  padding:8px 10px;border-radius:9px;border:none;background:none;cursor:pointer;
+  font-family:var(--font);font-size:13px;color:var(--text);transition:background .12s;
+}
+.ws-item:hover{background:var(--panel)}
+.ws-item .wi-ico{flex:none;font-size:14px}
+.ws-item .wi-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ws-item .wi-now{flex:none;font-size:11px;color:var(--accent1)}
+.ws-item .wi-del{flex:none;font-size:12px;color:var(--text3);padding:2px 6px;border-radius:6px}
+.ws-item .wi-del:hover{color:var(--err-tx);background:var(--err-bg)}
+.ws-sep{height:1px;background:var(--border);margin:4px 6px}
+.ws-add{
+  display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+  padding:8px 10px;border-radius:9px;border:none;background:none;cursor:pointer;
+  font-family:var(--font);font-size:13px;color:var(--accent1);transition:background .12s;
+}
+.ws-add:hover{background:var(--panel)}
 /* 当前登录用户徽标 */
 .user-badge{
   display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 13px;
@@ -170,6 +222,47 @@ header{
 .bubble ul,.bubble ol{margin:4px 0 10px;padding-left:22px}
 .bubble li{margin:3px 0}
 .bubble a{color:var(--accent1);text-decoration:none;border-bottom:1px dashed var(--border-strong)}
+/* 工作空间文件下载卡片（点击保存到本机/手机） */
+.bubble a.filedl{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 12px 6px 6px;margin:2px 4px;border-radius:10px;
+  border:1px solid var(--border);
+  background:linear-gradient(180deg,var(--panel-solid),color-mix(in srgb,var(--panel-solid) 88%,var(--accent1) 12%));
+  color:var(--text);font-size:13px;font-weight:500;text-decoration:none;vertical-align:baseline;
+  box-shadow:0 1px 4px rgba(0,0,0,.07);transition:border-color .15s,transform .12s,box-shadow .15s;
+}
+.bubble a.filedl:hover{
+  border-color:var(--accent1);transform:translateY(-1px);
+  box-shadow:0 3px 10px rgba(76,125,255,.18);
+}
+/* 左侧文件类型徽标：按扩展名渐变着色 */
+.bubble a.filedl .f-ico{
+  width:26px;height:26px;border-radius:7px;flex:none;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-size:9.5px;font-weight:700;letter-spacing:.4px;color:#fff;
+  background:linear-gradient(135deg,#4c7dff,#9a6bff);
+}
+.bubble a.filedl.ext-md .f-ico,.bubble a.filedl.ext-markdown .f-ico{background:linear-gradient(135deg,#4c7dff,#38bdf8)}
+.bubble a.filedl.ext-txt .f-ico,.bubble a.filedl.ext-log .f-ico{background:linear-gradient(135deg,#64748b,#94a3b8)}
+.bubble a.filedl.ext-pdf .f-ico{background:linear-gradient(135deg,#ef4444,#f97316)}
+.bubble a.filedl.ext-doc .f-ico,.bubble a.filedl.ext-docx .f-ico{background:linear-gradient(135deg,#2563eb,#60a5fa)}
+.bubble a.filedl.ext-xls .f-ico,.bubble a.filedl.ext-xlsx .f-ico,.bubble a.filedl.ext-csv .f-ico{background:linear-gradient(135deg,#059669,#34d399)}
+.bubble a.filedl.ext-ppt .f-ico,.bubble a.filedl.ext-pptx .f-ico{background:linear-gradient(135deg,#ea580c,#fb923c)}
+.bubble a.filedl.ext-zip .f-ico,.bubble a.filedl.ext-tar .f-ico,.bubble a.filedl.ext-gz .f-ico{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
+.bubble a.filedl.ext-py .f-ico,.bubble a.filedl.ext-js .f-ico,.bubble a.filedl.ext-ts .f-ico,.bubble a.filedl.ext-json .f-ico,.bubble a.filedl.ext-sh .f-ico{background:linear-gradient(135deg,#0d9488,#2dd4bf)}
+/* 文件名过长省略 */
+.bubble a.filedl .f-name{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 右侧下载箭头：hover 时高亮 */
+.bubble a.filedl .f-dl{
+  width:20px;height:20px;border-radius:50%;flex:none;margin-left:2px;
+  display:inline-flex;align-items:center;justify-content:center;
+  font-size:12px;color:var(--accent1);background:transparent;
+  border:1px solid transparent;transition:all .15s;
+}
+.bubble a.filedl:hover .f-dl{
+  background:color-mix(in srgb,var(--accent1) 14%,transparent);
+  border-color:color-mix(in srgb,var(--accent1) 35%,transparent);
+}
 .bubble a:hover{opacity:.85}
 .bubble hr{border:none;border-top:1px solid var(--border);margin:14px 0}
 .bubble blockquote{
@@ -372,14 +465,13 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
     <div class="auth-logo">
       <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l2.3 7.7L22 12l-7.7 2.3L12 22l-2.3-7.7L2 12l7.7-2.3z" fill="#fff"/></svg>
     </div>
-    <h2>MCP Agent</h2>
-    <p class="auth-sub">此服务包含文件读写与终端执行能力<br>首次使用请填写邀请码完成注册</p>
+    <h2>HJ_MCP Agent🐋</h2>
+    <p class="auth-sub">首次使用请填写邀请码完成注册</p>
     <input id="authUser" class="auth-input" type="text" placeholder="用户名（2-24 位中文/字母/数字）" autocomplete="username">
     <input id="authPwd" class="auth-input" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password">
     <input id="authInvite" class="auth-input" type="text" placeholder="邀请码（新用户注册时填写）" autocomplete="off">
     <button id="authLoginBtn" class="auth-btn">登 录 / 注 册</button>
     <p id="authErr" class="auth-err"></p>
-    <p class="auth-tip">已有账号直接登录、无需邀请码<br>个人文件空间与历史消息相互隔离</p>
   </div>
 </div>
 
@@ -391,7 +483,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
         <svg viewBox="0 0 24 24" fill="none"><path d="M12 2l2.3 7.7L22 12l-7.7 2.3L12 22l-2.3-7.7L2 12l7.7-2.3z" fill="#fff"/></svg>
       </div>
       <div>
-        <h1>MCP Agent</h1>
+        <h1>HJ_MCP Agent🐋</h1>
         <div class="tools">
           <span class="tool-chip">🗺️ 地图</span>
           <span class="tool-chip">🔍 搜索</span>
@@ -420,6 +512,13 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 
   <!-- 输入区 -->
   <div class="composer-wrap">
+    <div class="wsbar" id="wsBar" hidden>
+      <div class="ws-anchor">
+        <button class="lbtn" id="localBtn" title="选择/切换本机工作空间文件夹"><span class="dot"></span><span class="txt">选择工作空间</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="ws-menu" id="wsMenu" hidden></div>
+      </div>
+      <input type="file" id="localUpload" hidden multiple>
+    </div>
     <div class="composer">
       <textarea id="inputBox" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
       <button id="sendBtn" title="发送">
@@ -437,6 +536,7 @@ const chatBox = $('#chatBox'), inputBox = $('#inputBox'), sendBtn = $('#sendBtn'
 const THEME_KEY = 'mcp-theme';
 const TOKEN_KEY = 'mcp-auth-token';
 let authToken='', me={name:''};
+let myUserRoot='';   // 当前用户工作空间绝对路径，用于把回答里的文件路径变成下载链接
 try{authToken=localStorage.getItem(TOKEN_KEY)||''}catch(e){}
 const authOverlay=$('#authOverlay'), authUser=$('#authUser'), authPwd=$('#authPwd'),
       authInvite=$('#authInvite'), authErr=$('#authErr'), authLoginBtn=$('#authLoginBtn');
@@ -519,6 +619,35 @@ function renderMarkdown(src){
   return out.replace(/\u0000B(\d+)\u0000/g,(m,i)=>blocks[+i]);
 }
 
+// 把渲染后的 HTML 中出现的"本用户工作空间绝对路径"变成可点击的下载链接
+function linkifyUserFiles(html){
+  if(!myUserRoot||!html)return html;
+  const root=esc(myUserRoot.replace(/\/+$/,'')).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  // 生成下载卡片；失败返回 null（调用方保留原文）
+  const mk=(rel)=>{
+    // 去掉结尾被顺带吸进来的常见标点/括号
+    const clean=rel.replace(/[，。、；：,.!?;:'")\]}>】》]+$/,'');
+    if(!clean||clean==='/')return null;
+    const name=decodeURIComponent(clean.split('/').pop());
+    // 最后一段没有扩展名 → 大概率是目录(如"查看工作目录"回复的路径),不做下载链接
+    if(!name.includes('.'))return null;
+    // 下载走新标签页直接导航，无法带 Authorization 头 → 把 token 拼进查询参数让后端认
+    const href='/api/files/download?path='+encodeURIComponent(clean.replace(/^\//,''))+
+      '&token='+encodeURIComponent(authToken);
+    // 按扩展名着色的文件类型徽标 + 文件名 + 下载箭头
+    const ext=(name.split('.').pop()||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,8);
+    const ico=ext&&ext!==name.toLowerCase().replace('.','')?esc(ext.toUpperCase()):'FILE';
+    return '<a class="filedl ext-'+esc(ext||'bin')+'" href="'+href+'" target="_blank" rel="noopener" title="点击保存到你的设备">'+
+      '<span class="f-ico">'+ico+'</span><span class="f-name">'+esc(name)+'</span><span class="f-dl">↓</span></a>';
+  };
+  // 路径被 AI 包进反引号时,渲染成 <code>路径</code> —— 必须连外壳一起替换,
+  // 否则 code 的背景/边框会在卡片两侧露出长条
+  html=html.replace(new RegExp('<code>\\s*('+root+'[^<]*?)\\s*</code>','g'),(m,rel)=>mk(rel)||m);
+  // 裸路径兜底
+  html=html.replace(new RegExp(root+'(/[^\\s<>"\'`]+)','g'),(m,rel)=>mk(rel)||m);
+  return html;
+}
+
 /* ================= 消息管理 ================= */
 let history=[];   // {role:'user'|'assistant'|'error'|'loading', text, ts?}
 let busy=false, controller=null;
@@ -536,6 +665,7 @@ async function loadServerHistory(){
     if(!r.ok){throw new Error('HTTP '+r.status)}
     const d=await r.json();
     if(d&&d.username)me.name=d.username;
+    if(d&&d.user_root)myUserRoot=d.user_root;
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
       .map(m=>({role:m.role,text:m.text,ts:m.ts}));
@@ -569,7 +699,7 @@ function buildMsg(item){
     }else if(item.role==='error'){
       body='<div class="bubble err">'+esc(item.text)+'</div>';
     }else{
-      body='<div class="bubble">'+renderMarkdown(item.text)+'</div>';
+      body='<div class="bubble">'+linkifyUserFiles(renderMarkdown(item.text))+'</div>';
     }
     wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+'</div>';
   }
@@ -657,6 +787,7 @@ const TOOL_LABEL={
   directory_tree:'查看目录树',read_multiple_files:'批量读取文件',
   create_directory:'新建目录',move_file:'移动文件',copy_file:'复制文件',
   delete_file:'删除文件',run_command:'执行终端命令',
+  user_filesystem:'读写本机文件',
   terminal_session_create:'开启终端',web_search:'联网搜索',fetch_page:'抓取网页'
 };
 function toolLabel(name){
@@ -866,6 +997,7 @@ async function doAuth(){
       if(authInvite)authInvite.value='';
       hideAuth();
       await loadServerHistory();   // 拉取该用户自己的历史
+      localStatus();wsStart();await restoreLocalHandle();
       inputBox.focus();
       return;
     }
@@ -883,6 +1015,8 @@ async function doLogout(){
   try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+authToken}})}catch(e){}
   authToken='';me={name:''};
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}
+  wsStop();localHandle=null;closeWsMenu();
+  localStatus();
   history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
   if(authInvite)authInvite.value='';
@@ -897,6 +1031,252 @@ if(logoutBtn)logoutBtn.onclick=()=>{if(confirm('确定退出登录吗？'))doLog
 
 /* ================= 初始化 ================= */
 syncThemeIcon();renderAll();updateUserBadge();
+/* =============== 本机文件桥(File System Access + WebSocket) =============== */
+const localBtn=$('#localBtn'), localUp=$('#localUpload');
+let localHandle=null, ws=null, localSupported=false;
+function toast(msg,ms){
+  let t=$('#toast');
+  if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#1f2430;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;z-index:999;max-width:82vw;box-shadow:0 6px 24px rgba(0,0,0,.25);transition:opacity .3s';document.body.appendChild(t)}
+  t.textContent=msg;t.style.opacity='1';
+  clearTimeout(t._tm);t._tm=setTimeout(()=>{t.style.opacity='0'},ms||3200);
+}
+
+/* IndexedDB: 每用户最近 3 个授权目录句柄列表(本浏览器本地) */
+function idbOpen(){return new Promise((res,rej)=>{const r=indexedDB.open('hj_mcp_local',2);r.onupgradeneeded=e=>{const db=r.result;if(!db.objectStoreNames.contains('dirs'))db.createObjectStore('dirs')};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+function idbReq(db,mode,fn){return new Promise((res,rej)=>{const tx=db.transaction('dirs',mode).objectStore('dirs');const q=fn(tx);q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})}
+async function idbGet(k){const db=await idbOpen();try{return await idbReq(db,'readonly',s=>s.get(k))}finally{db.close()}}
+async function idbSet(k,v){const db=await idbOpen();try{await idbReq(db,'readwrite',s=>s.put(v,k))}finally{db.close()}}
+async function idbDel(k){const db=await idbOpen();try{await idbReq(db,'readwrite',s=>s.delete(k))}finally{db.close()}}
+
+/* 工作空间记录: {list:[{name,handle},...]} 最多3条, 新的在前 */
+const MAX_WS=3;
+function wsKey(){return 'wslist_'+me.name}
+async function loadWsList(){
+  if(!me.name)return[];
+  try{
+    const v=await idbGet(wsKey());
+    // 兼容旧版: 旧结构是单个 handle 直接存 me.name 下
+    if(!v||!Array.isArray(v.list)){
+      const old=await idbGet(me.name);
+      if(old&&old.name){const nv={list:[{name:old.name,handle:old}]};await idbSet(wsKey(),nv);return nv.list}
+      return v&&v.list?v.list:[];
+    }
+    return v.list;
+  }catch(e){return[]}
+}
+async function saveWsList(list){
+  if(!me.name)return;
+  try{await idbSet(wsKey(),{list})}catch(e){}
+}
+// 挑选/写入目录句柄后, 把该目录排到最近列表最前(去重, 最多保留 MAX_WS 个)
+async function rememberWs(h){
+  const list=await loadWsList();
+  const next=[{name:h.name,handle:h}].concat(list.filter(x=>x&&x.name!==h.name)).slice(0,MAX_WS);
+  await saveWsList(next);
+  return next;
+}
+async function forgetWs(name){
+  const list=await loadWsList();
+  await saveWsList(list.filter(x=>x&&x.name!==name));
+}
+
+function localStatus(){
+  const bar=$('#wsBar');
+  if(!bar)return;
+  localSupported=!!(window.showDirectoryPicker&&window.FileSystemDirectoryHandle);
+  if(!me.name){bar.hidden=true;return}
+  bar.hidden=false;
+  if(!localBtn)return;
+  if(localHandle){
+    localBtn.className='lbtn on';
+    localBtn.querySelector('.txt').textContent=localHandle.name;
+    localBtn.title='当前工作空间：'+localHandle.name+'。点击可切换';
+  }else if(!localSupported){
+    localBtn.className='lbtn err';
+    localBtn.querySelector('.txt').textContent='选择工作空间';
+    localBtn.title='当前浏览器不支持目录授权，将用“上传文件”方式';
+  }else{
+    localBtn.className='lbtn';
+    localBtn.querySelector('.txt').textContent='选择工作空间';
+    localBtn.title='点击授权本机上的一个文件夹作为工作空间';
+  }
+}
+
+async function restoreLocalHandle(){
+  if(!me.name)return;
+  try{
+    const list=await loadWsList();
+    if(list.length){localHandle=list[0].handle;localStatus();return}
+  }catch(e){}
+  localHandle=null;localStatus();
+}
+async function pickLocalDir(){
+  try{
+    const h=await window.showDirectoryPicker({mode:'readwrite'});
+    localHandle=h;
+    await rememberWs(h);
+    localStatus();toast('已授权本机文件夹：'+h.name+'。现在可以让我读写它了');
+  }catch(e){if(!e||e.name!=='AbortError')toast('无法授权：'+e.message)}
+}
+async function switchWsTo(name){
+  // 从最近列表里切到指定目录: 重新请求一次权限再启用
+  const list=await loadWsList();
+  const it=list.find(x=>x&&x.name===name);
+  if(!it)return;
+  try{
+    let p=await it.handle.queryPermission({mode:'readwrite'});
+    if(p==='prompt')p=await it.handle.requestPermission({mode:'readwrite'});
+    if(p!=='granted'){toast('未能取得「'+name+'」的读写权限');return}
+    localHandle=it.handle;
+    await rememberWs(it.handle);
+    localStatus();closeWsMenu();toast('已切换工作空间：'+name);
+  }catch(e){toast('切换失败：'+e.message)}
+}
+
+/* 授权目录内的文件操作(由后端经 WS 下达, 结果回传) */
+async function fsopExec(op,path,content){
+  if(!localHandle)return{ok:false,error:'尚未选择工作空间。请点击输入框上方的“选择工作空间”按钮授权本机文件夹后重试。'};
+  const parts=(path||'').split('/').filter(Boolean);
+  try{
+    if(op==='list'){
+      let d=localHandle;
+      for(const p of parts)d=await d.getDirectoryHandle(p,{create:false});
+      const items=[];
+      for await(const[n,hd]of d.entries())items.push({n,k:hd.kind==='directory'?'dir':'file'});
+      items.sort((a,b)=>a.k===b.k?(a.n<b.n?-1:1):(a.k==='dir'?-1:1));
+      const who=parts.join('/')||'(授权根目录)';
+      if(!items.length)return{ok:true,data:'['+who+'] 为空目录'};
+      return{ok:true,data:'['+who+'] 共 '+items.length+' 项\n'+items.map(x=>x.k==='dir'?x.n+'/':x.n).join('\n')};
+    }
+    if(op==='read'){
+      if(!parts.length)return{ok:false,error:'read 需要指定文件名'};
+      let d=localHandle;
+      for(const p of parts.slice(0,-1))d=await d.getDirectoryHandle(p,{create:false});
+      const fh=await d.getFileHandle(parts[parts.length-1],{create:false});
+      const f=await fh.getFile();
+      const cap=400000;
+      const txt=f.size>cap?(await f.slice(0,cap).text())+'\n…(文件较大,仅截取前 '+cap+' 字符)':await f.text();
+      return{ok:true,data:'[本机文件] '+f.name+' ('+f.size+' bytes)\n'+txt};
+    }
+    if(op==='write'){
+      if(!parts.length)return{ok:false,error:'write 需要指定文件名'};
+      const perm=await localHandle.queryPermission({mode:'readwrite'});
+      if(perm==='prompt')return{ok:false,error:'浏览器要求重新确认写入权限：请点击输入框上方的“工作空间”按钮(会弹出允许框)后重试。'};
+      if(perm==='denied')return{ok:false,error:'写入权限已被拒绝。请在地址栏左侧权限设置里允许该网站，或重新授权文件夹。'};
+      let d=localHandle;
+      for(const p of parts.slice(0,-1))d=await d.getDirectoryHandle(p,{create:true});
+      const fh=await d.getFileHandle(parts[parts.length-1],{create:true});
+      const w=await fh.createWritable();await w.write(content);await w.close();
+      return{ok:true,data:'已写入本机文件 '+fh.name+' ('+content.length+' 字符)'};
+    }
+    return{ok:false,error:'未知操作 '+op};
+  }catch(e){return{ok:false,error:'本机文件操作失败：'+e.message}}
+}
+
+/* WebSocket 通道: 后端把 user_filesystem 调用推到浏览器执行 */
+function wsStart(){
+  if(!authToken)return;
+  if(ws){try{ws.close()}catch(e){}}
+  const proto=location.protocol==='https:'?'wss://':'ws://';
+  let closed=false;
+  const sk=new WebSocket(proto+location.host+'/ws?token='+encodeURIComponent(authToken));
+  sk.onmessage=async(e)=>{
+    let m;try{m=JSON.parse(e.data)}catch(_){return}
+    if(!m||m.type!=='fsop')return;
+    const r=await fsopExec(m.op,m.path,m.content);
+    try{sk.send(JSON.stringify({type:'fsop_result',id:m.id,ok:r.ok,data:r.ok?r.data:undefined,error:r.ok?undefined:r.error}))}catch(_){}
+  };
+  sk.onclose=()=>{if(closed)return;if(ws===sk)ws=null;if(authToken)setTimeout(wsStart,1500)};
+  sk.onerror=()=>{try{sk.close()}catch(_){}};
+  ws=sk;
+}
+function wsStop(){
+  if(ws){try{ws.onclose=null;ws.close()}catch(e){}}
+  ws=null;
+}
+
+/* 降级上传(不支持目录授权/移动端): 文件传进服务器工作空间 _uploads/ */
+async function uploadFiles(files){
+  if(!files||!files.length)return;
+  for(const f of files){
+    if(f.size>8*1024*1024){toast('「'+f.name+'」超过 8MB，未上传');continue}
+    const fd=new FormData();fd.append('file',f,f.name);
+    try{
+      const r=await fetch('/api/uploads',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:fd});
+      const d=await r.json().catch(()=>({}));
+      if(r.ok&&d.path)toast('已上传「'+d.name+'」到工作空间 _uploads/，可以让我读取处理');
+      else toast('上传失败：'+(d.detail||('HTTP '+r.status)));
+    }catch(e){toast('上传失败：'+e.message)}
+  }
+}
+async function localBtnClick(){
+  if(!window.showDirectoryPicker||!window.FileSystemDirectoryHandle){
+    localUp.click();
+    return;
+  }
+  // 统一行为: 点开=上拉菜单(最近空间列表 + 新建工作空间)
+  toggleWsMenu();
+}
+function toggleWsMenu(){
+  const menu=$('#wsMenu');
+  if(!menu||!localSupported)return;
+  if(!menu.hidden){closeWsMenu();return}
+  openWsMenu();
+  if(localBtn)localBtn.classList.add('open');
+}
+async function openWsMenu(){
+  const menu=$('#wsMenu');
+  if(!menu||!localSupported)return;
+  const list=await loadWsList();
+  const curName=localHandle?localHandle.name:'';
+  let html='<div class="ws-hd"><span>最近工作空间</span><span>'+list.length+'/'+MAX_WS+'</span></div>';
+  if(!list.length){
+    html+='<div style="padding:8px 10px;font-size:12px;color:var(--text3)">还没有工作空间，点下面按钮新建</div>';
+  }else{
+    list.forEach(it=>{
+      const isCur=it.name===curName;
+      html+='<button class="ws-item" data-name="'+esc(it.name)+'">'+
+        '<span class="wi-ico">'+(isCur?'📁':'🗂')+'</span>'+
+        '<span class="wi-name">'+esc(it.name)+'</span>'+
+        (isCur?'<span class="wi-now">当前</span>':'')+
+        '<span class="wi-del" title="从列表移除">✕</span>'+
+      '</button>';
+    });
+  }
+  html+='<div class="ws-sep"></div>';
+  html+='<button class="ws-add" id="wsAddNew">＋ 新建工作空间</button>';
+  menu.innerHTML=html;
+  menu.querySelectorAll('.ws-item').forEach(btn=>{
+    const nm=btn.dataset.name;
+    btn.querySelector('.wi-del').onclick=async ev=>{
+      ev.stopPropagation();
+      await forgetWs(nm);
+      if(localHandle&&localHandle.name===nm)localHandle=null;
+      openWsMenu();localStatus();
+    };
+    btn.onclick=async()=>{
+      const name=btn.dataset.name;
+      if(localHandle&&localHandle.name===name){closeWsMenu();return}
+      await switchWsTo(name);
+    };
+  });
+  const add=menu.querySelector('#wsAddNew');
+  if(add)add.onclick=()=>{closeWsMenu();pickLocalDir()};
+  menu.hidden=false;
+}
+function closeWsMenu(){
+  const menu=$('#wsMenu');
+  if(menu)menu.hidden=true;
+  if(localBtn)localBtn.classList.remove('open');
+}
+document.addEventListener('click',e=>{
+  const menu=$('#wsMenu'),bar=$('#wsBar');
+  if(menu&&!menu.hidden&&bar&&!bar.contains(e.target))closeWsMenu();
+});
+if(localBtn)localBtn.onclick=localBtnClick;
+if(localUp)localUp.onchange=e=>{uploadFiles([...e.target.files]);e.target.value=''};
+/* =============== 本机文件桥 end =============== */
+
 (async function initAuth(){
   if(!authToken){showAuth();return}
   try{
@@ -904,8 +1284,10 @@ syncThemeIcon();renderAll();updateUserBadge();
     if(r.ok){
       const d=await r.json();
       me.name=(d&&d.username)||'';
+      myUserRoot=(d&&d.user_root)||'';
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
+      localStatus();wsStart();await restoreLocalHandle();
       inputBox.focus();
       return;
     }

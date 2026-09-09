@@ -15,6 +15,7 @@ MCP Agent Web 服务：多用户版
   MCP_WEB_DB / MCP_WEB_DATA_DIR / MCP_WEB_FS_ROOT  数据/文件空间位置（一般不用改）
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -22,13 +23,24 @@ import secrets
 import shutil
 import time
 from contextlib import asynccontextmanager, AsyncExitStack
-from typing import Dict, Any
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+    UploadFile,
+    File as FastFile,
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from build_mcp.client.conversation import (
@@ -50,6 +62,7 @@ from build_mcp.web.store import (
     create_user,
     find_invite,
     consume_invite,
+    normalize_code,
     add_message,
     list_messages,
     recent_llm_messages,
@@ -86,6 +99,92 @@ _chat_locks: Dict[int, asyncio.Lock] = {}
 _user_fs_cache: Dict[int, dict] = {}
 _fs_boot_lock = asyncio.Lock()
 
+# ================== 用户本机文件桥(浏览器 File System Access) ==================
+# user_id -> {"ws": WebSocket|None, "pending": {fsop_id: asyncio.Future}}
+_user_ws: Dict[int, dict] = {}
+_fsop_seq = 0            # fsop 消息自增 id
+FSOP_TIMEOUT = 40        # 等待浏览器执行文件操作的最长秒数
+FSOP_MAX_TEXT = 500_000  # read 文本最大字节(超出截断并提示)
+
+# user_filesystem 工具的 OpenAI function 定义(挂到每个 chat 请求的工具列表)
+USER_FS_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "user_filesystem",
+        "description": (
+            "操作【用户已授权】的本地电脑文件夹（浏览器端执行，只能访问用户亲手授权的那一个目录）。"
+            "用于用户要求读取/修改自己电脑上的文件（如“读我电脑上的笔记.txt”“把这份报告存到我授权的文件夹”）。"
+            "path 一律用相对该授权根目录的路径，正斜杠分隔，如 '笔记/日报.md'；对目录本身用 path='' 或目录名。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["list", "read", "write"]},
+                "path": {"type": "string", "description": "相对授权目录的路径；目录操作给目录路径"},
+                "content": {"type": "string", "description": "write 时的文本内容"},
+            },
+            "required": ["op", "path"],
+        },
+    },
+}
+
+
+async def _fsop_request(user: dict, op: str, path: str, content: str = "") -> dict:
+    """向该用户的浏览器发一次文件操作请求并等待结果。返回 {ok, data|error}。"""
+    conn = _user_ws.get(user["id"])
+    if not conn or not conn.get("ws"):
+        return {"ok": False, "error": "浏览器未连接本机文件通道(可能未登录或页面已关)。请保持页面打开后重试。"}
+    ws: WebSocket = conn["ws"]
+    global _fsop_seq
+    _fsop_seq += 1
+    fid = _fsop_seq
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    conn["pending"][fid] = fut
+    try:
+        await ws.send_json({"type": "fsop", "id": fid, "op": op, "path": path or "", "content": content or ""})
+    except Exception:
+        conn["pending"].pop(fid, None)
+        return {"ok": False, "error": "向浏览器发送文件操作失败(连接可能已断开)，请刷新页面重试。"}
+    try:
+        res = await asyncio.wait_for(fut, timeout=FSOP_TIMEOUT)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"浏览器 {FSOP_TIMEOUT}s 未响应文件操作。若弹出了授权确认，请点击允许；否则检查“本机文件”是否已授权。"}
+    finally:
+        conn["pending"].pop(fid, None)
+    return res
+
+
+class _UserFsShim:
+    """把 user_filesystem 工具调用桥到浏览器；鸭子类型对齐 MCP ClientSession.call_tool。
+
+    agent_loop_stream 只依赖 session.call_tool(name, arguments) 返回
+    result.content[0].text，因此可以无侵入地挂进 tool_name_to_session。
+    """
+
+    def __init__(self, user: dict):
+        self.user = user
+
+    async def call_tool(self, name: str, arguments: dict):
+        op = str(arguments.get("op") or "list").strip().lower()
+        path = str(arguments.get("path") or "").strip()
+        content = str(arguments.get("content") or "")
+        # 路径清洗：反斜杠转正斜杠、去掉开头的 / 与盘符，禁止 ..
+        path = path.replace("\\", "/").lstrip("/")
+        parts = [p for p in path.split("/") if p and p not in (".", "..")]
+        # 去掉可能的盘符前缀 C: D:
+        if parts and len(parts[0]) == 2 and parts[0][1] == ":":
+            parts = parts[1:]
+        clean = "/".join(parts)
+        if op not in ("list", "read", "write"):
+            text = f"不支持的操作：{op}(可选 list/read/write)"
+        else:
+            res = await _fsop_request(self.user, op, clean, content)
+            if res.get("ok"):
+                text = res.get("data", "完成")
+            else:
+                text = "错误：" + res.get("error", "未知错误")
+        return SimpleNamespace(content=[SimpleNamespace(text=text)])
+
 _bearer = HTTPBearer(auto_error=False)  # 不自动报错，由我们统一返回 401
 
 
@@ -114,6 +213,22 @@ def _issue_token(uid: int) -> str:
     return token
 
 
+def _user_from_token(tok: str) -> dict:
+    """校验 token 值，返回用户信息；非法/过期则 401。供 header 与查询参数两条通道共用。"""
+    rec = _tokens.get(tok)
+    now = time.time()
+    if rec is None:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
+    if rec["exp"] < now:
+        _tokens.pop(tok, None)
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    user = get_user_by_id(rec["uid"])
+    if user is None:
+        _tokens.pop(tok, None)
+        raise HTTPException(status_code=401, detail="账号不存在，请重新登录")
+    return {"id": user["id"], "username": user["username"], "token": tok}
+
+
 def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
     """FastAPI 依赖：校验 Bearer token，返回当前用户 {id, username}，非法则 401。"""
     if credentials is None:
@@ -122,18 +237,7 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(_bea
             detail="未登录",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    rec = _tokens.get(credentials.credentials)
-    now = time.time()
-    if rec is None:
-        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
-    if rec["exp"] < now:
-        _tokens.pop(credentials.credentials, None)
-        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
-    user = get_user_by_id(rec["uid"])
-    if user is None:
-        _tokens.pop(credentials.credentials, None)
-        raise HTTPException(status_code=401, detail="账号不存在，请重新登录")
-    return {"id": user["id"], "username": user["username"], "token": credentials.credentials}
+    return _user_from_token(credentials.credentials)
 
 
 # 全局 exit_stack：持有所有 stdio_client / ClientSession 的 context manager，
@@ -275,7 +379,7 @@ async def auth(req: AuthRequest, request: Request):
         return {"token": token, "username": user["username"], "is_new": False}
 
     # ---- 新用户：校验邀请码并注册 ----
-    code = (req.invite or "").strip().upper()
+    code = normalize_code(req.invite)
     if not code:
         raise HTTPException(status_code=403, detail="该用户名尚未注册，请填写邀请码完成注册")
     ic = find_invite(code)
@@ -302,7 +406,11 @@ async def logout(user: dict = Depends(require_user)):
 @app.get("/api/me")
 async def me(user: dict = Depends(require_user)):
     """校验当前 token 是否有效，供前端启动时探测登录态。"""
-    return {"ok": True, "username": user["username"]}
+    return {
+        "ok": True,
+        "username": user["username"],
+        "user_root": str(user_filesystem_dir(user["username"], user["id"]).resolve()),
+    }
 
 
 @app.get("/api/history")
@@ -312,6 +420,7 @@ async def history(user: dict = Depends(require_user), limit: int = 200):
     msgs = list_messages(user["id"], limit=limit)
     return {
         "username": user["username"],
+        "user_root": str(user_filesystem_dir(user["username"], user["id"]).resolve()),
         "messages": [
             {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"]}
             for m in msgs
@@ -326,9 +435,124 @@ async def history_clear(user: dict = Depends(require_user)):
     return {"ok": True}
 
 
+def _safe_user_file(user: dict, path: str) -> Path:
+    """把请求的相对/绝对路径解析到用户沙箱内的文件；越权/穿越一律 403。"""
+    base = user_filesystem_dir(user["username"], user["id"]).resolve()
+    raw = Path(path or "")
+    cand = (base / raw).resolve() if not raw.is_absolute() else raw.resolve()
+    if cand != base and base not in cand.parents:
+        raise HTTPException(status_code=403, detail="禁止访问工作空间以外的文件")
+    if not cand.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return cand
+
+
+@app.get("/api/files/download")
+async def file_download(
+    path: str,
+    token: str = "",
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+):
+    """下载自己工作空间里的文件（仅限本用户沙箱内，自动带附件下载头）。
+
+    token 支持两种携带方式：Authorization: Bearer（fetch 用）或 ?token=（<a href> 新标签页导航用）。
+    """
+    tok = ""
+    if credentials is not None:
+        tok = credentials.credentials
+    elif token:
+        tok = token
+    if not tok:
+        raise HTTPException(
+            status_code=401,
+            detail="未登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = _user_from_token(tok)
+    f = _safe_user_file(user, path)
+    return FileResponse(f, filename=f.name, content_disposition_type="attachment")
+
+
+@app.post("/api/uploads")
+async def upload_file(file: UploadFile = FastFile(...), user: dict = Depends(require_user)):
+    """移动端/不支持目录授权的浏览器：把用户选择的本地文件存入其服务器工作空间 _uploads/。
+
+    返回 {path}（相对 user_root），AI 随后可用 filesystem 工具读取。
+    """
+    base = user_filesystem_dir(user["username"], user["id"])
+    up = base / "_uploads"
+    up.mkdir(parents=True, exist_ok=True)
+    name = (file.filename or "file").replace("\\", "/").split("/")[-1]
+    # 文件名字符清洗：只保留安全字符集
+    import re as _re
+    name = _re.sub(r"[^\w\u4e00-\u9fa5.\-]", "_", name)[-80:]
+    if not name:
+        name = "file"
+    dest = up / name
+    n = 0
+    while dest.exists():
+        n += 1
+        stem, _, ext = name.rpartition(".")
+        dest = up / f"{stem}_{n}.{ext}" if ext else up / f"{name}_{n}"
+    size = 0
+    with open(dest, "wb") as fh:
+        while True:
+            chunk = await file.read(1024 * 256)
+            if not chunk:
+                break
+            fh.write(chunk)
+            size += len(chunk)
+    rel = str(dest.relative_to(base))
+    logger.info("📤 用户[%s] 上传 %s (%d bytes) -> %s", user["username"], name, size, rel)
+    return {"ok": True, "name": name, "path": rel, "size": size}
+
+
 def _sse(event: dict) -> str:
     """把事件 dict 打包成一条 SSE 帧（data: {...}），中文不转义。"""
     return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    """浏览器↔后端长连接：承接 fsop 请求与结果回传。token 经查询参数携带。"""
+    token = websocket.query_params.get("token", "")
+    try:
+        user = _user_from_token(token)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+    uid = user["id"]
+    await websocket.accept()
+    conn = _user_ws.setdefault(uid, {"ws": None, "pending": {}})
+    # 多标签页时以最新连接为准
+    conn["ws"] = websocket
+    logger.info("🔌 用户[%s] 本机文件通道已连接", user["username"])
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            if msg.get("type") == "fsop_result":
+                fid = msg.get("id")
+                fut = conn["pending"].get(fid)
+                if fut and not fut.done():
+                    fut.set_result({
+                        "ok": bool(msg.get("ok")),
+                        "data": msg.get("data", ""),
+                        "error": msg.get("error", ""),
+                    })
+            # 其余消息(心跳 pong 等)忽略
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("ws 通道异常(用户 %s)", user["username"])
+    finally:
+        if conn.get("ws") is websocket:
+            conn["ws"] = None
+        # 未决的 fsop 全部按失败收尾，避免挂起
+        for fut in conn["pending"].values():
+            if not fut.done():
+                fut.set_result({"ok": False, "error": "浏览器连接已断开"})
+        conn["pending"].clear()
+        logger.info("🔌 用户[%s] 本机文件通道已断开", user["username"])
 
 
 @app.post("/api/chat")
@@ -342,10 +566,25 @@ async def chat(req: ChatRequest, user: dict = Depends(require_user)):
     tool_map = dict(shared_mcp["tool_name_to_session"])
     for name in fs["names"]:
         tool_map[name] = fs["session"]
-    openai_tools = shared_mcp["openai_tools"] + fs["openai_tools"]
+    # 用户本机文件工具(浏览器授权目录)：shim 伪装成 session 无侵入接入
+    tool_map["user_filesystem"] = _UserFsShim(user)
+    openai_tools = shared_mcp["openai_tools"] + fs["openai_tools"] + [USER_FS_TOOL_DEF]
 
     # 带上该用户最近 8 轮问答作为上下文（服务端持久化历史）
-    history_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    user_dir = user_filesystem_dir(user["username"], user["id"])
+    sys_note = (
+        "\n\n[文件交付约定] 当你在用户的专属工作空间里生成或保存文件时，"
+        "请在回复正文中写出该文件的完整路径（形如："
+        f"{user_dir}/文件名.ext，从根目录写到扩展名）。"
+        "前端会把回复中出现的这个路径自动变成可点击的下载链接，"
+        "让用户点击即可把文件保存到自己的手机/电脑。"
+        "\n\n[本机文件工具 user_filesystem] 仅当用户明确要求操作“自己电脑/本地”的文件时使用"
+        "（如“读我电脑上的 xxx”“把结果存到我的本地文件夹”）。它操作的是用户浏览器里亲手授权的那个目录："
+        "path 用相对该目录的路径，正斜杠；目录列表用 op=list + 目录路径；读文本 op=read；"
+        "写入/覆盖 op=write + content。不要把服务器工作空间路径传给该工具，两者无关。"
+        "如果返回“未授权/浏览器未连接”之类错误，告诉用户点击页面顶部的“本机文件”按钮授权后重试。"
+    )
+    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
 
