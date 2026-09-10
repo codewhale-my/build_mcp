@@ -566,7 +566,7 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest, user: dict = Depends(require_user)):
+async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_user)):
     global shared_mcp
     if not shared_mcp or not shared_mcp.get("tool_name_to_session"):
         raise HTTPException(status_code=500, detail="MCP服务尚未就绪，请稍后再试")
@@ -594,7 +594,18 @@ async def chat(req: ChatRequest, user: dict = Depends(require_user)):
         "写入/覆盖 op=write + content。不要把服务器工作空间路径传给该工具，两者无关。"
         "如果返回“未授权/浏览器未连接”之类错误，告诉用户点击页面顶部的“本机文件”按钮授权后重试。"
     )
-    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note}]
+    # 用户公网 IP：locate_ip 不传参会用"发起请求方"的 IP——即服务器自己(机房 IP 高德定位不出结果)，
+    # 所以必须把用户真实公网 IP 注入上下文，让 AI 显式传给工具
+    client_ip = _client_ip(request)
+    ip_note = ""
+    if client_ip and client_ip != "unknown":
+        ip_note = (
+            f"\n\n[用户网络上下文] 当前用户的公网 IP 是 {client_ip}（IP 定位一般只精确到城市级，运营商出口可能有偏差）。"
+            "当用户询问“我在哪 / 我的位置 / 我附近”等需要定位的问题时，"
+            "必须调用 locate_ip 并把该 IP 作为 ip 参数显式传入；"
+            "不要不传参数调用 locate_ip——那样拿到的是服务器自己的 IP，定位不到用户。"
+        )
+    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
 
