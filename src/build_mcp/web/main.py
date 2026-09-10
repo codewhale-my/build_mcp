@@ -198,6 +198,55 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# ============ 用户浏览器精确定位(Geolocation) → 文字地址 ============
+# 前端授权定位后会上报经纬度；这里复用 MCP 服务同一份高德 key 做逆地理编码，
+# 直接把地址注入对话上下文，模型无需再为此多调一次工具。
+_amap_sdk = None
+
+
+def _get_amap_sdk():
+    """惰性构建一个高德 SDK（只用于逆地理编码）；失败返回 None，不影响主流程。"""
+    global _amap_sdk
+    if _amap_sdk is None:
+        try:
+            from build_mcp.common.config import load_config
+            from build_mcp.services.gd_sdk import GdSDK
+
+            cfg = load_config("config.yaml")
+            # 单独给一个只报 warn 的 logger：gd_sdk 会把每次请求+响应都记 info，
+            # 直接挂到 web logger 上会把 web.log 刷满高德返回体
+            quiet = logging.getLogger("build_mcp.amap_quiet")
+            quiet.setLevel(logging.WARNING)
+            _amap_sdk = GdSDK(
+                config={
+                    "base_url": "https://restapi.amap.com",
+                    "api_key": cfg.get("api_key", ""),
+                    "max_retries": 1,
+                    "retry_delay": 0.5,
+                },
+                logger=quiet,
+            )
+        except Exception:
+            logger.exception("初始化高德 SDK 失败（仅影响精确定位的地址解析）")
+            _amap_sdk = False
+    return _amap_sdk or None
+
+
+async def _reverse_geocode(lng: float, lat: float) -> str:
+    """经纬度 → 文字地址；任何异常都返回空串，绝不阻断对话。"""
+    sdk = _get_amap_sdk()
+    if not sdk:
+        return ""
+    try:
+        res = await sdk.regeo(f"{lng:.6f},{lat:.6f}")
+    except Exception as e:
+        logger.warning("逆地理编码失败: %s", e)
+        return ""
+    if isinstance(res, dict) and isinstance(res.get("formatted_address"), str):
+        return res["formatted_address"]
+    return ""
+
+
 def _check_login_rate(request: Request):
     """登录/注册接口限流：同一 IP 在窗口期内最多尝试 N 次。"""
     ip = _client_ip(request)
@@ -353,9 +402,17 @@ class AuthRequest(BaseModel):
     invite: str = ""   # 新用户注册必需
 
 
+class GeoFix(BaseModel):
+    """浏览器 Geolocation 上报的坐标（用户授权后前端才带）。"""
+    lat: float
+    lng: float
+    acc: Optional[float] = None   # 精度（米）
+
+
 class ChatRequest(BaseModel):
     query: str
     model: str = ""   # 前端选择的模型 key（见 config.yaml 的 llm_models）；空=用默认
+    geo: Optional[GeoFix] = None   # 用户已授权精确定位时的坐标，优先于 IP 定位
 
 
 @app.post("/api/auth")
@@ -605,7 +662,22 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             "必须调用 locate_ip 并把该 IP 作为 ip 参数显式传入；"
             "不要不传参数调用 locate_ip——那样拿到的是服务器自己的 IP，定位不到用户。"
         )
-    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note}]
+    # 用户浏览器精确定位：比 IP 定位准得多，优先使用，并免掉一次工具调用
+    geo_note = ""
+    if req.geo is not None and -90 <= req.geo.lat <= 90 and -180 <= req.geo.lng <= 180:
+        coord = f"{req.geo.lng:.6f},{req.geo.lat:.6f}"
+        addr = await _reverse_geocode(req.geo.lng, req.geo.lat)
+        acc_note = f"，精度约 ±{int(req.geo.acc)} 米" if req.geo.acc else ""
+        geo_note = (
+            f"\n\n[用户精确定位（用户已授权浏览器定位）] 坐标(lng,lat)={coord}{acc_note}。"
+            + (f"逆地理编码地址：{addr}。" if addr else "")
+            + "这是 GPS/WiFi 级精确定位，优先级高于上面的 IP 定位："
+            "当用户问“我在哪 / 我的位置 / 我附近”等问题时，"
+            f"直接把 search_nearby 的 location 参数填 \"{coord}\" 做周边搜索，不需要再调用 locate_ip；"
+            "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
+            "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
+        )
+    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note + geo_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
 

@@ -132,6 +132,10 @@ header{
 .m-anchor{position:relative;display:inline-flex}
 .mbtn .txt{max-width:150px}
 .mbtn .dot{background:var(--accent1);opacity:.85}
+/* 精确定位开关(浏览器 Geolocation) */
+.gbtn .dot{background:#94a3b8;opacity:.9}
+.gbtn.busy .dot{background:var(--accent1);animation:a-pulse 1s ease-in-out infinite}
+.gbtn.err .txt{color:var(--text3)}
 .ws-item .wi-tag{
   flex:none;font-size:10.5px;padding:1px 6px;border-radius:6px;
   background:var(--panel);color:var(--text3);border:1px solid var(--border);
@@ -435,8 +439,8 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   #plusBtn{width:38px;height:38px;border-radius:12px}
   /* 移动端隐藏“本机工作空间”按钮（File System Access 仅桌面浏览器支持），但保留模型选择 */
   .wsbar .ws-anchor{display:none!important}
-  .mbtn{height:30px;padding:0 10px;font-size:12px}
-  .mbtn .txt{max-width:110px}
+  .mbtn,.gbtn{height:30px;padding:0 10px;font-size:12px}
+  .mbtn .txt,.gbtn .txt{max-width:110px}
   .hint{display:none}
   .auth-overlay{padding:14px}
   .auth-card{padding:28px 22px 22px}
@@ -552,6 +556,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
         <button class="lbtn mbtn" id="modelBtn" title="选择回答模型"><span class="dot"></span><span class="txt" id="modelTxt">模型</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
         <div class="ws-menu" id="modelMenu" hidden></div>
       </div>
+      <button class="lbtn gbtn" id="geoBtn" title="开启精确定位"><span class="dot"></span><span class="txt" id="geoTxt">开启定位</span></button>
     </div>
     <input type="file" id="fileInput" hidden multiple>
     <div class="composer">
@@ -893,13 +898,14 @@ async function send(){
   busy=true;sendBtn.disabled=true;
   controller=new AbortController();
   ensureLiveMsg();
+  const gf=await geoForSend();   // 用户开了精确定位就带上坐标（最多等 3s）
   let answer='';
   let answeredModel='';
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
-      body:JSON.stringify({query:q,model:modelKey}),
+      body:JSON.stringify({query:q,model:modelKey,geo:gf?{lat:gf.lat,lng:gf.lng,acc:gf.acc}:undefined}),
       signal:controller.signal
     });
     if(resp.status===401){
@@ -1050,7 +1056,8 @@ async function doAuth(){
       hideAuth();
       await loadServerHistory();   // 拉取该用户自己的历史
       await loadModels();          // 拉取可选模型清单
-      localStatus();wsStart();await restoreLocalHandle();
+      localStatus();wsStart();await restoreLocalHandle();geoRender();
+      if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;
     }
@@ -1070,6 +1077,9 @@ async function doLogout(){
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}
   wsStop();localHandle=null;closeWsMenu();closeModelMenu();
   modelList=[];modelKey='';
+  geoEnabled=false;geoFix=null;
+  try{localStorage.removeItem(GEO_PREF)}catch(e){}
+  geoRender();
   localStatus();
   history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
@@ -1451,6 +1461,92 @@ document.addEventListener('click',e=>{
   if(anchor&&!anchor.contains(e.target))closeModelMenu();
 });
 /* =============== 模型选择 end =============== */
+
+/* =============== 精确定位(浏览器 Geolocation, 优先级高于 IP 定位) =============== */
+const GEO_PREF='hj_mcp_geo_on';          // 只记"用户是否想开启"，坐标永不落盘
+let geoEnabled=false, geoFix=null, geoBusy=false;
+try{geoEnabled=localStorage.getItem(GEO_PREF)==='1'}catch(e){}
+const geoBtn=$('#geoBtn'), geoTxt=$('#geoTxt');
+function geoSupported(){return !!(navigator&&navigator.geolocation)}
+function geoSecure(){
+  // 浏览器只在安全上下文暴露定位：https 或 localhost
+  return !!window.isSecureContext||location.hostname==='localhost'||location.hostname==='127.0.0.1';
+}
+function geoRender(){
+  if(!geoBtn)return;
+  geoBtn.hidden=false;
+  if(geoBusy){geoBtn.className='lbtn gbtn busy';geoTxt.textContent='定位中…';geoBtn.title='正在获取定位…';return}
+  if(!geoSupported()){
+    geoBtn.className='lbtn gbtn err';geoTxt.textContent='定位不可用';
+    geoBtn.title='当前浏览器不支持定位';
+  }else if(!geoSecure()){
+    geoBtn.className='lbtn gbtn err';geoTxt.textContent='定位需HTTPS';
+    geoBtn.title='浏览器要求 HTTPS 才允许精确定位；当前是 http 访问，暂时沿用 IP 定位（城市级）。配好域名+HTTPS 后即可开启。';
+  }else if(geoEnabled&&geoFix){
+    geoBtn.className='lbtn gbtn on';geoTxt.textContent='定位已开启';
+    geoBtn.title='已获取定位（精度约 ±'+Math.round(geoFix.acc||0)+' 米），点击关闭';
+  }else if(geoEnabled){
+    geoBtn.className='lbtn gbtn';geoTxt.textContent='定位未就绪';
+    geoBtn.title='已开启精确定位，但暂时没拿到坐标（信号弱/超时）。点一下可重试，发消息时也会自动重试。';
+  }else{
+    geoBtn.className='lbtn gbtn';geoTxt.textContent='开启定位';
+    geoBtn.title='点击开启精确定位（浏览器会询问授权），用于“我在哪 / 我附近”这类问题';
+  }
+}
+function geoErrHint(err){
+  const c=err&&err.code;
+  if(c===1)return '定位权限被拒绝，可在浏览器地址栏的权限设置里重新允许';
+  if(c===2)return '暂时拿不到定位（信号弱），继续使用 IP 定位';
+  if(c===3)return '定位超时，继续使用 IP 定位';
+  return '定位失败：'+((err&&err.message)||'未知原因');
+}
+function requestGeo(silent){
+  return new Promise(resolve=>{
+    if(!geoSupported()||!geoSecure()){resolve(null);return}
+    geoBusy=true;geoRender();
+    navigator.geolocation.getCurrentPosition(pos=>{
+      geoBusy=false;
+      const c=pos.coords||{};
+      geoFix={lat:c.latitude,lng:c.longitude,acc:c.accuracy,ts:Date.now()};
+      geoRender();
+      if(!silent)toast('定位已开启（精度约 ±'+Math.round(c.accuracy||0)+' 米）');
+      resolve(geoFix);
+    },err=>{
+      geoBusy=false;geoFix=null;
+      if(err&&err.code===1){geoEnabled=false;try{localStorage.removeItem(GEO_PREF)}catch(e){}}
+      geoRender();
+      if(!silent)toast(geoErrHint(err));
+      resolve(null);
+    },{enableHighAccuracy:true,timeout:12000,maximumAge:60000});
+  });
+}
+function geoBtnClick(){
+  if(geoBusy)return;
+  if(!geoSupported()){toast('当前浏览器不支持定位');return}
+  if(!geoSecure()){
+    toast('浏览器只在 HTTPS 下允许精确定位；当前是 http 访问，先用 IP 定位，配好域名+HTTPS 后即可开启');
+    return;
+  }
+  if(geoEnabled&&geoFix){   // 已就绪 → 这次点击用来关闭
+    geoEnabled=false;geoFix=null;
+    try{localStorage.removeItem(GEO_PREF)}catch(e){}
+    geoRender();toast('已关闭精确定位，改回 IP 定位');
+    return;
+  }
+  geoEnabled=true;          // 未开启 / 已开启但没坐标 → 开启并取一次
+  try{localStorage.setItem(GEO_PREF,'1')}catch(e){}
+  requestGeo(false);
+}
+async function geoForSend(){
+  // 发送时取一份尽量新鲜的坐标；最多等 3s，绝不拖垮发送
+  if(!geoEnabled||!geoSupported()||!geoSecure())return null;
+  if(geoFix&&Date.now()-(geoFix.ts||0)<180000)return geoFix;
+  await Promise.race([requestGeo(true),sleep(3000)]);
+  return geoFix;
+}
+if(geoBtn)geoBtn.onclick=geoBtnClick;
+geoRender();
+/* =============== 精确定位 end =============== */
 /* =============== 本机文件桥 end =============== */
 
 (async function initAuth(){
@@ -1464,7 +1560,8 @@ document.addEventListener('click',e=>{
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
       await loadModels();          // 可选模型清单
-      localStatus();wsStart();await restoreLocalHandle();
+      localStatus();wsStart();await restoreLocalHandle();geoRender();
+      if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;
     }
