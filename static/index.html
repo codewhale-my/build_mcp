@@ -374,6 +374,16 @@ header{
 #sendBtn:active{transform:scale(.95)}
 #sendBtn:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
 #sendBtn svg{width:18px;height:18px}
+#plusBtn{
+  width:42px;height:42px;flex:none;cursor:pointer;
+  border:1px solid var(--border-strong);border-radius:14px;background:var(--bubble);
+  color:var(--text2);display:flex;align-items:center;justify-content:center;transition:.18s;
+}
+#plusBtn:hover{color:var(--accent1);border-color:var(--accent1);transform:translateY(-1px)}
+#plusBtn:active{transform:scale(.95)}
+#plusBtn svg{width:19px;height:19px}
+#plusBtn.busy{opacity:.5;pointer-events:none}
+.composer.dragover{border-color:var(--accent1);box-shadow:0 0 0 3px var(--glow),var(--shadow)}
 .hint{text-align:center;font-size:11px;color:var(--text3);margin-top:8px}
 /* ============ 移动端 ============ */
 button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
@@ -404,9 +414,11 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   .sugg{padding:11px 12px;border-radius:12px}
   .sugg b{font-size:12.5px}
   .sugg span{font-size:11px}
-  .composer{border-radius:16px;padding:7px 7px 7px 13px}
+  .composer{border-radius:16px;padding:7px 7px 7px 13px;gap:8px}
   #inputBox{font-size:16px} /* ≥16px 防 iOS 聚焦时页面自动放大 */
   #sendBtn{width:38px;height:38px;border-radius:12px}
+  #plusBtn{width:38px;height:38px;border-radius:12px}
+  .wsbar{display:none!important} /* 移动端不提供本机工作空间（File System Access 仅桌面浏览器支持） */
   .hint{display:none}
   .auth-overlay{padding:14px}
   .auth-card{padding:28px 22px 22px}
@@ -519,8 +531,12 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
       </div>
       <input type="file" id="localUpload" hidden multiple>
     </div>
+    <input type="file" id="photoInput" accept="image/*" hidden multiple>
     <div class="composer">
       <textarea id="inputBox" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="plusBtn" title="上传照片/图片">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
       <button id="sendBtn" title="发送">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.4l17.5-7.5a1 1 0 0 0 0-1.8L3.4 3.6a.9.9 0 0 0-1.2 1l2 6.7a1 1 0 0 0 .8.7l9 .6-9 .6a1 1 0 0 0-.8.7l-2 6.7a.9.9 0 0 0 1.2 1.1z"/></svg>
       </button>
@@ -1209,6 +1225,53 @@ async function uploadFiles(files){
     }catch(e){toast('上传失败：'+e.message)}
   }
 }
+/* =============== 照片上传(+ 按钮)：桌面=文件对话框/拖拽/粘贴；移动端=相机或相册 =============== */
+const plusBtn=$('#plusBtn'), photoInput=$('#photoInput'), composerEl=$('.composer');
+const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent||'');
+async function uploadPhotos(files){
+  const list=[...files].filter(f=>f&&f.type&&f.type.indexOf('image/')===0);
+  if(!list.length){toast('只能上传图片文件');return}
+  if(plusBtn)plusBtn.classList.add('busy');
+  const paths=[];
+  try{
+    for(const f of list){
+      if(f.size>8*1024*1024){toast('「'+(f.name||'图片')+'」超过 8MB，已跳过');continue}
+      const fd=new FormData();
+      fd.append('file',f,f.name||('photo_'+Date.now()+'.png'));
+      try{
+        const r=await fetch('/api/uploads',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:fd});
+        const d=await r.json().catch(()=>({}));
+        if(r.ok&&d.path)paths.push(d.path);
+        else toast('上传失败：'+(d.detail||('HTTP '+r.status)));
+      }catch(e){toast('上传失败：'+e.message)}
+    }
+  }finally{
+    if(plusBtn)plusBtn.classList.remove('busy');
+    if(photoInput)photoInput.value='';
+  }
+  if(paths.length){
+    const mark=paths.map(p=>'[图片: '+p+']').join(' ');
+    inputBox.value=(inputBox.value?inputBox.value.replace(/\s+$/,'')+' ':'')+mark+' ';
+    autoGrow();inputBox.focus();
+    toast(IS_MOBILE?('已上传 '+paths.length+' 张照片，可补充说明后发送'):('已上传 '+paths.length+' 张图片（已插入引用），可补充说明后发送'));
+  }
+}
+if(plusBtn)plusBtn.onclick=()=>{photoInput&&photoInput.click()};
+if(photoInput)photoInput.onchange=e=>{uploadPhotos(e.target.files)};
+if(composerEl){
+  composerEl.addEventListener('dragover',e=>{e.preventDefault();composerEl.classList.add('dragover')});
+  composerEl.addEventListener('dragleave',()=>composerEl.classList.remove('dragover'));
+  composerEl.addEventListener('drop',e=>{
+    const fs=e.dataTransfer&&e.dataTransfer.files;
+    if(fs&&fs.length){e.preventDefault();composerEl.classList.remove('dragover');uploadPhotos(fs)}
+  });
+}
+document.addEventListener('paste',e=>{
+  const fs=e.clipboardData&&e.clipboardData.files;
+  if(fs&&fs.length&&[...fs].some(f=>f.type&&f.type.indexOf('image/')===0))uploadPhotos(fs);
+});
+/* =============== 照片上传 end =============== */
+
 async function localBtnClick(){
   if(!window.showDirectoryPicker||!window.FileSystemDirectoryHandle){
     localUp.click();
