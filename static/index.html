@@ -531,10 +531,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
       </div>
       <input type="file" id="localUpload" hidden multiple>
     </div>
-    <input type="file" id="photoInput" accept="image/*" hidden multiple>
+    <input type="file" id="fileInput" hidden multiple>
     <div class="composer">
       <textarea id="inputBox" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
-      <button id="plusBtn" title="上传照片/图片">
+      <button id="plusBtn" title="上传文件（图片、文档、表格、压缩包…）">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
       </button>
       <button id="sendBtn" title="发送">
@@ -637,8 +637,8 @@ function renderMarkdown(src){
 
 // 把渲染后的 HTML 中出现的"本用户工作空间绝对路径"变成可点击的下载链接
 function linkifyUserFiles(html){
-  if(!myUserRoot||!html)return html;
-  const root=esc(myUserRoot.replace(/\/+$/,'')).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  if(!html)return html;
+  const root=myUserRoot?esc(myUserRoot.replace(/\/+$/,'')).replace(/[.*+?^${}()|[\]\\]/g,'\\$&'):null;
   // 生成下载卡片；失败返回 null（调用方保留原文）
   const mk=(rel)=>{
     // 去掉结尾被顺带吸进来的常见标点/括号
@@ -656,6 +656,11 @@ function linkifyUserFiles(html){
     return '<a class="filedl ext-'+esc(ext||'bin')+'" href="'+href+'" target="_blank" rel="noopener" title="点击保存到你的设备">'+
       '<span class="f-ico">'+ico+'</span><span class="f-name">'+esc(name)+'</span><span class="f-dl">↓</span></a>';
   };
+  // ① 上传引用标记([图片: 路径]/[文件: 路径]) → 直接变成下载卡片, 连外壳一起去掉
+  html=html.replace(/\[(?:图片|文件|附件):\s*([^\]]+?)\s*\]/g,(m,rel)=>mk(rel)||m);
+  // ② 用户上传的附件相对路径 _uploads/xxx 的裸路径兜底
+  html=html.replace(/(^|[\s（(>：:，,、])(_uploads\/[^\s<>"'`\[\]]+)/g,(m,p1,rel)=>{const c=mk(rel);return c?(p1+c):m});
+  if(!root)return html;
   // 路径被 AI 包进反引号时,渲染成 <code>路径</code> —— 必须连外壳一起替换,
   // 否则 code 的背景/边框会在卡片两侧露出长条
   html=html.replace(new RegExp('<code>\\s*('+root+'[^<]*?)\\s*</code>','g'),(m,rel)=>mk(rel)||m);
@@ -1211,66 +1216,63 @@ function wsStop(){
   ws=null;
 }
 
-/* 降级上传(不支持目录授权/移动端): 文件传进服务器工作空间 _uploads/ */
-async function uploadFiles(files){
-  if(!files||!files.length)return;
-  for(const f of files){
-    if(f.size>8*1024*1024){toast('「'+f.name+'」超过 8MB，未上传');continue}
-    const fd=new FormData();fd.append('file',f,f.name);
-    try{
-      const r=await fetch('/api/uploads',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:fd});
-      const d=await r.json().catch(()=>({}));
-      if(r.ok&&d.path)toast('已上传「'+d.name+'」到工作空间 _uploads/，可以让我读取处理');
-      else toast('上传失败：'+(d.detail||('HTTP '+r.status)));
-    }catch(e){toast('上传失败：'+e.message)}
-  }
-}
-/* =============== 照片上传(+ 按钮)：桌面=文件对话框/拖拽/粘贴；移动端=相机或相册 =============== */
-const plusBtn=$('#plusBtn'), photoInput=$('#photoInput'), composerEl=$('.composer');
+/* =============== 文件上传(+ 按钮)：图片/文档/表格/压缩包… 任意类型 =============== */
+/* 桌面: 点 + 弹文件对话框 / 拖拽到输入框 / Ctrl+V 粘贴；移动端: 点 + 由系统弹层选(拍照、相册、文件) */
+const MAX_UP=8*1024*1024;
+const IMG_RE=/\.(png|jpe?g|gif|webp|bmp|svg|ico|heic|heif|avif|tiff?)$/i;
+const plusBtn=$('#plusBtn'), fileInput=$('#fileInput'), composerEl=$('.composer');
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent||'');
-async function uploadPhotos(files){
-  const list=[...files].filter(f=>f&&f.type&&f.type.indexOf('image/')===0);
-  if(!list.length){toast('只能上传图片文件');return}
+// 生成插入输入框的引用标记：图片=[图片: 路径]，其他=[文件: 路径]，AI 据此读取该文件
+function attachMark(path,name,type){
+  const isImg=(type&&type.indexOf('image/')===0)||IMG_RE.test(name||path||'');
+  return (isImg?'[图片: ':'[文件: ')+path+']';
+}
+/* 统一上传入口：任意文件 → 服务器工作空间 _uploads/，成功后把引用插入输入框 */
+async function uploadFiles(files){
+  const list=[...(files||[])].filter(Boolean);
+  if(!list.length)return [];
   if(plusBtn)plusBtn.classList.add('busy');
-  const paths=[];
+  const ok=[];
   try{
     for(const f of list){
-      if(f.size>8*1024*1024){toast('「'+(f.name||'图片')+'」超过 8MB，已跳过');continue}
-      const fd=new FormData();
-      fd.append('file',f,f.name||('photo_'+Date.now()+'.png'));
+      const fname=f.name||('file_'+Date.now());
+      if(f.size>MAX_UP){toast('「'+fname+'」超过 8MB，已跳过');continue}
+      const fd=new FormData();fd.append('file',f,fname);
       try{
         const r=await fetch('/api/uploads',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:fd});
         const d=await r.json().catch(()=>({}));
-        if(r.ok&&d.path)paths.push(d.path);
+        if(r.ok&&d.path)ok.push({path:d.path,name:d.name||fname,type:f.type});
         else toast('上传失败：'+(d.detail||('HTTP '+r.status)));
       }catch(e){toast('上传失败：'+e.message)}
     }
   }finally{
     if(plusBtn)plusBtn.classList.remove('busy');
-    if(photoInput)photoInput.value='';
+    if(fileInput)fileInput.value='';
+    if(localUp)localUp.value='';
   }
-  if(paths.length){
-    const mark=paths.map(p=>'[图片: '+p+']').join(' ');
+  if(ok.length){
+    const mark=ok.map(o=>attachMark(o.path,o.name,o.type)).join(' ');
     inputBox.value=(inputBox.value?inputBox.value.replace(/\s+$/,'')+' ':'')+mark+' ';
     autoGrow();inputBox.focus();
-    toast(IS_MOBILE?('已上传 '+paths.length+' 张照片，可补充说明后发送'):('已上传 '+paths.length+' 张图片（已插入引用），可补充说明后发送'));
+    toast('已上传 '+ok.length+' 个文件'+(IS_MOBILE?'，可补充说明后发送':'（引用已插入输入框），可补充说明后发送'));
   }
+  return ok;
 }
-if(plusBtn)plusBtn.onclick=()=>{photoInput&&photoInput.click()};
-if(photoInput)photoInput.onchange=e=>{uploadPhotos(e.target.files)};
+if(plusBtn)plusBtn.onclick=()=>{fileInput&&fileInput.click()};
+if(fileInput)fileInput.onchange=e=>{uploadFiles(e.target.files)};
 if(composerEl){
   composerEl.addEventListener('dragover',e=>{e.preventDefault();composerEl.classList.add('dragover')});
   composerEl.addEventListener('dragleave',()=>composerEl.classList.remove('dragover'));
   composerEl.addEventListener('drop',e=>{
     const fs=e.dataTransfer&&e.dataTransfer.files;
-    if(fs&&fs.length){e.preventDefault();composerEl.classList.remove('dragover');uploadPhotos(fs)}
+    if(fs&&fs.length){e.preventDefault();composerEl.classList.remove('dragover');uploadFiles(fs)}
   });
 }
 document.addEventListener('paste',e=>{
   const fs=e.clipboardData&&e.clipboardData.files;
-  if(fs&&fs.length&&[...fs].some(f=>f.type&&f.type.indexOf('image/')===0))uploadPhotos(fs);
+  if(fs&&fs.length)uploadFiles(fs);
 });
-/* =============== 照片上传 end =============== */
+/* =============== 文件上传 end =============== */
 
 async function localBtnClick(){
   if(!window.showDirectoryPicker||!window.FileSystemDirectoryHandle){
