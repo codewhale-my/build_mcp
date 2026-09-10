@@ -19,11 +19,76 @@ from build_mcp.common.config import load_config
 config = load_config("config.yaml")
 LLM_BASE_URL = config["llm_base_url"]
 LLM_API_KEY = config["llm_api_key"]
-LLM_MODEL = config["llm_model"]
-# 思考模式：true=先推理(reasoning_content)再回答，前端可展示思考过程。
-# 注：DeepSeek 思考模式下 temperature 无效(被忽略)，由 reasoning_effort 控制风格。
-LLM_THINKING = bool(config.get("llm_thinking", True))
-LLM_REASONING_EFFORT = str(config.get("llm_reasoning_effort", "low")).strip() or "low"
+
+
+def _load_model_catalog() -> tuple[List[dict], str]:
+    """解析模型目录。
+
+    推荐写法：`llm_models` 列出可选模型（key/label/model/thinking/reasoning_effort），
+    `llm_model` 填其中某一项的 key 作为默认。
+    兼容旧写法：`llm_model` 直接写模型名，思考模式看 `llm_thinking` / `llm_reasoning_effort`。
+    """
+    specs: List[dict] = []
+    raw = config.get("llm_models")
+    if isinstance(raw, list):
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            model = str(item.get("model") or "").strip()
+            if not model:
+                continue
+            key = str(item.get("key") or "").strip() or f"m{i + 1}"
+            specs.append({
+                "key": key,
+                "label": str(item.get("label") or key).strip(),
+                "model": model,
+                "thinking": bool(item.get("thinking", False)),
+                "reasoning_effort": str(item.get("reasoning_effort") or "low").strip() or "low",
+            })
+
+    default_key = str(config.get("llm_model") or "").strip()
+    if not specs:
+        # 旧配置兼容：llm_model 本身就是模型名
+        model = default_key or "deepseek-flash"
+        specs = [{
+            "key": model,
+            "label": model,
+            "model": model,
+            "thinking": bool(config.get("llm_thinking", False)),
+            "reasoning_effort": str(config.get("llm_reasoning_effort", "low")).strip() or "low",
+        }]
+        default_key = model
+    elif default_key not in {s["key"] for s in specs}:
+        # llm_model 里写的是模型名（而非 key）时，按模型名匹配，匹配不到就用第一项
+        same_model = [s["key"] for s in specs if s["model"] == default_key]
+        default_key = same_model[0] if same_model else specs[0]["key"]
+    return specs, default_key
+
+
+LLM_SPECS, LLM_DEFAULT_KEY = _load_model_catalog()
+
+
+def list_llm_models() -> Dict[str, Any]:
+    """给前端下拉用的模型清单（只含展示信息，不含密钥）。"""
+    return {
+        "default": LLM_DEFAULT_KEY,
+        "models": [
+            {"key": s["key"], "label": s["label"], "model": s["model"], "thinking": s["thinking"]}
+            for s in LLM_SPECS
+        ],
+    }
+
+
+def resolve_llm_spec(model_key: str | None = None) -> Dict[str, Any]:
+    """按前端提交的 key 取模型配置；空值 / 非法值一律回落到默认项。"""
+    key = (model_key or "").strip()
+    for spec in LLM_SPECS:
+        if spec["key"] == key:
+            return spec
+    for spec in LLM_SPECS:
+        if spec["key"] == LLM_DEFAULT_KEY:
+            return spec
+    return LLM_SPECS[0]
 
 # ========== 对话 System Prompt（CLI 与 Web 共用） ==========
 SYSTEM_PROMPT = (
@@ -230,18 +295,19 @@ def _delta_field(delta, name):
         return None
 
 
-def _build_llm_request(work_messages: list[dict], openai_tools) -> Dict[str, Any]:
-    """组装一次 chat.completions 请求参数（按 llm_thinking 开关决定是否开思考模式）。"""
+def _build_llm_request(work_messages: list[dict], openai_tools, spec: dict | None = None) -> Dict[str, Any]:
+    """组装一次 chat.completions 请求参数（按所选模型的 thinking 开关决定是否开思考模式）。"""
+    spec = spec or resolve_llm_spec()
     req: Dict[str, Any] = {
-        "model": LLM_MODEL,
+        "model": spec["model"],
         # 统一清洗后再发送：工具返回等外部文本可能携带非法代理项，会炸序列化
         "messages": _sanitize(work_messages),
         "tools": openai_tools,
     }
-    if LLM_THINKING:
+    if spec["thinking"]:
         # 开启 DeepSeek 思考模式：先输出 reasoning_content 再给 content
         req["extra_body"] = {"thinking": {"type": "enabled"}}
-        req["reasoning_effort"] = LLM_REASONING_EFFORT
+        req["reasoning_effort"] = spec["reasoning_effort"]
     else:
         req["temperature"] = 0.3  # 非思考模式沿用原温度
     return req
@@ -252,22 +318,27 @@ async def agent_loop_stream(
     openai_tools: List[Dict[str, Any]],
     user_query: str,
     history_messages: list[dict],
+    model_key: str | None = None,
 ):
     """
     流式执行一轮「推理 + 工具调用」，逐事件产出给调用方(Web SSE / CLI)。
+
+    model_key: 前端选择的模型 key(见 config.yaml 的 llm_models)；None/非法 → 用默认模型。
 
     产出的事件 dict：
       {"type": "thinking", "delta": str}    思考过程增量(模型思考时实时下发)
       {"type": "answer",   "delta": str}    最终回答增量
       {"type": "tool", "name": str, "status": "start"|"ok"|"error", "note": str}
                                             (note 仅 start/error 时可能带参数或原因)
-      {"type": "done", "answer": str, "thinking": str}   整轮结束(携带全文)
+      {"type": "done", "answer": str, "thinking": str, "model": str, "model_key": str}
+                                            整轮结束(携带全文与实际使用的模型)
       {"type": "error", "message": str}    硬错误(网络/API/解析等)
 
     不修改传入的 history_messages，中间工具过程只在本轮内部。
     工具轮次的 reasoning_content 会随 assistant 消息一起回传(DeepSeek 要求，
     否则带 tools 的后续请求会 400)。
     """
+    spec = resolve_llm_spec(model_key)
     work_messages = history_messages.copy()
     work_messages.append({"role": "user", "content": user_query})
 
@@ -280,7 +351,7 @@ async def agent_loop_stream(
     max_round = 1000
 
     for _ in range(max_round):
-        req = _build_llm_request(work_messages, openai_tools)
+        req = _build_llm_request(work_messages, openai_tools, spec)
 
         # ---------- 发起流式请求 ----------
         try:
@@ -341,6 +412,8 @@ async def agent_loop_stream(
                 "type": "done",
                 "answer": content_acc,
                 "thinking": "\n\n".join(p for p in thinking_parts if p),
+                "model": spec["model"],
+                "model_key": spec["key"],
             }
             return
 
@@ -391,6 +464,8 @@ async def agent_loop_stream(
         "type": "done",
         "answer": "已达到最大工具调用轮次，停止处理。",
         "thinking": "\n\n".join(p for p in thinking_parts if p),
+        "model": spec["model"],
+        "model_key": spec["key"],
     }
 
 

@@ -128,6 +128,21 @@ header{
 }
 .wsbar[hidden]{display:none}
 .ws-anchor{position:relative;display:inline-flex}
+/* 模型选择按钮(与工作空间按钮同款外观, 位于其右侧) */
+.m-anchor{position:relative;display:inline-flex}
+.mbtn .txt{max-width:150px}
+.mbtn .dot{background:var(--accent1);opacity:.85}
+.ws-item .wi-tag{
+  flex:none;font-size:10.5px;padding:1px 6px;border-radius:6px;
+  background:var(--panel);color:var(--text3);border:1px solid var(--border);
+}
+.ws-item .wi-check{flex:none;color:var(--accent1);font-weight:700}
+/* 回答下方的小字：本轮由哪个模型回答 */
+.msg-model{font-size:11px;color:var(--text3);margin-top:5px;opacity:.9}
+.msg-model .mm-dot{
+  display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent1);
+  margin-right:5px;vertical-align:middle;opacity:.8;
+}
 .lbtn .chev{width:11px;height:11px;flex:none;opacity:.7;transition:transform .18s}
 .lbtn.open .chev{transform:rotate(180deg)}
 .ws-menu{
@@ -418,7 +433,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   #inputBox{font-size:16px} /* ≥16px 防 iOS 聚焦时页面自动放大 */
   #sendBtn{width:38px;height:38px;border-radius:12px}
   #plusBtn{width:38px;height:38px;border-radius:12px}
-  .wsbar{display:none!important} /* 移动端不提供本机工作空间（File System Access 仅桌面浏览器支持） */
+  /* 移动端隐藏“本机工作空间”按钮（File System Access 仅桌面浏览器支持），但保留模型选择 */
+  .wsbar .ws-anchor{display:none!important}
+  .mbtn{height:30px;padding:0 10px;font-size:12px}
+  .mbtn .txt{max-width:110px}
   .hint{display:none}
   .auth-overlay{padding:14px}
   .auth-card{padding:28px 22px 22px}
@@ -530,6 +548,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
         <div class="ws-menu" id="wsMenu" hidden></div>
       </div>
       <input type="file" id="localUpload" hidden multiple>
+      <div class="m-anchor">
+        <button class="lbtn mbtn" id="modelBtn" title="选择回答模型"><span class="dot"></span><span class="txt" id="modelTxt">模型</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="ws-menu" id="modelMenu" hidden></div>
+      </div>
     </div>
     <input type="file" id="fileInput" hidden multiple>
     <div class="composer">
@@ -693,7 +715,7 @@ async function loadServerHistory(){
     if(d&&d.user_root)myUserRoot=d.user_root;
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
-      .map(m=>({role:m.role,text:m.text,ts:m.ts}));
+      .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||''}));
   }catch(e){
     history=[];
   }
@@ -726,7 +748,9 @@ function buildMsg(item){
     }else{
       body='<div class="bubble">'+linkifyUserFiles(renderMarkdown(item.text))+'</div>';
     }
-    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+'</div>';
+    const mchip=(item.role==='assistant'&&item.model)
+      ? '<div class="msg-model"><span class="mm-dot"></span>'+esc(item.model)+'</div>' : '';
+    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+mchip+'</div>';
   }
   return wrap;
 }
@@ -870,11 +894,12 @@ async function send(){
   controller=new AbortController();
   ensureLiveMsg();
   let answer='';
+  let answeredModel='';
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
-      body:JSON.stringify({query:q}),
+      body:JSON.stringify({query:q,model:modelKey}),
       signal:controller.signal
     });
     if(resp.status===401){
@@ -934,6 +959,7 @@ async function send(){
           scrollKeep();
         }else if(ev.type==='done'){
           if(ev.answer!==undefined)answer=ev.answer;
+          if(ev.model_key)answeredModel=modelLabel(ev.model_key);
           completed=true;
         }else if(ev.type==='error'){
           throw new Error(ev.message||'服务端流式错误');
@@ -942,7 +968,8 @@ async function send(){
       if(completed)break;
     }
     // 结束：用最终全文渲染替换直播气泡
-    const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）'};
+    const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）',
+              model:answeredModel||modelLabel(modelKey)};
     finishLiveStream(it);
   }catch(err){
     const el=liveMsgEl;el&&el.remove();liveCleanup();
@@ -1022,6 +1049,7 @@ async function doAuth(){
       if(authInvite)authInvite.value='';
       hideAuth();
       await loadServerHistory();   // 拉取该用户自己的历史
+      await loadModels();          // 拉取可选模型清单
       localStatus();wsStart();await restoreLocalHandle();
       inputBox.focus();
       return;
@@ -1040,7 +1068,8 @@ async function doLogout(){
   try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+authToken}})}catch(e){}
   authToken='';me={name:''};
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}
-  wsStop();localHandle=null;closeWsMenu();
+  wsStop();localHandle=null;closeWsMenu();closeModelMenu();
+  modelList=[];modelKey='';
   localStatus();
   history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
@@ -1344,6 +1373,84 @@ document.addEventListener('click',e=>{
 });
 if(localBtn)localBtn.onclick=localBtnClick;
 if(localUp)localUp.onchange=e=>{uploadFiles([...e.target.files]);e.target.value=''};
+
+/* =============== 模型选择(回答用哪个模型, 逐轮生效) =============== */
+const MODEL_KEY='hj_mcp_model';
+const modelBtn=$('#modelBtn'), modelMenu=$('#modelMenu');
+let modelList=[], modelDefault='', modelKey='';
+function modelLabel(key){
+  const it=modelList.find(m=>m.key===key);
+  return it?it.label:(key||'');
+}
+function renderModelBtn(){
+  if(!modelBtn)return;
+  modelBtn.hidden=false;
+  const cur=modelList.find(m=>m.key===modelKey);
+  const txt=$('#modelTxt');
+  if(txt)txt.textContent=cur?cur.label:(modelList.length?'模型':'模型');
+  modelBtn.title=cur
+    ? ('当前模型：'+cur.label+(cur.thinking?'（思考模式）':'')+'　点击切换')
+    : '选择回答模型';
+}
+function openModelMenu(){
+  if(!modelMenu)return;
+  if(!modelList.length){
+    modelMenu.innerHTML='<div class="ws-hd"><span>回答模型</span></div>'+
+      '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">模型列表未加载</div>';
+    modelMenu.hidden=false;return;
+  }
+  let html='<div class="ws-hd"><span>选择回答模型</span><span>'+(modelKey===modelDefault?'默认':'')+'</span></div>';
+  modelList.forEach(m=>{
+    const isCur=m.key===modelKey;
+    html+='<button class="ws-item" data-key="'+esc(m.key)+'">'+
+      '<span class="wi-ico">'+(m.thinking?'🧠':'⚡')+'</span>'+
+      '<span class="wi-name">'+esc(m.label)+'</span>'+
+      '<span class="wi-tag">'+(m.thinking?'思考':'快答')+'</span>'+
+      (isCur?'<span class="wi-check">✓</span>':'')+
+    '</button>';
+  });
+  modelMenu.innerHTML=html;
+  modelMenu.querySelectorAll('.ws-item').forEach(btn=>{
+    btn.onclick=()=>{setModel(btn.dataset.key);closeModelMenu()};
+  });
+  modelMenu.hidden=false;
+}
+function closeModelMenu(){
+  if(modelMenu)modelMenu.hidden=true;
+  if(modelBtn)modelBtn.classList.remove('open');
+}
+function toggleModelMenu(){
+  if(!modelMenu)return;
+  if(!modelMenu.hidden){closeModelMenu();return}
+  openModelMenu();
+  if(modelBtn)modelBtn.classList.add('open');
+}
+function setModel(key){
+  if(!key)return;
+  modelKey=key;
+  try{localStorage.setItem(MODEL_KEY,key)}catch(e){}
+  renderModelBtn();
+}
+async function loadModels(){
+  try{
+    const r=await fetch('/api/models',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return;
+    const d=await r.json();
+    modelList=Array.isArray(d.models)?d.models:[];
+    modelDefault=d.default||((modelList[0]&&modelList[0].key)||'');
+    let saved='';
+    try{saved=localStorage.getItem(MODEL_KEY)||''}catch(e){}
+    modelKey=modelList.some(m=>m.key===saved)?saved:modelDefault;
+    renderModelBtn();
+  }catch(e){/* 拉不到就用默认, 不影响对话 */}
+}
+if(modelBtn)modelBtn.onclick=toggleModelMenu;
+document.addEventListener('click',e=>{
+  if(!modelMenu||modelMenu.hidden)return;
+  const anchor=modelBtn&&modelBtn.parentElement;
+  if(anchor&&!anchor.contains(e.target))closeModelMenu();
+});
+/* =============== 模型选择 end =============== */
 /* =============== 本机文件桥 end =============== */
 
 (async function initAuth(){
@@ -1356,6 +1463,7 @@ if(localUp)localUp.onchange=e=>{uploadFiles([...e.target.files]);e.target.value=
       myUserRoot=(d&&d.user_root)||'';
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
+      await loadModels();          // 可选模型清单
       localStatus();wsStart();await restoreLocalHandle();
       inputBox.focus();
       return;

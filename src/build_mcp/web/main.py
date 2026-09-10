@@ -46,6 +46,8 @@ from pydantic import BaseModel
 from build_mcp.client.conversation import (
     agent_loop_stream,
     init_all_mcp_sessions,
+    list_llm_models,
+    resolve_llm_spec,
     SYSTEM_PROMPT,
 )
 from build_mcp.client.conversation import (
@@ -353,6 +355,7 @@ class AuthRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str
+    model: str = ""   # 前端选择的模型 key（见 config.yaml 的 llm_models）；空=用默认
 
 
 @app.post("/api/auth")
@@ -413,6 +416,12 @@ async def me(user: dict = Depends(require_user)):
     }
 
 
+@app.get("/api/models")
+async def models(user: dict = Depends(require_user)):
+    """可选回答模型清单（前端下拉用）：默认项 + 每个模型的 key/label/model/thinking。"""
+    return list_llm_models()
+
+
 @app.get("/api/history")
 async def history(user: dict = Depends(require_user), limit: int = 200):
     """当前用户的历史消息（只返回自己的）。"""
@@ -422,7 +431,8 @@ async def history(user: dict = Depends(require_user), limit: int = 200):
         "username": user["username"],
         "user_root": str(user_filesystem_dir(user["username"], user["id"]).resolve()),
         "messages": [
-            {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"]}
+            {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"],
+             "model": m.get("model") or ""}
             for m in msgs
         ],
     }
@@ -589,10 +599,14 @@ async def chat(req: ChatRequest, user: dict = Depends(require_user)):
         history_messages.append({"role": m["role"], "content": m["text"]})
 
     lock = _chat_locks.setdefault(user["id"], asyncio.Lock())
+    _spec = resolve_llm_spec(req.model)
+    logger.info("💬 用户[%s] 提问 → 模型 %s(%s, thinking=%s)",
+                user["username"], _spec["model"], _spec["key"], _spec["thinking"])
 
     async def event_gen():
         answer: str | None = None
         failed = False
+        used_model = ""
         try:
             # 同一用户串行：锁跨整个流式过程持有，防止上下文竞态
             async with lock:
@@ -601,9 +615,11 @@ async def chat(req: ChatRequest, user: dict = Depends(require_user)):
                     openai_tools=openai_tools,
                     user_query=req.query,
                     history_messages=history_messages,
+                    model_key=req.model,
                 ):
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
+                        used_model = _spec["label"] or ev.get("model") or _spec["model"]
                     elif ev.get("type") == "error":
                         failed = True
                     yield _sse(ev)
@@ -618,7 +634,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_user)):
             # 完整结束才写入历史（中止/出错不写，保持历史干净成对）
             if answer is not None and answer.strip() and not failed:
                 add_message(user["id"], "user", req.query)
-                add_message(user["id"], "assistant", answer.strip())
+                add_message(user["id"], "assistant", answer.strip(), used_model)
 
     return StreamingResponse(
         event_gen(),

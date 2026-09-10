@@ -89,10 +89,18 @@ CREATE TABLE IF NOT EXISTS messages(
   user_id INTEGER NOT NULL REFERENCES users(id),
   role    TEXT NOT NULL CHECK(role IN ('user','assistant')),
   text    TEXT NOT NULL,
-  ts      REAL NOT NULL
+  ts      REAL NOT NULL,
+  model   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量迁移：给已有库补上新增列（老库没有 model 列）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "model" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''")
 
 
 def init_db(import_env_codes: str = ""):
@@ -100,6 +108,7 @@ def init_db(import_env_codes: str = ""):
     conn = _conn()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         for item in [c.strip() for c in (import_env_codes or "").split(",") if c.strip()]:
             code, _, note = item.partition(":")
             nc = normalize_code(code)
@@ -269,13 +278,13 @@ def list_users() -> list[dict]:
 
 
 # ---------------- 消息 ----------------
-def add_message(user_id: int, role: str, text: str) -> None:
+def add_message(user_id: int, role: str, text: str, model: str = "") -> None:
     conn = _conn()
     try:
         with conn:
             conn.execute(
-                "INSERT INTO messages(user_id,role,text,ts) VALUES(?,?,?,?)",
-                (user_id, role, text, time.time()),
+                "INSERT INTO messages(user_id,role,text,ts,model) VALUES(?,?,?,?,?)",
+                (user_id, role, text, time.time(), model or ""),
             )
     finally:
         conn.close()
@@ -285,7 +294,7 @@ def list_messages(user_id: int, limit: int = 200) -> list[dict]:
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT id,role,text,ts FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            "SELECT id,role,text,ts,model FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]

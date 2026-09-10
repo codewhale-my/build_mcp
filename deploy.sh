@@ -7,21 +7,28 @@
 #   所以改由本机（能正常访问 GitHub）把代码直接推过去，绕开 GitHub。
 #
 # 用法:
-#   ./deploy.sh                          # 默认推送到 admin@47.108.234.194
-#   ./deploy.sh admin@1.2.3.4            # 指定其他服务器
-#   ./deploy.sh --restart                # 只重启服务, 不同步代码
+#   ./deploy.sh                    # 只同步代码 + 重启 + 健康检查（默认 admin@47.108.234.194）
+#   ./deploy.sh --config           # 额外同步 config.yaml（去掉本机代理行；服务器旧配置备份为 .bak）
+#   ./deploy.sh --restart          # 只重启服务，不同步代码
+#   ./deploy.sh admin@1.2.3.4      # 指定其他服务器（可与上面参数组合）
 #
 # 首次使用建议先做免密（否则每条命令都要输一次服务器密码）:
 #   ssh-copy-id admin@47.108.234.194
 # ==============================================================================
 set -euo pipefail
 
-HOST="${1:-admin@47.108.234.194}"
-if [ "${HOST}" = "--restart" ] || [ "${HOST}" = "-r" ]; then
-  HOST="admin@47.108.234.194"; ONLY_RESTART=1
-else
-  ONLY_RESTART=0
-fi
+HOST=""
+ONLY_RESTART=0
+WITH_CONFIG=0
+for arg in "$@"; do
+  case "$arg" in
+    --restart|-r) ONLY_RESTART=1 ;;
+    --config|-c)  WITH_CONFIG=1 ;;
+    -* ) echo "未知参数: $arg"; exit 1 ;;
+    *  ) HOST="$arg" ;;
+  esac
+done
+HOST="${HOST:-admin@47.108.234.194}"
 
 RUSER="${HOST%@*}"
 REMOTE_DIR="/home/${RUSER}/build-mcp"
@@ -34,7 +41,7 @@ if [ "${ONLY_RESTART}" = "0" ]; then
   step "同步代码  $SRC  →  ${HOST}:${REMOTE_DIR}"
   echo "   本机版本: $(git -C "$SRC" log --oneline -1 2>/dev/null || echo '(非 git 仓库)')"
   # 用 tar over ssh，服务器无需安装 rsync
-  # 排除: .git / 虚拟环境 / 日志 / 缓存 / config.yaml(含密钥且服务器已单独配置)
+  # 排除: .git / 虚拟环境 / 日志 / 缓存 / config.yaml(见 --config 说明)
   tar czf - \
     --exclude-vcs \
     --exclude='./.venv' \
@@ -46,6 +53,16 @@ if [ "${ONLY_RESTART}" = "0" ]; then
     -C "$SRC" . \
   | ssh "$HOST" "mkdir -p '${REMOTE_DIR}' && tar xzf - -C '${REMOTE_DIR}'"
   echo "   已同步（config.yaml / 日志 / 虚拟环境保持服务器原样）"
+
+  if [ "${WITH_CONFIG}" = "1" ]; then
+    step "同步配置 config.yaml"
+    echo "   · 去掉本机专用代理行(proxy: http://127.0.0.1:...)，服务器上没有这个代理"
+    echo "   · 服务器旧配置首次会备份为 config.yaml.bak"
+    ssh "$HOST" "test -f '${REMOTE_DIR}/src/build_mcp/config.yaml' && cp -n '${REMOTE_DIR}/src/build_mcp/config.yaml' '${REMOTE_DIR}/src/build_mcp/config.yaml.bak' || true"
+    grep -v -E '^[[:space:]]*proxy[[:space:]]*:' "$SRC/src/build_mcp/config.yaml" \
+      | ssh "$HOST" "cat > '${REMOTE_DIR}/src/build_mcp/config.yaml'"
+    echo "   已写入 ${REMOTE_DIR}/src/build_mcp/config.yaml"
+  fi
 else
   step "跳过代码同步（--restart 模式）"
 fi
@@ -58,7 +75,7 @@ for i in 1 2 3 4 5; do
   code="$(curl -s -o /tmp/_hj_deploy.html -w '%{http_code}' -m 8 "$WEB_URL/" || true)"
   if [ "$code" = "200" ]; then
     printf '   HTTP 200 ✅  页面OK\n'
-    grep -o 'HJ_MCP Agent\|fileInput\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
+    grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
     rm -f /tmp/_hj_deploy.html
     printf '\n\033[1;32m✅ 部署完成\033[0m\n'
     exit 0

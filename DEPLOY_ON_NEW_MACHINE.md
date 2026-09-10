@@ -1,0 +1,274 @@
+# 在新机器 WSL 上部署 build-mcp（完整指南）
+
+> 适用场景：把「MCP Web 聊天服务 + 多用户鉴权 + 每用户文件沙箱 + cpolar 公网隧道」整套从现机器迁移到**另一台 Windows 的 WSL(Ubuntu)**。
+> 写于 2026-09-08，以当时运行环境为准（uv 0.12、Python 3.12、Node 22、cpolar 3.3.12）。
+
+---
+
+## 0. 这套系统由哪些部分组成（迁移地图）
+
+| 部件 | 位置 | 说明 |
+|---|---|---|
+| 代码仓库 | `~/build-mcp/` | git 仓库，remote 为 **SSH over 443**（见 §2） |
+| Python 依赖 | `~/build-mcp/.venv/` + `uv.lock` | `uv sync` 一键还原，Python 版本按 `.python-version`=3.12 自动下载 |
+| Node 运行库 | 系统 node / npm（≥22） | 三个 npx 型 MCP 工具靠它，首次使用自动下载 |
+| 核心配置 | `~/build-mcp/src/build_mcp/config.yaml` | **含明文 LLM/高德 key,不入库**(历史已清洗);clone 后不存在,需自行准备(见 §4) |
+| 用户/邀请码/历史数据 | `~/build-mcp-data/app.db`（**项目目录外**） | SQLite；不迁移则新机器从零开始 |
+| 用户文件沙箱 | `~/fs_workspace/users/u<id>_<用户名>/` | 每个用户一个目录（服务自动创建） |
+| 隧道日志/域名 | `~/cpolar_tunnel.log` | 看域名用 `grep "Tunnel established" ~/cpolar_tunnel.log \| tail -1` |
+| 项目日志 | `~/build-mcp/log/web.log` | 启动失败先看这里 |
+| 进程 | uvicorn(:8000) + cpolar | 4 个启动/停止脚本管理 |
+
+MCP 工具构成：**共享** amap（`uv run build_mcp`）、websearch（`npx open-websearch@latest`，默认 DuckDuckGo 免 key）、terminal（`npx mcp-server-terminal --headless`）；**每用户独立** filesystem（`npx -y @modelcontextprotocol/server-filesystem <该用户目录>`，由后端按用户懒启动，天然沙箱互不可见）。
+
+---
+
+## 1. 准备 WSL 与基础软件
+
+在 Windows 上装好 WSL + Ubuntu（本机为 Ubuntu，用户名 administrator），进入 WSL 后：
+
+```bash
+# 系统工具
+sudo apt update && sudo apt install -y git curl unzip
+
+# 1) uv（Python 包管理器；版本管理器，会自动下载 .python-version 指定的 3.12）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 重新打开 shell 后验证
+uv --version        # 本机 0.12.x
+
+# 2) Node.js（需要 npx；apt 自带版本太旧，建议装 20+）
+#    本机用 22。最快方式：
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+node --version && npm --version && npx --version
+```
+
+---
+
+## 2. 拿到代码（推荐 git clone）
+
+现仓库 remote 已固化为 **SSH over 443**（HTTPS git 流量在本网络环境被掐断，勿改回）：
+
+```bash
+# 1) 生成 SSH 密钥（新机器没有时）
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "your-email"
+cat ~/.ssh/id_ed25519.pub
+#    复制输出，粘贴到 https://github.com/settings/ssh/new（codewhale-my 账号）
+
+# 2) 预置 host key（否则首次 ssh 会卡在 yes/no 确认）
+ssh-keyscan -p 443 ssh.github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+# 3) 验证认证
+ssh -T -p 443 git@ssh.github.com   # 看到 Hi codewhale-my! 即成功
+
+# 4) 克隆
+git clone ssh://git@ssh.github.com:443/codewhale-my/build_mcp.git ~/build-mcp
+```
+
+> 备选：直接把现机器 `~/build-mcp` 整目录打包拷过来也行（跳过 git）。但后续 push/pull 仍需按上面配 SSH。
+> 若也想把旧用户数据带过来，先看 §6（拷 `app.db` 与 `fs_workspace/users`）。
+
+---
+
+## 3. 换行符坑（重要，本机刚踩过）
+
+现机器 git 全局设了 `core.autocrlf=true`。仓库文件在 Linux 侧是 LF，**clone 到新机器时 `.sh` 等文件可能被写成 CRLF**，直接执行会报 `$'\r': command not found` 之类错误。
+
+```bash
+cd ~/build-mcp
+# 让 git 在本仓库内不做 CRLF 转换（Linux 侧规范）
+git config core.autocrlf input
+# 重新按 LF 检出全部文件（把可能的 CRLF 洗掉）
+git rm --cached -r . >/dev/null 2>&1; git reset --hard
+# 验证：不应输出 CRLF
+file start_web.sh && bash -n start_web.sh && echo OK
+```
+
+**长期根治**：在仓库根加 `.gitattributes`（提交后所有机器统一行为）：
+
+```
+* text=auto
+*.sh  text eol=lf
+*.py  text eol=lf
+*.yaml text eol=lf
+*.html text eol=lf
+*.js  text eol=lf
+*.md  text eol=lf
+*.log -text
+```
+
+（`*.log -text` 让日志不再被跟踪/转换——当前 `log/*.log` 已被历史跟踪，详见 §9。）
+
+---
+
+## 4. 安装依赖并核对配置
+
+```bash
+cd ~/build-mcp
+uv sync          # 按 uv.lock 装依赖，自动下载 Python 3.12（无需手动装 python）
+```
+
+> ⚠️ `config.yaml` **不进 git 仓库**（含敏感 key，已从历史清洗）。clone 后该文件不存在，需从原机器拷贝一份，或按下表新建；它已被 `.gitignore` 忽略，不会误提交。
+
+核对 `src/build_mcp/config.yaml`：
+
+| 项 | 现机器值（示例） | 新机器要做什么 |
+|---|---|---|
+| `llm_base_url` / `llm_api_key` / `llm_model` | deepseek | key 若随仓库公开过，**去 DeepSeek 后台轮换新 key 再填** |
+| `api_key` | 高德 key | 确认有效；失效则去高德控制台换 |
+| `proxy` | `http://127.0.0.1:10809` | ⚠️ 这是**现机器本地代理**。新机器没有就改成 `proxy: null`（直连；高德/DeepSeek 国内直连即可）。不删键、留 `null`，代码里 `httpx.AsyncClient(proxy=None)` 才合法 |
+| `log_dir` | `./log` | 保持相对路径即可 |
+
+`conversation.py` 里的 `WEBSEARCH_ENV / TERMINAL_ENV` 无需改（open-websearch 默认免 key）。
+
+可选预热（首次对话会自动下载，这里先装好避免首问超时）：
+
+```bash
+npx --yes open-websearch@latest --help >/dev/null 2>&1; echo $?
+npx --yes mcp-server-terminal --help >/dev/null 2>&1; echo $?
+```
+
+---
+
+## 5. 首次启动与验证
+
+```bash
+cd ~/build-mcp
+chmod +x *.sh
+
+# 强烈建议先换掉内置默认邀请码再启动
+MCP_WEB_INVITE_CODES='DEPLOY-001:管理员' ./start_web.sh
+# 不带环境变量则默认码为 MCP2026（谁拿到都能注册！）
+```
+
+验证：
+
+```bash
+# 本机存活
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/    # 200
+# 注册一个新账号（用户名/密码/邀请码）
+curl -s -X POST http://127.0.0.1:8000/api/auth -H "Content-Type: application/json" \
+  -d '{"username":"me","password":"pass123456","invite":"DEPLOY-001"}'
+# 无邀请码注册应被拒(403)；已有账号仅验密码登录
+```
+
+浏览器开 `http://localhost:8000` 注册两个号互测：文件空间、历史消息彼此不可见即 OK。
+
+日常管理（详细见 store CLI）：
+
+```bash
+uv run python -m build_mcp.web.store invites          # 查邀请码
+uv run python -m build_mcp.web.store invite CODE 备注  # 新增
+uv run python -m build_mcp.web.store note CODE 备注    # 改备注
+uv run python -m build_mcp.web.store reset CODE        # 已用→未使用
+uv run python -m build_mcp.web.store revoke CODE       # 删除
+uv run python -m build_mcp.web.store users             # 用户列表
+```
+
+停止：`./stop_web.sh`。
+
+---
+
+## 6. 迁移旧数据（把现机器的用户/历史/文件带过去）
+
+想让新机器无缝继承现机器账号，就迁移这两个目录（**两个都要，且保持相对关系**，目录名里的 `u<id>_` 与 DB 中的 id 对应，勿改名/拆开）：
+
+```bash
+# 旧机器上打包（停服后再打，保证一致）
+cd ~/build-mcp && ./stop_web.sh
+tar czf ~/buildmcp-data.tgz ~/build-mcp-data ~/fs_workspace/users
+# 拷到新机器（内网 scp / U盘 / 网盘 / /mnt/c 共享都行），然后：
+cd ~
+tar xzf ~/buildmcp-data.tgz -C ~     # 还原出 ~/build-mcp-data 与 ~/fs_workspace/users
+```
+
+新机器上先 `./start_web.sh` 再验证：旧账号能直接登录、历史与文件都在。
+
+> 注意：cpolar 隧道域名、服务端 token 不随迁移（重启即失效，重登即可）；`app.db` 里邀请码使用状态一并迁走，到新机器后发码要发"未使用"的。
+
+---
+
+## 7. 公网访问（cpolar）
+
+```bash
+# 1) 安装 cpolar（3.3.12，与现机器同版本；二进制放用户目录免 sudo）
+curl -L https://www.cpolar.com/static/downloads/releases/3.3.12/cpolar-stable-linux-amd64.zip -o /tmp/cpolar.zip
+unzip -o /tmp/cpolar.zip -d ~/.local/bin && chmod +x ~/.local/bin/cpolar && rm /tmp/cpolar.zip
+cpolar version
+
+# 2) 绑定账号：登录 https://www.cpolar.com 后台复制 authtoken
+cpolar authtoken <你的token>          # 写入 ~/.cpolar/cpolar.yml
+
+# 3) 起隧道
+./start_tunnel.sh                    # 默认把 8000 映射到公网
+
+# 4) 查域名
+grep "Tunnel established" ~/cpolar_tunnel.log | tail -1
+```
+
+公网回归（换成你自己的域名）：
+
+```bash
+curl -s -o /dev/null -w "首页 %{http_code}\n" https://<域名>/
+curl -s -X POST https://<域名>/api/auth -H "Content-Type: application/json" -d '{"username":"t","password":"12345678","invite":""}' -o /dev/null -w "无邀请码注册 %{http_code}\n"   # 期望 403
+```
+
+⚠️ 免费版**每次重启隧道域名都可能变**；日常改代码只重启 Web（`./stop_web.sh && ./start_web.sh`）就不会碰隧道、域名不变。想固定域名需 cpolar 付费套餐。
+
+---
+
+## 8. 常见问题速查
+
+| 症状 | 处理 |
+|---|---|
+| `./start_web.sh` 报 `\r` 相关错 | §3 换行符问题 |
+| Web 起不来 | `tail -f log/web.log` 看真实报错 |
+| 端口被占 | `ss -tlnp \| grep 8000` |
+| 地图工具报网络错 | §4 的 `proxy`（新机器没本地代理就设 `null`） |
+| 首次提问很慢/超时 | npx 在后台下载 open-websearch/server-filesystem，跑一次 §4 预热即可 |
+| 隧道起不来 | `tail -f ~/cpolar_tunnel.log`；确认已 `cpolar authtoken` |
+| 用户目录没生成 | filesystem 是懒加载，该用户第一次调用文件工具才建目录 |
+| git push 失败(GnuTLS/TLS 掐断) | 本仓库已切 SSH over 443，§2 配置好即不会再走 HTTPS |
+
+---
+
+## 9. 安全提醒（建议尽快处理）
+
+1. `config.yaml` 曾短暂进入 git 历史并推送过 GitHub，现已用 `git filter-repo` 重写历史**彻底清除**（2026-09-08，远端现 HEAD=`002e9b3`）。但 key 在公开窗口期内理论上可被看到，**仍建议去 DeepSeek / 高德控制台轮换 key**，并将仓库设为私有。旧历史备份在 `~/buildmcp-git-backup-20260908.tgz`（含敏感内容，妥善保管或删除）。
+2. `log/*.log` 也被历史跟踪（运行时产物本不该入库，虽被 `.gitignore` 覆盖但 `-f` 强加过）。后续每次提交都建议 `git rm --cached log/*.log`，并把 §3 的 `.gitattributes` 加上。
+3. 登录用户经「终端」工具运行在 uvicorn 的 cwd（`~/build-mcp`），可读项目内文件 —— 演示版设计。生产环境请把 LLM key 挪到环境变量、收缩终端工作目录并做操作审计。
+4. 默认邀请码 `MCP2026` 公开后等于开放注册，启动前务必用 `MCP_WEB_INVITE_CODES` 换成自己的码。
+
+---
+
+## 附：现机器与本仓库的关键差异备忘
+
+- git remote：`ssh://git@ssh.github.com:443/codewhale-my/build_mcp.git`
+- 现机器 `core.autocrlf=true`（全局+仓库）→ 新机器 WSL 内务必改 `input` 或加 `.gitattributes`
+- Web 启动用 `uv run uvicorn build_mcp.web.main:app`（FastAPI，端口 8000），DB 在项目外 `~/build-mcp-data/app.db`
+
+---
+
+## 10. 更新线上服务器（阿里云，2026-09-10 起）
+
+⚠️ **不要指望在服务器上 `git pull`**：阿里云北京节点访问 `github.com:443` 会直接超时
+（实测 `Failed to connect to github.com port 443 after 134255 ms`）。
+改用项目根目录的 `deploy.sh`——由本机（能正常访问 GitHub）把代码推过去：
+
+```bash
+# 本机 WSL，首次建议先免密
+ssh-copy-id admin@47.108.234.194
+
+cd /home/administrator/build-mcp
+./deploy.sh              # 同步代码 → 重启 hjmcp → 健康检查
+./deploy.sh --config     # 额外同步 config.yaml（自动去掉本机代理行，旧配置备份为 .bak）
+./deploy.sh --restart    # 只重启服务
+```
+
+脚本行为：`tar` 打包（走 ssh，服务器无需装 rsync）→ 排除 `.git/.venv/log/*.log/__pycache__/src/build_mcp/config.yaml`
+→ `ssh -t` 重启 `hjmcp` → curl 健康检查并核对页面关键标记。
+
+排障：
+- `./deploy.sh --restart` 时 sudo 需要 tty，脚本已用 `ssh -t`；若报密码错误检查免密是否配好。
+- 服务器日志：`ssh admin@47.108.234.194 'sudo journalctl -u hjmcp -n 50 --no-pager'`
+- 改完 `config.yaml` 必须重启才生效（`--config` 已包含重启）。
