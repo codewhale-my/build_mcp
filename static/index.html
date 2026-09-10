@@ -656,7 +656,11 @@ function linkifyUserFiles(html){
     return '<a class="filedl ext-'+esc(ext||'bin')+'" href="'+href+'" target="_blank" rel="noopener" title="点击保存到你的设备">'+
       '<span class="f-ico">'+ico+'</span><span class="f-name">'+esc(name)+'</span><span class="f-dl">↓</span></a>';
   };
-  // ① 上传引用标记([图片: 路径]/[文件: 路径]) → 直接变成下载卡片, 连外壳一起去掉
+  // ① 上传引用标记([图片: 路径]/[文件: 路径]) → 直接变成下载卡片, 连外壳一起去掉。
+  //    路径可能被 AI 包进反引号(渲染成 <code>…</code>) → 必须连 code 外壳一起替换,
+  //    否则 code 的背景/边框会在卡片两侧露出长条
+  html=html.replace(/<code>\s*(?:\[(?:图片|文件|附件):\s*([^\]]+?)\s*\]|(_uploads\/[^<]*?))\s*<\/code>/g,
+    (m,mk1,up)=>{const c=mk(mk1||up);return c||m});
   html=html.replace(/\[(?:图片|文件|附件):\s*([^\]]+?)\s*\]/g,(m,rel)=>mk(rel)||m);
   // ② 用户上传的附件相对路径 _uploads/xxx 的裸路径兜底
   html=html.replace(/(^|[\s（(>：:，,、])(_uploads\/[^\s<>"'`\[\]]+)/g,(m,p1,rel)=>{const c=mk(rel);return c?(p1+c):m});
