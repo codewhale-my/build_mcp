@@ -68,22 +68,47 @@ else
 fi
 
 step "重启 systemd 服务"
-ssh -t "$HOST" 'sudo systemctl restart hjmcp'
+# ssh -t 会打印 "Connection to ... closed."，那是正常收尾，不是错误
+ssh -t "$HOST" 'sudo systemctl restart hjmcp' || true
 
-step "健康检查  ${WEB_URL}"
-for i in 1 2 3 4 5; do
-  code="$(curl -s -o /tmp/_hj_deploy.html -w '%{http_code}' -m 8 "$WEB_URL/" || true)"
+# 服务重启后 uv 要重建包并依次拉起 3 个 MCP 子进程，实测需 10~30 秒才开始监听。
+# 所以这里耐心轮询「服务器本机 127.0.0.1:8000」，与本机网络/代理/安全组无关，最可靠。
+step "等待服务就绪（通常 10~30 秒，最多等 90 秒）"
+READY=0
+for i in $(seq 1 45); do
+  code="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" \
+          "curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:8000/" 2>/dev/null || true)"
   if [ "$code" = "200" ]; then
-    printf '   HTTP 200 ✅  页面OK\n'
-    grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
-    rm -f /tmp/_hj_deploy.html
-    printf '\n\033[1;32m✅ 部署完成\033[0m\n'
-    exit 0
+    READY=1
+    printf '   就绪 ✅ HTTP 200（第 %s 次探测）\n' "$i"
+    break
   fi
-  printf '   第 %s 次探测: HTTP %s，等 3 秒重试…\n' "$i" "${code:-失败}"
-  sleep 3
+  printf '   第 %s 次: HTTP %s，2 秒后重试…\n' "$i" "${code:-失败}"
+  sleep 2
 done
+if [ "$READY" = "0" ]; then
+  printf '\n\033[1;31m❌ 服务未在 90 秒内就绪，请查看日志:\033[0m\n'
+  echo "   ssh $HOST 'sudo journalctl -u hjmcp -n 80 --no-pager'"
+  exit 1
+fi
+
+# 顺带回报 MCP 装载情况，便于确认 3 个服务都在
+ssh -o BatchMode=yes "$HOST" \
+  "sudo journalctl -u hjmcp --no-pager -n 300 2>/dev/null | grep -E 'MCP服务启动完成|✅MCP|❌MCP|启动失败' | tail -5" \
+  2>/dev/null | sed 's/^/   /' || true
+
+step "公网健康检查  ${WEB_URL}"
+# --noproxy '*'：避免本机 curl 走代理导致误报 000
+code="$(curl -s --noproxy '*' -o /tmp/_hj_deploy.html -w '%{http_code}' -m 10 "$WEB_URL/" || true)"
+if [ "$code" = "200" ]; then
+  printf '   HTTP 200 ✅  页面OK\n'
+  grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
+  rm -f /tmp/_hj_deploy.html
+  printf '\n\033[1;32m✅ 部署完成\033[0m   （服务端 token 是内存态，浏览器请刷新页面重新登录）\n'
+  exit 0
+fi
 rm -f /tmp/_hj_deploy.html
-printf '\n\033[1;31m❌ 服务未在预期时间内就绪，请在服务器上看日志:\033[0m\n'
-echo "   ssh $HOST 'sudo journalctl -u hjmcp -n 50 --no-pager'"
+printf '\n\033[1;31m❌ 公网探测返回 HTTP %s\033[0m\n' "${code:-失败}"
+echo "   服务本机是通的，公网不通多半是安全组/防火墙拦截 8000，或本机网络问题："
+echo "   curl -v --noproxy '*' ${WEB_URL}/"
 exit 1
