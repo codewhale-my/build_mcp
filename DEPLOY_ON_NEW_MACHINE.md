@@ -272,3 +272,36 @@ cd /home/administrator/build-mcp
 - `./deploy.sh --restart` 时 sudo 需要 tty，脚本已用 `ssh -t`；若报密码错误检查免密是否配好。
 - 服务器日志：`ssh admin@47.108.234.194 'sudo journalctl -u hjmcp -n 50 --no-pager'`
 - 改完 `config.yaml` 必须重启才生效（`--config` 已包含重启）。
+
+---
+
+## 11. 定位能力说明（2026-09-10）
+
+两条链路，**精确定位优先**：
+
+| 链路 | 触发条件 | 精度 | 依赖 |
+|---|---|---|---|
+| 浏览器精确定位 | 前端「开启定位」按钮授权后，每轮对话带 `geo{lat,lng,acc}` | GPS/WiFi 级（米级） | ⚠️ **必须 HTTPS**，浏览器才给定位权限 |
+| IP 定位 | 未授权精确定位时，服务端把用户公网 IP 注入上下文 | 城市级 | 高德 `/v3/ip` + 备用免费库 |
+
+⚠️ **`http://47.108.234.194:8000` 是明文 http，浏览器不会开放 Geolocation**（安全上下文限制），
+所以前端按钮会显示「定位需HTTPS」，并在点击时提示；此时自动回落 IP 定位。
+等域名 + ICP 备案 + HTTPS 配好（同一份代码，无需改动）后，按钮即可正常开启精确定位。
+
+IP 定位兜底链（`src/build_mcp/services/ip_locate.py`，全部免 key）：
+`pconline`（0.1s，中文名最准）→ `ipinfo.io`（0.4s，阿里云北京可达）→ `ipwho.is`（大陆机房常超时，放最后）。
+每个库最多等 3.5s（`PER_PROVIDER_TIMEOUT`），避免一个 hanging 的库拖死整条链路。
+高德查到的省市会用 `/v3/geocode/geo` 换成 `location`（`"lng,lat"`），保证 `search_nearby` 直接可用。
+
+自测（服务器侧，不依赖前端）：
+```bash
+ssh admin@47.108.234.194 'cd ~/build-mcp && PYTHONPATH=src .venv/bin/python - <<PY
+import asyncio, json
+from build_mcp.common.config import load_config
+from build_mcp.services.gd_sdk import GdSDK
+cfg = load_config("config.yaml")
+s = GdSDK(config={"base_url": "https://restapi.amap.com", "api_key": cfg["api_key"], "max_retries": 1})
+print(json.dumps(asyncio.run(s.locate_ip("39.144.137.222")), ensure_ascii=False))
+PY'
+# 期望：source=pconline, province=四川省, city=成都市, location=104.066301,30.572961
+```
