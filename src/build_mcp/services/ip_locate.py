@@ -7,9 +7,9 @@
 保证下游 search_nearby 依然可用。
 
 接口（全部免 key、免注册，按顺序尝试，任一命中即返回）：
-  1. pconline   https://whois.pconline.com.cn/ipJson.jsp   境内 IP 覆盖好、中文名
-  2. ipwho.is   https://ipwho.is/{ip}                      境外库，带回经纬度
-  3. ipinfo.io  https://ipinfo.io/{ip}/json                境外库，兜底
+  1. pconline   https://whois.pconline.com.cn/ipJson.jsp   境内 IP 覆盖好、中文名，~0.1s
+  2. ipinfo.io  https://ipinfo.io/{ip}/json                境外库，阿里云北京可达，~0.4s
+  3. ipwho.is   https://ipwho.is/{ip}                      境外库，大陆机房常超时，放最后
 
 注：实测过但被淘汰的接口——api.vore.top（服务端 Redis 故障返回 HTML）、
 bilibili zone（忽略 ip 参数，永远返回调用方 IP，会造成"用服务器 IP 定位用户"的错误）、
@@ -17,8 +17,10 @@ ipapi.co（共享 IP 触发 429）。这些不要再加回来。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
@@ -26,6 +28,9 @@ import httpx
 logger = logging.getLogger("ip_locate")
 
 TIMEOUT = 4.0
+# 单个库的最长等待：外部客户端的 timeout 可能是 10s，直接把链路拖死；
+# 这里统一卡住上限，hanging 的库最多浪费 3.5s 就跳到下一个。
+PER_PROVIDER_TIMEOUT = 3.5
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) hj-mcp/1.0",
     "Accept": "application/json,text/plain,*/*",
@@ -174,10 +179,12 @@ def _fmt_lnglat(lng: Any, lat: Any) -> Optional[str]:
     return f"{f_lng:.6f},{f_lat:.6f}"
 
 
+# 顺序有讲究：pconline 最快且中文名最准（境内机房 0.1s 级）；
+# ipinfo.io 从阿里云北京可达（0.4s）；ipwho.is 从大陆机房经常超时，放到最后兜底。
 _PROVIDERS: tuple[Callable[[httpx.AsyncClient, str], Awaitable[Optional[dict]]], ...] = (
     _via_pconline,
-    _via_ipwho,
     _via_ipinfo,
+    _via_ipwho,
 )
 
 
@@ -198,11 +205,16 @@ async def locate(ip: str, client: httpx.AsyncClient = None) -> Optional[dict]:
     c = client or httpx.AsyncClient(timeout=TIMEOUT, headers=_HEADERS, follow_redirects=True)
     try:
         for fn in _PROVIDERS:
+            t0 = time.monotonic()
             try:
-                res = await fn(c, ip)
+                res = await asyncio.wait_for(fn(c, ip), timeout=PER_PROVIDER_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.info("备用 IP 库 %s 超时(>%ss)，跳过", fn.__name__, PER_PROVIDER_TIMEOUT)
+                continue
             except Exception as e:  # 单个库失败不影响下一个
                 logger.warning("备用 IP 库 %s 查询失败(%s)：%s", fn.__name__, ip, e)
                 continue
+            logger.info("备用 IP 库 %s 耗时 %.2fs", fn.__name__, time.monotonic() - t0)
             if res and (res.get("province") or res.get("city")):
                 logger.info("备用 IP 库命中 %s：%s → %s", fn.__name__, ip, res)
                 return res
