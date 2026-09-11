@@ -354,7 +354,7 @@ def _build_llm_request(work_messages: list[dict], openai_tools, spec: dict | Non
 async def agent_loop_stream(
     tool_name_to_session: Dict[str, ClientSession],
     openai_tools: List[Dict[str, Any]],
-    user_query: str,
+    user_query: str | list,   # str 或 OpenAI 多模态 content 列表(text/image_url 混排)
     history_messages: list[dict],
     model_key: str | None = None,
 ):

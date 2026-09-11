@@ -584,7 +584,7 @@ def _image_ocr_text(path: Path) -> str:
 
 async def _image_note_for_query(user: dict, query: str) -> str:
     """
-    扫描用户消息里的 [图片: 路径] 引用，把图片 OCR 文本注入系统提示词，
+    [降级路径] 扫描用户消息里的 [图片: 路径] 引用，把图片 OCR 文本注入系统提示词，
     并禁止模型去 read_media_file / 终端读图片二进制（纯文本模型只会拿到乱码）。
     """
     refs = re.findall(r"\[图片:\s*([^\]]+?)\s*\]", query or "")
@@ -619,6 +619,61 @@ async def _image_note_for_query(user: dict, query: str) -> str:
         "请坦诚告知用户：你目前只能读出图片里的文字，看不到画面内容。\n"
         + "\n".join(items)
     )
+
+
+# ================== 图片直传：DeepSeek API 已支持 image_url，原生视觉优先 ==================
+IMG_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    ".tiff": "image/tiff", ".tif": "image/tiff",
+}
+MAX_IMG_BYTES = 4 * 1024 * 1024   # 单图 4MB 上限（base64 后约 5.4MB）
+
+async def _build_user_content(user: dict, query: str):
+    """
+    [主路径] 把消息里的 [图片: 路径] 引用转成 OpenAI 多模态 content（image_url + data URL），
+    随用户消息直接发给模型，实现原生看图。
+
+    返回 (user_content, fallback_note)：
+      - 至少一张图片成功附带 → content 为列表，fallback_note 为空；
+      - 引用了图片但全部失败（不存在/超限/格式不支持）→ content 仍为 str，走 OCR 降级 note；
+      - 没有图片引用 → (query, "")。
+    """
+    refs = re.findall(r"\[图片:\s*([^\]]+?)\s*\]", query or "")
+    if not refs:
+        return query, ""
+    parts, attached, skipped = [], 0, []
+    for raw in refs[:3]:
+        p = raw.strip()
+        try:
+            f = _safe_user_file(user, p)
+        except HTTPException:
+            skipped.append(f"{p}：文件不存在或不在你的工作空间")
+            continue
+        mime = IMG_MIME.get(f.suffix.lower())
+        if not mime:
+            skipped.append(f"{f.name}：不是支持的图片格式")
+            continue
+        if f.stat().st_size > MAX_IMG_BYTES:
+            skipped.append(f"{f.name}：超过 4MB，未随消息发送")
+            continue
+        try:
+            b64 = await asyncio.to_thread(lambda: base64.b64encode(f.read_bytes()).decode())
+        except Exception:
+            skipped.append(f"{f.name}：读取失败")
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        attached += 1
+    if attached:
+        note = (
+            f"\n\n[系统提示] 本条消息随文附上了用户上传的 {attached} 张图片，你可以直接查看画面并结合图片回答。"
+        )
+        text_part = {"type": "text", "text": (query or "请看图。") + note}
+        if skipped:
+            text_part["text"] += "\n另有图片未随消息发送：" + "；".join(skipped) + "。"
+        return [text_part] + parts, ""
+    # 一张都没发出去：回退到 OCR 降级
+    return query, await _image_note_for_query(user, query)
 
 
 @app.get("/api/files/download")
@@ -784,8 +839,8 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
             "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
         )
-    # 图片引用：预 OCR 并注入提示词（纯文本模型看不了图，只能给它文字）
-    img_note = await _image_note_for_query(user, req.query)
+    # 图片：优先原生直传(DeepSeek 支持 image_url)；发不出去才降级 OCR 注入
+    user_content, img_note = await _build_user_content(user, req.query)
     history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note + geo_note + img_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
@@ -812,7 +867,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                         async for ev in agent_loop_stream(
                             tool_name_to_session=tool_map,
                             openai_tools=openai_tools,
-                            user_query=req.query,
+                            user_query=user_content,
                             history_messages=history_messages,
                             model_key=req.model,
                         ):
