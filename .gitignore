@@ -11,3 +11,10 @@ log/
 .venv
 # 本地敏感配置（含 LLM/高德 key），不入库；新机器需自行复制/填写
 src/build_mcp/config.yaml
+# 改代码时留下的备份副本（如 main.py.bak-20260911_154208、index.html.bak-wsfix-…），不入库
+*.bak
+*.bak-*
+*.bak[0-9]*
+*.bak-*_*
+# 测试缓存
+.pytest_cache/

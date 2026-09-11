@@ -282,6 +282,38 @@ def _tool_result_to_text(tool_result: Any) -> str:
     return "(工具无返回内容)"
 
 
+# ====================== 工具输出截断（省 token） ======================
+# 工具返回（尤其终端整屏输出、大文件读取）动辄几千到几万字符，而一次工具调用就会让
+# 之后的每一轮请求都把这段文本重发一遍——不截断时，一个 20 步的任务输入量能到几十万
+# token。这里统一压到上限：保留头部（交代上下文）+ 尾部（错误/结果通常在后半段）。
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, "")).strip() or default)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+TOOL_OUTPUT_LIMIT = _env_int("MCP_WEB_TOOL_OUTPUT_LIMIT", 4000)
+TOOL_OUTPUT_HEAD = _env_int("MCP_WEB_TOOL_OUTPUT_HEAD", 2400)
+TOOL_OUTPUT_TAIL = _env_int("MCP_WEB_TOOL_OUTPUT_TAIL", 1400)
+
+
+def truncate_tool_output(text: str, name: str = "") -> tuple[str, int]:
+    """工具输出过长时截断，返回 (截断后的文本, 被省略的字符数)；未截断时省略数为 0。"""
+    if not isinstance(text, str) or len(text) <= TOOL_OUTPUT_LIMIT:
+        return text, 0
+    head = text[:TOOL_OUTPUT_HEAD]
+    tail = text[-TOOL_OUTPUT_TAIL:]
+    omitted = max(0, len(text) - len(head) - len(tail))
+    marker = (
+        f"\n\n…〔{name or '工具'} 输出过长，此处省略 {omitted} 字符（原文共 {len(text)} 字符）〕\n"
+        "提示：不要为了看到被省略的部分而重试同一次调用；改用更精确的参数"
+        "（tail / head / grep / 限定行数）只取你真正需要的那几行。\n\n"
+    )
+    return head + marker + tail, omitted
+
+
 def _sanitize(obj: Any) -> Any:
     """
     递归清除字符串中的非法代理项(surrogate, U+D800~U+DFFF)。
@@ -484,10 +516,19 @@ async def agent_loop_stream(
                 try:
                     tool_result = await session.call_tool(tool_name, arguments=tool_args)
                     tool_content = _tool_result_to_text(tool_result)
+                    # 过长输出就地压缩：省 token，也让后续每一轮请求都更小更快
+                    tool_content, _omitted = truncate_tool_output(tool_content, tool_name)
                     print(f"✅工具[{tool_name}]返回结果")
-                    yield {"type": "tool", "name": tool_name, "status": "ok"}
+                    if _omitted:
+                        print(f"✂️ 工具[{tool_name}]输出过长，已省略 {_omitted} 字符")
+                    yield {
+                        "type": "tool", "name": tool_name, "status": "ok",
+                        "note": f"输出过长，已省略 {_omitted} 字符" if _omitted else "",
+                    }
                 except Exception as e:
-                    tool_content = f"工具调用异常: {str(e)}"
+                    tool_content, _ = truncate_tool_output(
+                        f"工具调用异常: {str(e)}", tool_name
+                    )
                     print(f"❌{tool_content}")
                     yield {"type": "tool", "name": tool_name, "status": "error", "note": str(e)[:200]}
 

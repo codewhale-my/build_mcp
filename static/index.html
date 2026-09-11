@@ -199,8 +199,12 @@ header{
 /* ============ 消息区 ============ */
 /* 隐藏原生滚动条（长度由浏览器控制，无法自定义），改用自绘"米粒"指示条 */
 #chatBox{
-  flex:1;overflow-y:auto;padding:20px 10px 12px 2px;scroll-behavior:smooth;
+  flex:1;overflow-y:auto;padding:20px 10px 12px 2px;
+  /* 不能用 scroll-behavior:smooth：流式输出时内容不停长高，平滑动画会被后续的贴底
+     请求反复打断，滚动"卡在半路"反而到不了底。贴底改由 JS 每帧直接赋值 scrollTop。 */
   scrollbar-width:none; /* Firefox 隐藏 */
+  overflow-anchor:none; /* 关掉浏览器自带滚动锚定，否则会和手动贴底互抢控制权 */
+  overscroll-behavior:contain;
 }
 #chatBox::-webkit-scrollbar{display:none}
 /* 自绘滚动指示条：固定高度的小短条，滚动时出现，停止后淡出 */
@@ -209,6 +213,32 @@ header{
   background:var(--text3);opacity:0;transition:opacity .4s;pointer-events:none;z-index:5;
 }
 .chat-scroll-ind.show{opacity:.75}
+/* 一键回到底部：已贴底时隐藏；用户往回翻 / 未跟随时淡入 */
+.jump-btn{
+  position:absolute;left:50%;transform:translateX(-50%) translateY(6px);
+  bottom:calc(132px + env(safe-area-inset-bottom));
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 14px;border-radius:999px;cursor:pointer;font-family:inherit;
+  border:1px solid var(--border-strong);background:var(--panel-solid);color:var(--text2);
+  font-size:12.5px;font-weight:500;line-height:1;
+  box-shadow:0 6px 18px rgba(0,0,0,.16);
+  opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;z-index:6;
+}
+.jump-btn.show{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0)}
+.jump-btn:active{transform:translateX(-50%) scale(.96)}
+@media (max-width:600px){.jump-btn{bottom:calc(104px + env(safe-area-inset-bottom))}}
+/* 「正在回答」状态胶囊：挂在直播间的时间行上，让用户一眼知道已经在跑了 */
+.live-status{
+  display:inline-flex;align-items:center;gap:6px;margin-left:9px;
+  padding:2.5px 9px;border-radius:999px;font-size:11px;color:var(--accent1);
+  background:color-mix(in srgb,var(--accent1) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent1) 30%,transparent);
+}
+.live-status .ls-dot{
+  width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;
+  animation:ls-pulse 1.1s ease-in-out infinite;
+}
+@keyframes ls-pulse{0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
 .msg{display:flex;gap:11px;margin-bottom:22px;animation:pop .22s ease}
 @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .avatar{
@@ -634,6 +664,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   <!-- 消息区 -->
   <main id="chatBox"></main>
   <div id="scrollInd" class="chat-scroll-ind"></div>
+  <button id="jumpBtn" class="jump-btn" type="button">↓ 新内容</button>
 
   <!-- 输入区 -->
   <div class="composer-wrap">
@@ -669,8 +700,9 @@ const $ = s => document.querySelector(s);
 const chatBox = $('#chatBox'), inputBox = $('#inputBox'), sendBtn = $('#sendBtn');
 const THEME_KEY = 'mcp-theme';
 const TOKEN_KEY = 'mcp-auth-token';
-let authToken='', me={name:''};
+let authToken='', me={name:'',isAdmin:false,serverRoot:''};
 let myUserRoot='';   // 当前用户工作空间绝对路径，用于把回答里的文件路径变成下载链接
+let wsMode='local';  // 'local'=个人工作空间 / 'server'=云服务器代码目录(仅管理员)
 try{authToken=localStorage.getItem(TOKEN_KEY)||''}catch(e){}
 const authOverlay=$('#authOverlay'), authUser=$('#authUser'), authPwd=$('#authPwd'),
       authInvite=$('#authInvite'), authErr=$('#authErr'), authLoginBtn=$('#authLoginBtn');
@@ -842,6 +874,27 @@ function fmtHM(ts){
   const d=new Date(ts*1000);
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
 }
+// 【唯一的用户上下文填充入口】/api/me 是权威来源。
+// 历史 bug：doAuth(点登录按钮) 只填了 me.name，漏了 isAdmin/serverRoot，
+// 导致重启后重新登录的用户看不到「云服务器」工作空间入口。所有登录/启动路径都必须走这里。
+function applyMe(d){
+  if(!d)return;
+  if(d.username)me.name=d.username;
+  me.isAdmin=!!d.is_admin;
+  me.serverRoot=d.server_root||'';
+  if(d.user_root)myUserRoot=d.user_root;
+  if(d.ws_mode)wsMode=d.ws_mode;
+}
+// 主动拉一次 /api/me 并套用（登录后必须调用：/api/auth 不返回 is_admin/server_root）
+async function refreshMe(){
+  try{
+    const r=await fetch('/api/me',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return false;
+    applyMe(await r.json());
+    return true;
+  }catch(e){return false}
+}
+
 // 从服务端拉取“当前用户自己的”历史消息（按用户隔离）
 async function loadServerHistory(){
   try{
@@ -850,6 +903,7 @@ async function loadServerHistory(){
     const d=await r.json();
     if(d&&d.username)me.name=d.username;
     if(d&&d.user_root)myUserRoot=d.user_root;
+    if(d&&d.ws_mode)wsMode=d.ws_mode;
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
       .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||''}));
@@ -901,7 +955,62 @@ function insertLoading(){
   chatBox.appendChild(buildMsg({role:'loading',text:''}));
   scrollBottom();
 }
-function scrollBottom(){chatBox.scrollTop=chatBox.scrollHeight}
+/* ================= 粘底引擎（stick-to-bottom） =================
+   三条原则：
+   1) 贴底一律直接赋值 scrollTop，不做平滑动画 —— 流式期间每帧都要真的到底；
+   2) 「是否跟随」由用户手势决定，不用 scrollTop 反推 —— 否则流式输出时位置稍有
+      滞后就会被误判成"用户往上翻了"，从而永久停止跟随（原 bug）；
+   3) 用 rAF 合并同一帧内的多次贴底请求，避免每个 delta 都触发一次布局。 */
+let stick=true;          // 是否自动跟随最新内容
+let stickRaf=0;          // 同帧贴底请求合并标志
+let lastUserGesture=0;   // 最近一次用户主动滚动的时间戳
+
+const BOTTOM_SLACK=72;   // 距底部多少像素以内算"贴底"
+function distToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight}
+function isAtBottom(slack){return distToBottom()<=(slack==null?BOTTOM_SLACK:slack)}
+
+// 立即贴底（发送、新增消息、点回到底部时用）
+function scrollToBottomNow(){
+  stick=true;
+  if(stickRaf){cancelAnimationFrame(stickRaf);stickRaf=0}
+  chatBox.scrollTop=chatBox.scrollHeight;
+  syncJumpBtn();
+}
+// 本帧末贴底（流式增量时用，若仍处于跟随状态）
+function stickToBottom(){
+  if(!stick||stickRaf)return;
+  stickRaf=requestAnimationFrame(()=>{
+    stickRaf=0;
+    if(stick){chatBox.scrollTop=chatBox.scrollHeight;syncJumpBtn()}
+  });
+}
+// 兼容历史调用名
+function scrollBottom(){scrollToBottomNow()}
+function scrollKeep(){stickToBottom()}
+function pinnedToBottom(){return stick&&isAtBottom()}
+
+function noteUserGesture(){lastUserGesture=performance.now()}
+['wheel','touchstart','touchmove','pointerdown','mousedown'].forEach(ev=>
+  chatBox.addEventListener(ev,noteUserGesture,{passive:true}));
+chatBox.addEventListener('keydown',noteUserGesture,true);
+
+// 「↓ 新内容」按钮
+const jumpBtn=$('#jumpBtn');
+function syncJumpBtn(){
+  if(!jumpBtn)return;
+  if(stick&&isAtBottom())jumpBtn.classList.remove('show');
+  else jumpBtn.classList.add('show');
+}
+if(jumpBtn)jumpBtn.onclick=()=>{scrollToBottomNow();updateScrollInd()};
+
+// 内容异步变高（图片解码、表格/代码块渲染完成）也要继续跟随
+if(window.ResizeObserver){
+  const ro=new ResizeObserver(()=>{if(stick)stickToBottom()});
+  new MutationObserver(ms=>ms.forEach(m=>m.addedNodes.forEach(n=>{
+    if(n.nodeType===1)ro.observe(n);
+  }))).observe(chatBox,{childList:true});
+  ro.observe(chatBox);
+}
 
 /* ================= 自绘"米粒"滚动指示条 ================= */
 const scrollInd=$('#scrollInd');
@@ -920,7 +1029,12 @@ function updateScrollInd(){
   clearTimeout(indTimer);
   indTimer=setTimeout(()=>scrollInd.classList.remove('show'),900);
 }
-chatBox.addEventListener('scroll',updateScrollInd,{passive:true});
+chatBox.addEventListener('scroll',()=>{
+  // 只在"用户自己动的"滚动上重新判定跟随状态，程序化贴底不会误伤
+  if(performance.now()-lastUserGesture<700)stick=isAtBottom(24);
+  updateScrollInd();
+  syncJumpBtn();
+},{passive:true});
 window.addEventListener('resize',updateScrollInd);
 
 /* ================= 欢迎页 ================= */
@@ -951,12 +1065,13 @@ let liveActLines={}; // 工具名 -> 最近一条动作行元素（完成时更�
 function liveCleanup(){
   liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};
 }
-function pinnedToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight<160}
-function scrollKeep(){if(pinnedToBottom())scrollBottom()}
+/* 粘底相关函数已集中到上方「粘底引擎」，此处不再重复定义 */
 function ensureLiveMsg(){
   liveMsgEl=document.createElement('div');liveMsgEl.className='msg bot';liveMsgEl.id='liveMsg';
   liveMsgEl.innerHTML='<div class="avatar">'+STAR+'</div><div class="col">'+
-    '<div class="live-top"><div class="time">'+now()+'</div><button class="stop-mini" id="liveStop" title="停止生成">⏹ 停止</button></div>'+
+    '<div class="live-top"><div class="time">'+now()+'</div>'+
+    '<span class="live-status" id="liveStatus"><i class="ls-dot"></i>正在回答</span>'+
+    '<button class="stop-mini" id="liveStop" title="停止生成">⏹ 停止</button></div>'+
     '<div class="bubble live" id="liveBubble"></div></div>';
   chatBox.appendChild(liveMsgEl);
   liveBubbleEl=liveMsgEl.querySelector('#liveBubble');
@@ -964,7 +1079,7 @@ function ensureLiveMsg(){
   liveTextNode=document.createTextNode('⏳ 正在思考…');
   liveBubbleEl.appendChild(liveTextNode);
   liveMsgEl.querySelector('#liveStop').onclick=()=>controller&&controller.abort();
-  scrollKeep();
+  scrollToBottomNow(); // 直播间一出现就贴底，别让用户以为没反应
 }
 // 工具名 -> 中文短名（未收录则显示原名）
 const TOOL_LABEL={
@@ -974,6 +1089,7 @@ const TOOL_LABEL={
   create_directory:'新建目录',move_file:'移动文件',copy_file:'复制文件',
   delete_file:'删除文件',run_command:'执行终端命令',
   user_filesystem:'读写本机文件',
+  terminal_run:'执行命令',
   terminal_session_create:'开启终端',web_search:'联网搜索',fetch_page:'抓取网页'
 };
 function toolLabel(name){
@@ -1204,6 +1320,7 @@ async function doAuth(){
       if(authPwd)authPwd.value='';
       if(authInvite)authInvite.value='';
       hideAuth();
+      await refreshMe();           // 【必须】/api/auth 不返回 is_admin，补齐后才能显示云服务器入口
       await loadServerHistory();   // 拉取该用户自己的历史
       await loadModels();          // 拉取可选模型清单
       localStatus();wsStart();await restoreLocalHandle();geoRender();
@@ -1305,6 +1422,12 @@ function localStatus(){
   if(!me.name){bar.hidden=true;return}
   bar.hidden=false;
   if(!localBtn)return;
+  if(wsMode==='server'){
+    localBtn.className='lbtn on';
+    localBtn.querySelector('.txt').textContent='云服务器 · 整机';
+    localBtn.title='当前工作空间：整台云服务器（'+(me.serverRoot||myUserRoot)+'）。点击可切换';
+    return;
+  }
   if(localHandle){
     localBtn.className='lbtn on';
     localBtn.querySelector('.txt').textContent=localHandle.name;
@@ -1328,11 +1451,37 @@ async function restoreLocalHandle(){
   }catch(e){}
   localHandle=null;localStatus();
 }
+/* 切换服务器端文件空间模式: local=个人工作空间 / server=整台云服务器(仅管理员) */
+async function postWsMode(mode){
+  try{
+    const r=await fetch('/api/workspace',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify({mode})
+    });
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){toast(d.detail||('切换失败（HTTP '+r.status+'）'));return false}
+    wsMode=d.ws_mode||mode;
+    if(d.user_root)myUserRoot=d.user_root;
+    localStatus();
+    return true;
+  }catch(e){toast('切换失败：'+e.message);return false}
+}
+async function switchToServerWs(){
+  if(wsMode==='server'){toast('当前已是云服务器工作空间：'+(me.serverRoot||myUserRoot));return}
+  if(await postWsMode('server'))toast('已切到云服务器工作空间：'+(me.serverRoot||myUserRoot));
+}
+/* 用本机文件夹时自动切回个人工作空间，避免“看着是文件夹、其实文件空间在服务器” */
+async function ensureLocalMode(){
+  if(wsMode!=='local')await postWsMode('local');
+}
+
 async function pickLocalDir(){
   try{
     const h=await window.showDirectoryPicker({mode:'readwrite'});
     localHandle=h;
     await rememberWs(h);
+    await ensureLocalMode();
     localStatus();toast('已授权本机文件夹：'+h.name+'。现在可以让我读写它了');
   }catch(e){if(!e||e.name!=='AbortError')toast('无法授权：'+e.message)}
 }
@@ -1347,6 +1496,7 @@ async function switchWsTo(name){
     if(p!=='granted'){toast('未能取得「'+name+'」的读写权限');return}
     localHandle=it.handle;
     await rememberWs(it.handle);
+    await ensureLocalMode();
     localStatus();closeWsMenu();toast('已切换工作空间：'+name);
   }catch(e){toast('切换失败：'+e.message)}
 }
@@ -1472,7 +1622,9 @@ document.addEventListener('paste',e=>{
 /* =============== 文件上传 end =============== */
 
 async function localBtnClick(){
-  if(!window.showDirectoryPicker||!window.FileSystemDirectoryHandle){
+  // 不支持目录授权的浏览器(多为手机)：普通用户维持“点一下就上传”的原行为；
+  // 管理员仍要能打开菜单，否则永远切不到云服务器工作空间。
+  if(!(window.showDirectoryPicker&&window.FileSystemDirectoryHandle)&&!me.isAdmin){
     localUp.click();
     return;
   }
@@ -1481,18 +1633,20 @@ async function localBtnClick(){
 }
 function toggleWsMenu(){
   const menu=$('#wsMenu');
-  if(!menu||!localSupported)return;
+  if(!menu)return;   // 不再要求 localSupported：管理员在手机上也要能切云服务器
   if(!menu.hidden){closeWsMenu();return}
   openWsMenu();
   if(localBtn)localBtn.classList.add('open');
 }
 async function openWsMenu(){
   const menu=$('#wsMenu');
-  if(!menu||!localSupported)return;
-  const list=await loadWsList();
+  if(!menu)return;
+  const list=localSupported?await loadWsList():[];
   const curName=localHandle?localHandle.name:'';
   let html='<div class="ws-hd"><span>最近工作空间</span><span>'+list.length+'/'+MAX_WS+'</span></div>';
-  if(!list.length){
+  if(!localSupported){
+    html+='<div style="padding:8px 10px;font-size:12px;color:var(--text3)">此浏览器不支持选择本机文件夹，可用输入框旁的 ＋ 上传文件</div>';
+  }else if(!list.length){
     html+='<div style="padding:8px 10px;font-size:12px;color:var(--text3)">还没有工作空间，点下面按钮新建</div>';
   }else{
     list.forEach(it=>{
@@ -1505,26 +1659,47 @@ async function openWsMenu(){
       '</button>';
     });
   }
-  html+='<div class="ws-sep"></div>';
-  html+='<button class="ws-add" id="wsAddNew">＋ 新建工作空间</button>';
+  if(me.isAdmin){
+    const srvName=me.serverRoot||'/';
+    html+='<div class="ws-sep"></div>';
+    html+='<div class="ws-hd"><span>云服务器（管理员）</span></div>';
+    html+='<button class="ws-item" id="wsServerItem">'+
+      '<span class="wi-ico">☁️</span>'+
+      '<span class="wi-name">云服务器 · 整台服务器</span>'+
+      (wsMode==='server'?'<span class="wi-now">当前</span>':'<span class="wi-tag">'+esc(srvName)+'</span>')+
+    '</button>';
+  }
+  if(localSupported){
+    html+='<div class="ws-sep"></div>';
+    html+='<button class="ws-add" id="wsAddNew">＋ 新建工作空间</button>';
+  }
   menu.innerHTML=html;
-  menu.querySelectorAll('.ws-item').forEach(btn=>{
-    const nm=btn.dataset.name;
-    btn.querySelector('.wi-del').onclick=async ev=>{
-      ev.stopPropagation();
-      await forgetWs(nm);
-      if(localHandle&&localHandle.name===nm)localHandle=null;
-      openWsMenu();localStatus();
-    };
-    btn.onclick=async()=>{
-      const name=btn.dataset.name;
-      if(localHandle&&localHandle.name===name){closeWsMenu();return}
-      await switchWsTo(name);
-    };
-  });
-  const add=menu.querySelector('#wsAddNew');
-  if(add)add.onclick=()=>{closeWsMenu();pickLocalDir()};
+  // 先显示菜单：后面的事件绑定即使出错，也不该让菜单变成“点不出来”
   menu.hidden=false;
+  try{
+    menu.querySelectorAll('.ws-item').forEach(btn=>{
+      const nm=btn.dataset.name;
+      if(!nm)return;   // 云服务器项没有 data-name，其事件在下方单独绑定
+      const del=btn.querySelector('.wi-del');
+      if(del)del.onclick=async ev=>{   // 必须判空：非列表项不一定有删除按钮
+        ev.stopPropagation();
+        await forgetWs(nm);
+        if(localHandle&&localHandle.name===nm)localHandle=null;
+        openWsMenu();localStatus();
+      };
+      btn.onclick=async()=>{
+        const name=btn.dataset.name;
+        if(localHandle&&localHandle.name===name){closeWsMenu();return}
+        await switchWsTo(name);
+      };
+    });
+    const srv=menu.querySelector('#wsServerItem');
+    if(srv)srv.onclick=async()=>{closeWsMenu();await switchToServerWs();};
+    const add=menu.querySelector('#wsAddNew');
+    if(add)add.onclick=()=>{closeWsMenu();pickLocalDir()};
+  }catch(err){
+    console.warn('工作空间菜单事件绑定失败',err);
+  }
 }
 function closeWsMenu(){
   const menu=$('#wsMenu');
@@ -1828,8 +2003,7 @@ if(updBtn)updBtn.onclick=async()=>{
     const r=await fetch('/api/me',{headers:{'Authorization':'Bearer '+authToken}});
     if(r.ok){
       const d=await r.json();
-      me.name=(d&&d.username)||'';
-      myUserRoot=(d&&d.user_root)||'';
+      applyMe(d);          // 统一填充，勿在此另写一份（曾因此漏掉 isAdmin）
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
       await loadModels();          // 可选模型清单

@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS users(
   pass_salt  TEXT NOT NULL,
   pass_hash  TEXT NOT NULL,
   created_at REAL NOT NULL,
-  last_seen_version TEXT NOT NULL DEFAULT ''
+  last_seen_version TEXT NOT NULL DEFAULT '',
+  ws_mode    TEXT NOT NULL DEFAULT 'local'
 );
 CREATE TABLE IF NOT EXISTS invite_codes(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +107,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
     if "last_seen_version" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN last_seen_version TEXT NOT NULL DEFAULT ''")
+    if "ws_mode" not in ucols:
+        # local = 个人工作空间（默认）；server = 云服务器代码目录（仅管理员可选）
+        conn.execute("ALTER TABLE users ADD COLUMN ws_mode TEXT NOT NULL DEFAULT 'local'")
 
 
 def init_db(import_env_codes: str = ""):
@@ -170,6 +174,19 @@ def set_user_seen_version(uid: int, version: str) -> None:
             conn.execute(
                 "UPDATE users SET last_seen_version=? WHERE id=?",
                 ((version or "").strip(), uid),
+            )
+    finally:
+        conn.close()
+
+
+def set_user_ws_mode(uid: int, mode: str) -> None:
+    """记录用户选择的服务器端文件空间模式（local=个人工作空间 / server=云服务器）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET ws_mode=? WHERE id=?",
+                ((mode or "local").strip().lower(), uid),
             )
     finally:
         conn.close()
