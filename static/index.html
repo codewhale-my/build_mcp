@@ -417,6 +417,39 @@ header{
 .sugg span{color:var(--text2);font-size:12px}
 /* ============ 输入区 ============ */
 .composer-wrap{flex:none;padding:10px 0 calc(12px + env(safe-area-inset-bottom))}
+/* 附件条：输入框上方的小框（缩略图/文件名 + 上传进度 + 移除叉），不占用输入框文本 */
+.attach-bar{display:flex;flex-wrap:wrap;gap:8px;padding:0 2px 9px}
+.attach-chip{
+  position:relative;width:58px;height:58px;flex:none;border-radius:13px;overflow:hidden;
+  border:1px solid var(--border-strong);background:var(--bubble);
+}
+.attach-chip img{width:100%;height:100%;object-fit:cover;display:block}
+.attach-chip .ico{
+  width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:700;color:var(--text2);letter-spacing:.4px;
+  background:linear-gradient(135deg,var(--bubble),var(--panel-solid));
+}
+.attach-chip .pg{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-size:11.5px;font-weight:700;color:#fff;background:rgba(12,16,28,.55);
+}
+.attach-chip.done .pg{display:none}
+.attach-chip.fail{border-color:#ff5b5b}
+.attach-chip.fail .pg{background:rgba(120,20,20,.62)}
+.attach-chip .bar{
+  position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--accent1);
+  transition:width .15s ease;
+}
+.attach-chip.done .bar{display:none}
+.attach-chip.fail .bar{background:#ff5b5b}
+.attach-chip .x{
+  position:absolute;top:2px;right:2px;width:18px;height:18px;padding:0;border:none;
+  border-radius:50%;cursor:pointer;font-size:13px;line-height:1;
+  display:flex;align-items:center;justify-content:center;
+  background:rgba(14,18,30,.72);color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.35);
+}
+.attach-chip .x:hover{background:#ff5b5b}
+.attach-chip .x::after{content:'';position:absolute;inset:-7px}  /* 手机上扩大点击热区 */
 .composer{
   display:flex;align-items:flex-end;gap:10px;
   background:var(--panel-solid);border:1px solid var(--border-strong);
@@ -691,6 +724,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
       <button class="lbtn gbtn" id="geoBtn" title="开启精确定位"><span class="dot"></span><span class="txt" id="geoTxt">开启定位</span></button>
     </div>
     <input type="file" id="fileInput" hidden multiple>
+    <div class="attach-bar" id="attachBar" hidden></div>
     <div class="composer">
       <textarea id="inputBox" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
       <button id="plusBtn" title="上传文件（图片、文档、表格、压缩包…）">
@@ -1233,8 +1267,12 @@ function netErrMsg(err){
   return m+'（若反复出现请确认服务是否正常）';
 }
 async function send(){
-  const q=inputBox.value.trim();
-  if(!q||busy)return;
+  if(busy)return;
+  if(attachList.some(a=>a.uploading)){toast('附件仍在上传中，请稍候…');return}
+  const mark=attachMarks();
+  let q=inputBox.value.trim();
+  if(!q&&!mark)return;
+  if(mark)q=q?(mark+' '+q):mark;
   inputBox.value='';autoGrow();
   push({role:'user',text:q});
   busy=true;sendBtn.disabled=true;
@@ -1271,6 +1309,7 @@ async function send(){
       push({role:'error',text:'请求失败：'+(data&&data.detail?data.detail:('HTTP '+resp.status))});
       return;
     }
+    attachClear();   // 附件标记已随 query 送达，收起输入框上方的小框
     if(!resp.body){
       // 极少数不支持流读取的环境：按 JSON 解析整包
       let data=null;try{data=await resp.json()}catch(e){}
@@ -1665,42 +1704,112 @@ const MAX_UP=8*1024*1024;
 const IMG_RE=/\.(png|jpe?g|gif|webp|bmp|svg|ico|heic|heif|avif|tiff?)$/i;
 const plusBtn=$('#plusBtn'), fileInput=$('#fileInput'), composerEl=$('.composer');
 const IS_MOBILE=(window.matchMedia&&matchMedia('(pointer:coarse)').matches)||/Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent||'');
-// 生成插入输入框的引用标记：图片=[图片: 路径]，其他=[文件: 路径]，AI 据此读取该文件
+// 生成引用标记：图片=[图片: 路径]，其他=[文件: 路径]（发送时随 query 带上，AI 据此读取文件）
 function attachMark(path,name,type){
   const isImg=(type&&type.indexOf('image/')===0)||IMG_RE.test(name||path||'');
   return (isImg?'[图片: ':'[文件: ')+path+']';
 }
-/* 统一上传入口：任意文件 → 服务器工作空间 _uploads/，成功后把引用插入输入框 */
+/* ===== 附件条：上传中的小框挂在输入框上方（缩略图 + 进度 + 叉），不再把文本塞进输入框 ===== */
+const attachBar=$('#attachBar');
+const attachList=[];   // {id,name,type,path,mark,pct,uploading,fail,url,xhr}
+let attachSeq=0;
+function attachRender(){
+  if(!attachBar)return;
+  attachBar.hidden=!attachList.length;
+  attachBar.innerHTML='';
+  attachList.forEach(a=>{
+    const chip=document.createElement('div');
+    chip.className='attach-chip'+(a.fail?' fail':(a.uploading?' uploading':' done'));
+    chip.title=a.name;
+    if(a.url){const im=document.createElement('img');im.src=a.url;im.alt='';chip.appendChild(im)}
+    else{
+      const ext=(String(a.name).split('.').pop()||'').toUpperCase().slice(0,4);
+      const d=document.createElement('div');d.className='ico';d.textContent=ext||'FILE';chip.appendChild(d);
+    }
+    const pg=document.createElement('div');pg.className='pg';
+    pg.textContent=a.fail?'失败':((a.pct||0)+'%');
+    chip.appendChild(pg);
+    const bar=document.createElement('div');bar.className='bar';
+    bar.style.width=(a.fail?100:(a.pct||0))+'%';
+    chip.appendChild(bar);
+    const x=document.createElement('button');
+    x.type='button';x.className='x';x.title='移除';x.textContent='×';
+    x.onclick=e=>{e.stopPropagation();attachRemove(a.id)};
+    chip.appendChild(x);
+    attachBar.appendChild(chip);
+  });
+}
+function attachRemove(id){
+  const i=attachList.findIndex(a=>a.id===id);
+  if(i<0)return;
+  const a=attachList[i];
+  try{if(a.xhr&&a.uploading)a.xhr.abort()}catch(e){}
+  if(a.url)try{URL.revokeObjectURL(a.url)}catch(e){}
+  attachList.splice(i,1);attachRender();
+}
+function attachClear(){
+  attachList.forEach(a=>{if(a.url)try{URL.revokeObjectURL(a.url)}catch(e){}});
+  attachList.length=0;attachRender();
+}
+function attachAdd(file){
+  const a={id:++attachSeq,name:file.name||('file_'+Date.now()),type:file.type||'',path:'',mark:'',pct:0,uploading:true,fail:false,url:'',xhr:null};
+  if(a.type.indexOf('image/')===0||IMG_RE.test(a.name)){
+    try{a.url=URL.createObjectURL(file)}catch(e){}
+  }
+  attachList.push(a);attachRender();
+  return a;
+}
+/* 单文件上传：用 XHR 以便拿到真实进度 */
+function attachUpload(a,file){
+  return new Promise(resolve=>{
+    const fd=new FormData();fd.append('file',file,a.name);
+    let xhr;
+    try{xhr=new XMLHttpRequest()}catch(e){a.uploading=false;a.fail=true;attachRender();return resolve(a)}
+    a.xhr=xhr;
+    xhr.open('POST','/api/uploads');
+    xhr.setRequestHeader('Authorization','Bearer '+authToken);
+    xhr.upload.onprogress=e=>{if(e.lengthComputable){a.pct=Math.min(99,Math.round(e.loaded*100/e.total));attachRender()}};
+    xhr.onload=()=>{
+      let d={};try{d=JSON.parse(xhr.responseText||'{}')}catch(e){}
+      if(xhr.status>=200&&xhr.status<300&&d.path){
+        a.path=d.path;a.name=d.name||a.name;a.pct=100;a.uploading=false;
+        a.mark=attachMark(a.path,a.name,a.type);
+      }else{
+        a.fail=true;a.uploading=false;
+        toast('上传失败：'+(d.detail||('HTTP '+xhr.status)));
+      }
+      attachRender();resolve(a);
+    };
+    xhr.onerror=()=>{a.fail=true;a.uploading=false;toast('上传失败：网络中断');attachRender();resolve(a)};
+    xhr.onabort=()=>{a.uploading=false;attachRender();resolve(a)};
+    xhr.send(fd);
+  });
+}
+/* 统一上传入口：任意文件 → 服务器工作空间 _uploads/，以小框形式挂在输入框上方 */
 async function uploadFiles(files){
   const list=[...(files||[])].filter(Boolean);
   if(!list.length)return [];
   if(plusBtn)plusBtn.classList.add('busy');
-  const ok=[];
+  const jobs=[];
   try{
     for(const f of list){
       const fname=f.name||('file_'+Date.now());
       if(f.size>MAX_UP){toast('「'+fname+'」超过 8MB，已跳过');continue}
-      const fd=new FormData();fd.append('file',f,fname);
-      try{
-        const r=await fetch('/api/uploads',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:fd});
-        const d=await r.json().catch(()=>({}));
-        if(r.ok&&d.path)ok.push({path:d.path,name:d.name||fname,type:f.type});
-        else toast('上传失败：'+(d.detail||('HTTP '+r.status)));
-      }catch(e){toast('上传失败：'+e.message)}
+      const a=attachAdd(f);
+      jobs.push(attachUpload(a,f));
     }
   }finally{
     if(plusBtn)plusBtn.classList.remove('busy');
     if(fileInput)fileInput.value='';
     if(localUp)localUp.value='';
   }
-  if(ok.length){
-    const mark=ok.map(o=>attachMark(o.path,o.name,o.type)).join(' ');
-    inputBox.value=(inputBox.value?inputBox.value.replace(/\s+$/,'')+' ':'')+mark+' ';
-    autoGrow();inputBox.focus();
-    toast('已上传 '+ok.length+' 个文件'+(IS_MOBILE?'，可补充说明后发送':'（引用已插入输入框），可补充说明后发送'));
-  }
+  if(jobs.length)await Promise.allSettled(jobs);
+  const ok=attachList.filter(a=>a.path);
+  if(ok.length){inputBox.focus();toast('已上传 '+ok.length+' 个文件，可补充说明后发送')}
   return ok;
 }
+/* 把附件引用标记拼进发送内容：界面上不再显示这些文字，但后端/AI 需要它们 */
+function attachMarks(){return attachList.filter(a=>a.path&&a.mark).map(a=>a.mark).join(' ')}
 if(plusBtn)plusBtn.onclick=()=>{fileInput&&fileInput.click()};
 if(fileInput)fileInput.onchange=e=>{uploadFiles(e.target.files)};
 if(composerEl){
