@@ -1,0 +1,131 @@
+name: renew-ip-cert
+
+# ---------------------------------------------------------------------------
+# 自动续期 Let's Encrypt 的「IP 地址证书」(shortlived profile，约 6 天有效期)
+#
+# 为什么要在 GitHub Actions 上跑：
+#   阿里云北京这台服务器被定向阻断了 Let's Encrypt 的 ACME 接口(实测 0/10 可达)，
+#   而 LE 对 IP 证书只允许 http-01 / tls-alpn-01 验证。所以让 GitHub 的 runner
+#   来跑 ACME，再把验证文件通过 SSH 写到服务器 webroot、签发后把证书推回去。
+#
+# 需要的仓库 Secret：
+#   DEPLOY_SSH_KEY  —— 能免密登录服务器的私钥（对应公钥已加到服务器
+#                      ~/.ssh/authorized_keys，备注 github-actions-ip-cert）
+#
+# 触发方式：每天定时 + 手动；只有服务器上证书剩余有效期 < 3 天时才真正签发。
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 每天 02:17 UTC（北京时间 10:17）检查一次
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重新签发（跳过剩余有效期检查）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renew-ip-cert
+  cancel-in-progress: false
+
+env:
+  DEPLOY_HOST: 47.108.234.194
+  DEPLOY_USER: admin
+  WEBROOT: /var/www/letsencrypt
+  SSL_DIR: /etc/nginx/ssl
+  # 服务器上证书剩余有效期少于这个秒数(3 天)就续期
+  RENEW_THRESHOLD_SECONDS: "259200"
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 SSH 私钥
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "::error::仓库缺少 Secret DEPLOY_SSH_KEY，请先添加后再运行"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -T 20 -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "DEPLOY_KEY=$HOME/.ssh/deploy_key" >> "$GITHUB_ENV"
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST" 'echo SSH 连接正常: $(hostname)'
+
+      - name: 检查证书剩余有效期
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = "true" ]; then
+            echo "手动强制续期"
+            echo "need=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # openssl -checkend N：证书在 N 秒内不会过期则返回 0
+          if ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o ConnectTimeout=20 \
+               "$DEPLOY_USER@$DEPLOY_HOST" \
+               "sudo openssl x509 -checkend $RENEW_THRESHOLD_SECONDS -noout -in $SSL_DIR/hjmcp-ip.crt"; then
+            echo "证书剩余有效期充足（超过 3 天），本次跳过"
+            echo "need=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "证书即将到期或不存在，开始续期"
+            echo "need=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 certbot（仅需续期时）
+        if: steps.check.outputs.need == '1'
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/certbot-venv
+          /tmp/certbot-venv/bin/pip install --quiet --upgrade pip
+          /tmp/certbot-venv/bin/pip install --quiet certbot
+          /tmp/certbot-venv/bin/certbot --version
+
+      - name: 签发新证书
+        if: steps.check.outputs.need == '1'
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/acme-auth.sh .github/scripts/acme-cleanup.sh
+          /tmp/certbot-venv/bin/certbot certonly \
+            --non-interactive --agree-tos --register-unsafely-without-email \
+            --manual --preferred-challenges http \
+            --preferred-profile shortlived \
+            --server https://acme-v02.api.letsencrypt.org/directory \
+            --manual-auth-hook "$GITHUB_WORKSPACE/.github/scripts/acme-auth.sh" \
+            --manual-cleanup-hook "$GITHUB_WORKSPACE/.github/scripts/acme-cleanup.sh" \
+            --config-dir /tmp/certbot/config \
+            --work-dir /tmp/certbot/work \
+            --logs-dir /tmp/certbot/logs \
+            --ip-address "$DEPLOY_HOST"
+
+      - name: 推送证书并 reload nginx
+        if: steps.check.outputs.need == '1'
+        env:
+          CERT_FILE: /tmp/certbot/config/live/${{ env.DEPLOY_HOST }}/fullchain.pem
+          KEY_FILE: /tmp/certbot/config/live/${{ env.DEPLOY_HOST }}/privkey.pem
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/deploy-cert.sh
+          .github/scripts/deploy-cert.sh
+
+      - name: 汇总
+        if: always()
+        run: |
+          echo "本次是否需要续期: ${{ steps.check.outputs.need }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "站点: https://$DEPLOY_HOST/" >> "$GITHUB_STEP_SUMMARY"
