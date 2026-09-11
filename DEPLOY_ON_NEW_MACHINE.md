@@ -440,3 +440,47 @@ curl -s -X POST https://47.108.234.194/api/auth -H 'Content-Type: application/js
   -d '{"username":"updtest1","password":"updtest123456","invite":"UPDTEST"}'
 curl -s https://47.108.234.194/api/whatsnew -H "Authorization: Bearer <token>"
 ```
+
+---
+
+## 14. 管理员能力与云服务器工作空间（2026-09-11）
+
+由站点内置 agent 开发，本次一并入库。
+
+- **管理员名单**：环境变量 `MCP_WEB_ADMINS`（逗号分隔，默认 `yanghj`）。用户名**精确匹配、区分大小写**
+  （`"YANGHJ"`、`"yanghj "` 这类仿冒名不会被误判为管理员，否则等于提权）。
+  启动时 `_check_admin_accounts()` 会核对名单里每个账号是否已注册，未注册打 WARNING。
+- **权限差异**（`is_admin()`）：
+  - 管理员：共享工具保留 terminal 全套，另挂一个组合工具 `terminal_run`；可把文件空间切到「云服务器·整机」。
+  - 非管理员：按「工具归属哪个 MCP 会话」剔除 terminal 工具集（不靠名字前缀猜，terminal 换实现也不会漏），
+    并在提示词里明确告知无权操作服务器，避免模型反复试探或假装已完成。
+- **云服务器工作空间**：`POST /api/workspace {"mode":"local"|"server"}`，状态存 `users.ws_mode`（自动迁移补列）。
+  切到 `server` 后 filesystem MCP 的根变成 `MCP_WEB_SERVER_ROOT`（默认 `/`），AI 可直接读改整机文件。
+  - 护栏 `_FsGuardShim` 只挡 `/proc`、`/sys`、`/dev`、`/run` 与「从 `/` 全盘递归」——不是收权限
+    （管理员本就该有整机权限），是防止一次 `list_directory("/")` / `search_files("/")` 把服务拖死。
+  - HTTP 侧 `_safe_user_file()` 改为多根白名单：个人工作空间恒可访问（上传文件落点），server 模式下追加整机根。
+- **`terminal_run`**：一次调用完成「建/复用会话 → 发送 → 等待结束 → 读输出」并带回退出码，
+  `session_id` 可复用（保留 cwd / 环境变量 / 已激活 venv）。交互式程序（vim/htop、需要确认的提示）仍走原生 `terminal_*`。
+- **工具输出截断**：`conversation.truncate_tool_output()`，上限 `MCP_WEB_TOOL_OUTPUT_LIMIT`（默认 4000 字符，
+  头 HEAD 2400 + 尾 TAIL 1400），避免终端整屏输出被后续每一轮请求重复计入。
+
+## 15. 成本：前缀缓存与用量日志（2026-09-11）
+
+- **背景**：DeepSeek 自 2026-08-17 起改峰谷定价（高峰=北京 9:00-12:00 / 14:00-18:00），
+  **缓存命中与未命中的单价固定差 30 倍**（V4-Flash 高峰 ¥0.10 vs ¥3.00 每百万 token，空闲时段减半）。
+  前缀缓存只比对「从第 0 个 token 起完全相同」的部分——system 里改一个字节，整段历史就全部按未命中计费。
+- **已做的两件事**：
+  1. **system 只放稳定内容**：`SYSTEM_PROMPT + sys_note + perm_note + admin_note`；
+     随轮变化的部分（公网 IP / GPS 坐标 / 图片说明）由 `conversation._compose_user_message()`
+     挂到最后一条用户消息（那里本来每轮就不同，吃掉它不影响缓存）。
+     ⚠️ **后续新增提示词时，凡「每轮可能不同」的一律走 `turn_note`，不要塞进 system。**
+  2. **用量落日志**：请求带 `stream_options={"include_usage": True}`（流式下 usage 只在最后一帧且该帧
+     `choices` 为空，必须在 `continue` 之前取）；每次请求打印一行，整轮结束再用 logger 带用户名打一行。
+     服务端不认 `stream_options` 时会自动去掉重试一次（自愈）。
+- **实测**（2026-09-11 16:42，临时账号，两次请求 GPS 坐标不同）：固定前缀 **3968 tok** 稳定命中，
+  两次命中率均 **90%**；单次输入成本从「全未命中」的 ¥0.0132 降到 ¥0.0017（约 **7.9 倍**）。
+- **单价可覆盖**（换模型/调价不用改代码）：`MCP_WEB_PRICE_CACHE_HIT` / `MCP_WEB_PRICE_CACHE_MISS` /
+  `MCP_WEB_PRICE_OUTPUT`（默认 0.10 / 3.00 / 9.00）。
+- **下一层优化（未做）**：`recent_llm_messages(turns=8)` 是滑动窗口，窗口一滑，固定前缀之外的历史
+  基本吃不到缓存。若要继续省，可改成「分块累积」（攒满 8 轮再整体推进），代价是上下文更长。
+
