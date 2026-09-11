@@ -314,6 +314,66 @@ def truncate_tool_output(text: str, name: str = "") -> tuple[str, int]:
     return head + marker + tail, omitted
 
 
+# ====================== 重复只读调用短路（省 token） ======================
+# 模型经常拿**一模一样的参数**反复调同一个只读工具（实测一次对话里 search 连发 4 次、
+# fetchWebContent 连发 3 次）。每次重复调用都要把完整结果再塞进上下文，而上下文会在
+# 之后每一轮被整份重发——这是平方级的钱。这里在「同名 + 参数一字不差」时直接短路：
+# 不发网络请求，也不再重复结果内容，只回一句「结果同上，别再重试」。
+#
+# 只对**纯网络查询**类工具开启。故意不含 read_text_file / terminal_*：同一次对话里
+# 文件可能刚被 write_file 改过、终端输出会随命令变化，短路它们会返回过期内容——
+# 那是 bug，不是省钱。
+_DEDUP_TOOL_NAMES = {
+    "search",
+    "search_nearby",
+    "locate_ip",
+    "regeo",
+    "fetchWebContent",
+    "fetchCsdnArticle",
+    "fetchGithubReadme",
+    "fetchJuejinArticle",
+    "fetchLinuxDoArticle",
+}
+
+
+def _dedup_enabled() -> bool:
+    """环境变量 MCP_WEB_DEDUP=0 可整体关掉这个优化。"""
+    return os.environ.get("MCP_WEB_DEDUP", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _dedup_key(tool_name: str, args_raw: str) -> str:
+    """
+    生成「这次调用是否与之前完全相同」的指纹；不适用时返回空串（=不做去重）。
+
+    参数没解析成功时返回空串：否则所有解析失败的调用会共用同一个空 key，
+    把本来不同的调用错判成重复，进而返回错误的结果。
+    """
+    if not _dedup_enabled() or tool_name not in _DEDUP_TOOL_NAMES:
+        return ""
+    text = (args_raw or "").strip()
+    try:
+        parsed = json.loads(text) if text else {}
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    try:
+        canon = json.dumps(parsed, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ""
+    return f"{tool_name}\x00{canon}"
+
+
+def _dedup_notice(tool_name: str) -> str:
+    """短路时回给模型的内容：短，且明确要求它别再重试。"""
+    return (
+        f"⚠️ 本次 [{tool_name}] 调用与本次对话中之前的一次**完全相同**（参数一字不差），"
+        "已直接跳过、未再次请求。\n"
+        "上一次的完整结果就在上面的历史里，请直接使用它；不要再用同样的参数调用这个工具。\n"
+        "若信息仍然不足，请换关键词 / 换参数 / 换工具，或直接基于已获得的信息作答。"
+    )
+
+
 def _sanitize(obj: Any) -> Any:
     """
     递归清除字符串中的非法代理项(surrogate, U+D800~U+DFFF)。
@@ -504,6 +564,9 @@ async def agent_loop_stream(
     max_round = 1000
     # 本次对话的 token 用量累计（跨工具轮），命中率是成本的第一杠杆，见文件上方说明
     totals = {"hit": 0, "miss": 0, "in": 0, "out": 0, "rounds": 0}
+    # 本次对话内「同名 + 同参数」的只读调用记录，用于短路重复调用（省 token）
+    seen_calls: Dict[str, bool] = {}
+    dedup_hits = 0
 
     for round_no in range(max_round):
         req = _build_llm_request(work_messages, openai_tools, spec)
@@ -610,24 +673,40 @@ async def agent_loop_stream(
                 yield {"type": "tool", "name": tool_name, "status": "error", "note": tool_content}
             else:
                 session = tool_name_to_session[tool_name]
-                try:
-                    tool_result = await session.call_tool(tool_name, arguments=tool_args)
-                    tool_content = _tool_result_to_text(tool_result)
-                    # 过长输出就地压缩：省 token，也让后续每一轮请求都更小更快
-                    tool_content, _omitted = truncate_tool_output(tool_content, tool_name)
-                    print(f"✅工具[{tool_name}]返回结果")
-                    if _omitted:
-                        print(f"✂️ 工具[{tool_name}]输出过长，已省略 {_omitted} 字符")
+                dedup_key = _dedup_key(tool_name, args_raw)
+                if dedup_key and dedup_key in seen_calls:
+                    # 与之前某次调用一字不差：直接短路，不发请求、不重复结果内容
+                    dedup_hits += 1
+                    tool_content = _dedup_notice(tool_name)
+                    print(
+                        f"♻️ 工具[{tool_name}]与之前的调用完全相同，已跳过重复执行"
+                        f"（本次对话累计跳过 {dedup_hits} 次）"
+                    )
                     yield {
                         "type": "tool", "name": tool_name, "status": "ok",
-                        "note": f"输出过长，已省略 {_omitted} 字符" if _omitted else "",
+                        "note": "与该轮之前的调用完全相同，已跳过重复执行",
                     }
-                except Exception as e:
-                    tool_content, _ = truncate_tool_output(
-                        f"工具调用异常: {str(e)}", tool_name
-                    )
-                    print(f"❌{tool_content}")
-                    yield {"type": "tool", "name": tool_name, "status": "error", "note": str(e)[:200]}
+                else:
+                    try:
+                        tool_result = await session.call_tool(tool_name, arguments=tool_args)
+                        tool_content = _tool_result_to_text(tool_result)
+                        # 过长输出就地压缩：省 token，也让后续每一轮请求都更小更快
+                        tool_content, _omitted = truncate_tool_output(tool_content, tool_name)
+                        if dedup_key:
+                            seen_calls[dedup_key] = True   # 只登记成功的调用；失败允许重试
+                        print(f"✅工具[{tool_name}]返回结果")
+                        if _omitted:
+                            print(f"✂️ 工具[{tool_name}]输出过长，已省略 {_omitted} 字符")
+                        yield {
+                            "type": "tool", "name": tool_name, "status": "ok",
+                            "note": f"输出过长，已省略 {_omitted} 字符" if _omitted else "",
+                        }
+                    except Exception as e:
+                        tool_content, _ = truncate_tool_output(
+                            f"工具调用异常: {str(e)}", tool_name
+                        )
+                        print(f"❌{tool_content}")
+                        yield {"type": "tool", "name": tool_name, "status": "error", "note": str(e)[:200]}
 
             work_messages.append({
                 "role": "tool",

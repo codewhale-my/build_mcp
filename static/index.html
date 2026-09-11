@@ -1076,8 +1076,9 @@ function showWelcome(){
 /* ================= 发送逻辑（SSE 流式） ================= */
 let liveMsgEl=null,liveBubbleEl=null,liveTextNode=null;
 let liveActLines={}; // 工具名 -> 最近一条动作行元素（完成时更新 / 同名重试收尾）
+let curRun=null;     // 当前「连续同名工具调用」合并组：{name,el,count,notes,closed}
 function liveCleanup(){
-  liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};
+  liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};curRun=null;
 }
 /* 粘底相关函数已集中到上方「粘底引擎」，此处不再重复定义 */
 function ensureLiveMsg(){
@@ -1103,8 +1104,15 @@ const TOOL_LABEL={
   create_directory:'新建目录',move_file:'移动文件',copy_file:'复制文件',
   delete_file:'删除文件',run_command:'执行终端命令',
   user_filesystem:'读写本机文件',
-  terminal_run:'执行命令',
-  terminal_session_create:'开启终端',web_search:'联网搜索',fetch_page:'抓取网页'
+  // 真实工具名（此前缺映射，界面直接暴露英文名，看不出在干什么）
+  search:'联网搜索',search_nearby:'搜索周边',locate_ip:'定位位置',regeo:'地址解析',
+  fetchWebContent:'抓取网页',fetchCsdnArticle:'读 CSDN 文章',fetchGithubReadme:'读 GitHub 说明',
+  fetchJuejinArticle:'读掘金文章',fetchLinuxDoArticle:'读 LinuxDo 帖',
+  terminal_run:'执行命令',terminal_session_list:'列出终端会话',terminal_type:'输入命令',
+  terminal_read_output:'读取终端输出',terminal_press_key:'终端按键',
+  terminal_snapshot:'读取终端画面',terminal_session_close:'关闭终端会话',
+  terminal_click:'终端点击',terminal_wait_for:'等待终端输出',terminal_session_resize:'调整终端尺寸',
+  web_search:'联网搜索',fetch_page:'抓取网页'
 };
 function toolLabel(name){
   const t=String(name||'');
@@ -1144,6 +1152,53 @@ function settleLiveToolLine(line,ok,note){
   line.querySelector('.a-ico').textContent=ok?'✓':'✕';
   line.querySelector('.a-txt').textContent=ok?(line.dataset.label||''):('失败：'+(line.dataset.label||''));
   if(note)line.title=note;
+}
+// ============ 连续同名工具调用合并成一行（「搜索 ×4」） ============
+// 模型常拿同一个词反复搜（实测一屏里 search ×4、fetchWebContent ×3），以前一行一个，
+// 把回答挤得看不见。这里把**连续的**同名调用合并成一行并标次数，点一下可展开每次参数。
+// 注意：合并只是少画几行，**省不了 token**；真正省 token 的是后端「同名同参数短路」。
+function applyRunText(run,phase){
+  const label=toolLabel(run.name);
+  const n=run.count>1?(' ×'+run.count):'';
+  const txt=run.el.querySelector('.a-txt');
+  if(!txt)return;
+  // count>1 时不能直接写「失败：X ×N」——前面几次可能是成功的，只标「最后一次失败」
+  if(phase==='fail')txt.textContent=run.count>1?(label+n+' · 最后一次失败'):('失败：'+label);
+  else if(phase==='done')txt.textContent=label+n;
+  else txt.textContent='正在执行 '+label+n+' …';
+}
+function bumpToolRun(run,note){
+  run.count+=1;
+  if(note)run.notes.push(note);
+  // 上一次已收尾（打勾）后又来了同名的下一次：重新标回「进行中」。否则后续的 ok/error
+  // 会被 sealToolRun 里的 closed 判断挡掉，文案永远停在「正在执行…」（测试抓出来的）
+  if(run.closed){run.closed=false;run.el.className='live-act run';}
+  applyRunText(run,'running');
+}
+function sealToolRun(run,phase){
+  if(!run||run.closed)return;
+  run.closed=true;
+  if(phase==='fail')run.failed=true;
+  run.el.className='live-act '+(phase==='fail'?'fail':'done');
+  const ico=run.el.querySelector('.a-ico');
+  if(ico)ico.textContent=phase==='fail'?'✕':'✓';
+  applyRunText(run,phase);
+  if(run.count>1)attachRunDetail(run);
+}
+function attachRunDetail(run){
+  if(run.detailEl||!run.el.parentNode)return;
+  const d=document.createElement('div');
+  d.style.cssText='display:none;margin:2px 0 6px 22px;font-size:11.5px;color:var(--text3);'+
+    'line-height:1.7;white-space:pre-wrap;word-break:break-all';
+  d.textContent=run.notes.map((n,i)=>{
+    const last=(i===run.notes.length-1)&&run.failed;
+    return '#'+(i+1)+'  '+(n||'(无参数)')+(last?'   ← 失败':'');
+  }).join('\n');
+  run.el.parentNode.insertBefore(d,run.el.nextSibling);
+  run.detailEl=d;
+  run.el.style.cursor='pointer';
+  run.el.title='点击展开／收起每次调用的参数';
+  run.el.onclick=()=>{d.style.display=d.style.display==='none'?'block':'none'};
 }
 function finishLiveStream(item){
   // 用正式渲染替换直播节点，并写入页面历史（服务端已完成持久化，无需本地保存）
@@ -1232,11 +1287,18 @@ async function send(){
         }else if(ev.type==='tool'&&ev.name){
           const name=ev.name;
           if(ev.status==='start'){
-            // 结束当前文本段，把工具行插在这段文字正下方
-            const prev=liveActLines[name];
-            if(prev&&prev.className==='live-act')settleLiveToolLine(prev,true); // 同名重试：上一行先收尾
-            liveBreakSegment();
-            liveActLines[name]=addLiveToolLine(name);
+            // 连续的**同名**调用合并成一行（「搜索 ×4」）；换了工具名就另起一行
+            if(curRun&&curRun.name===name){
+              bumpToolRun(curRun,ev.note||'');
+            }else{
+              sealToolRun(curRun,'done');   // 上一组先收尾
+              liveBreakSegment();           // 结束当前文本段，把工具行插在这段文字正下方
+              curRun={name:name,el:addLiveToolLine(name),count:0,notes:[],closed:false};
+              liveActLines[name]=curRun.el;
+              bumpToolRun(curRun,ev.note||'');
+            }
+          }else if(curRun&&curRun.name===name){
+            sealToolRun(curRun,ev.status==='ok'?'done':'fail');
           }else{
             settleLiveToolLine(liveActLines[name],ev.status==='ok',ev.note||'');
           }

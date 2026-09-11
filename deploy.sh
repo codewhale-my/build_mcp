@@ -10,7 +10,14 @@
 #   ./deploy.sh                    # 只同步代码 + 重启 + 健康检查（默认 admin@47.108.234.194）
 #   ./deploy.sh --config           # 额外同步 config.yaml（去掉本机代理行；服务器旧配置备份为 .bak）
 #   ./deploy.sh --restart          # 只重启服务，不同步代码
+#   ./deploy.sh --force            # 跳过「防覆盖闸门」强制覆盖（确知服务器改动可丢弃时用）
 #   ./deploy.sh admin@1.2.3.4      # 指定其他服务器（可与上面参数组合）
+#
+# 防覆盖闸门（默认开启）:
+#   部署前逐文件比对「本机仓库」与「服务器工作区」的哈希。若服务器上有未入库的改动
+#   （典型场景：另一个 agent 直接在服务器上改代码），会先把服务器版本备份到
+#   ~/build-mcp-backups/<时间戳>/ 然后**中止部署**，避免被本机版本整体覆盖掉。
+#   处理办法：把服务器改动合并进本机仓库（git commit）后再部署；或加 --force 强行覆盖。
 #
 # 首次使用建议先做免密（否则每条命令都要输一次服务器密码）:
 #   ssh-copy-id admin@47.108.234.194
@@ -20,10 +27,12 @@ set -euo pipefail
 HOST=""
 ONLY_RESTART=0
 WITH_CONFIG=0
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --restart|-r) ONLY_RESTART=1 ;;
     --config|-c)  WITH_CONFIG=1 ;;
+    --force|-f)   FORCE=1 ;;
     -* ) echo "未知参数: $arg"; exit 1 ;;
     *  ) HOST="$arg" ;;
   esac
@@ -40,6 +49,42 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$1"; }
 
 if [ "${ONLY_RESTART}" = "0" ]; then
+  # ---- 防覆盖闸门：服务器上有未入库改动时先备份并中止，避免互相覆盖 ----
+  # 只检查真正会被整体覆盖的源码文件；比对前统一去掉 \r（本机/服务器行尾习惯不同，
+  # 不归一化会把纯行尾差异误报成"有改动"，那会让闸门形同虚设）。
+  GUARD_FILES="static/index.html src/build_mcp/web/main.py src/build_mcp/web/store.py src/build_mcp/client/conversation.py src/build_mcp/web/whatsnew.json"
+  if [ "${FORCE}" = "0" ]; then
+    step "防覆盖检查：服务器上是否有未入库的改动"
+    DIFFS=""
+    for f in $GUARD_FILES; do
+      [ -f "$SRC/$f" ] || continue
+      lh="$(tr -d '\r' < "$SRC/$f" | sha1sum | cut -c1-12)"
+      rh="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
+              "tr -d '\r' < '${REMOTE_DIR}/$f' 2>/dev/null | sha1sum | cut -c1-12" 2>/dev/null || echo missing)"
+      if [ "$lh" != "$rh" ]; then
+        DIFFS="${DIFFS}${f}"$'\n'
+        printf '   \033[1;33m⚠ 不同\033[0m %s\n' "$f"
+      fi
+    done
+    if [ -n "$DIFFS" ]; then
+      BK="/home/${RUSER}/build-mcp-backups/$(date +%Y%m%d-%H%M%S)"
+      printf '%s' "$DIFFS" | while read -r f; do
+        [ -n "$f" ] || continue
+        ssh -o BatchMode=yes "$HOST" "mkdir -p '$BK/$(dirname "$f")' && cp -f '${REMOTE_DIR}/$f' '$BK/$f'"
+      done
+      printf '\n\033[1;31m❌ 已中止部署：服务器上这些文件与本机仓库不同（服务器版本已备份到 %s）\033[0m\n' "$BK"
+      printf '%s' "$DIFFS" | sed 's/^/     · /'
+      echo "   这不是错误——是防止把服务器上的改动（例如另一个 agent 直接改的代码）覆盖掉。"
+      echo "   处理办法：把服务器改动合并进本机仓库并提交，再重新部署；"
+      echo "             或先取回备份： scp -r $HOST:$BK ./server-backup"
+      echo "             确知可以丢弃服务器版本时： ./deploy.sh --force"
+      exit 1
+    fi
+    echo "   一致 ✅ 服务器没有未入库的改动"
+  else
+    echo "   （--force：跳过防覆盖检查）"
+  fi
+
   step "同步代码  $SRC  →  ${HOST}:${REMOTE_DIR}"
   echo "   本机版本: $(git -C "$SRC" log --oneline -1 2>/dev/null || echo '(非 git 仓库)')"
   # 用 tar over ssh，服务器无需安装 rsync
@@ -112,7 +157,7 @@ if [ "$code" != "200" ]; then
 fi
 if [ "$code" = "200" ]; then
   printf '   HTTP 200 ✅  页面OK  (%s)\n' "$WEB_URL"
-  grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|geoBtn\|updOverlay\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
+  grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|geoBtn\|updOverlay\|新建工作空间\|fmtUsage\|curRun' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
   rm -f /tmp/_hj_deploy.html
   printf '\n\033[1;32m✅ 部署完成\033[0m   （服务端 token 是内存态，浏览器请刷新页面重新登录）\n'
   exit 0

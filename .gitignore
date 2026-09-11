@@ -16,5 +16,8 @@ src/build_mcp/config.yaml
 *.bak-*
 *.bak[0-9]*
 *.bak-*_*
+# patch/合并过程留下的副本（如 index.html.orig）
+*.orig
+*.rej
 # 测试缓存
 .pytest_cache/
