@@ -904,7 +904,15 @@ async function send(){
   busy=true;sendBtn.disabled=true;
   controller=new AbortController();
   ensureLiveMsg();
-  const gf=await geoForSend();   // 用户开了精确定位就带上坐标（最多等 3s）
+  const wantGeo=needsGeoLocation(q);
+  let geoLine=null;
+  if(wantGeo&&geoSupported()&&geoSecure()&&!geoFix){
+    geoLine=addLiveToolLine('locate_ip');
+    geoLine.dataset.label='获取精确定位';
+    geoLine.querySelector('.a-txt').textContent='正在获取精确定位…';
+  }
+  const gf=await geoForSend(wantGeo);   // 位置相关问题会自动开启精确定位（最多等几秒）
+  if(geoLine)settleLiveToolLine(geoLine,!!gf,gf?'精度约 ±'+Math.round(gf.acc||0)+' 米':'未取到，改用 IP 定位（城市级）');
   let answer='';
   let answeredModel='';
   try{
@@ -1496,7 +1504,7 @@ function geoRender(){
     geoBtn.title='已开启精确定位，但暂时没拿到坐标（信号弱/超时）。点一下可重试，发消息时也会自动重试。';
   }else{
     geoBtn.className='lbtn gbtn';geoTxt.textContent='开启定位';
-    geoBtn.title='点击开启精确定位（浏览器会询问授权），用于“我在哪 / 我附近”这类问题';
+    geoBtn.title='点击开启精确定位（浏览器会询问授权）。问“我在哪 / 附近 / 怎么走 / 天气”这类问题时，也会自动尝试开启。';
   }
 }
 function geoErrHint(err){
@@ -1506,8 +1514,10 @@ function geoErrHint(err){
   if(c===3)return '定位超时，继续使用 IP 定位';
   return '定位失败：'+((err&&err.message)||'未知原因');
 }
+let geoPending=null;   // 并发合并：同一时刻只跑一次定位，避免重复弹权限
 function requestGeo(silent){
-  return new Promise(resolve=>{
+  if(geoPending)return geoPending;
+  const p=new Promise(resolve=>{
     if(!geoSupported()||!geoSecure()){resolve(null);return}
     geoBusy=true;geoRender();
     navigator.geolocation.getCurrentPosition(pos=>{
@@ -1525,6 +1535,25 @@ function requestGeo(silent){
       resolve(null);
     },{enableHighAccuracy:true,timeout:12000,maximumAge:60000});
   });
+  geoPending=p;
+  p.then(()=>{geoPending=null},()=>{geoPending=null});
+  return p;
+}
+// —— 位置意图识别：命中则发送前自动尝试开启精确定位 ——
+const GEO_INTENT_RE=new RegExp([
+  '我在(哪|什么位置|什么地方|哪个位置)','我的位置','当前位置','我这边(在哪|什么位置)','现在在哪',
+  '附近','周边','周围','就近','最近的','离我(多|有)远','距离我',
+  '怎么(走|去|到)','导航','路线','带我去','怎么过去','怎么到达',
+  '离.{0,10}(多远|几点几公里|多少公里)','几公里','车程','打车','步行','骑行','坐地铁','公交',
+  '(去哪|哪里|哪儿)(吃|玩|逛|买)','去哪儿',
+  '(推荐|找个|找一家|帮我找|有没有|哪家).{0,10}(餐厅|饭店|吃的|美食|咖啡|奶茶|酒店|宾馆|民宿|超市|商场|便利店|医院|药店|银行|ATM|加油站|充电桩|停车场|厕所|洗手间|景点|公园|地铁站|健身房|快递|菜市场)',
+  '(找一家|找个|推荐个|推荐一家|来一家|哪家好|去哪家).{0,6}(店|馆|城|铺|吧|站|场|园|楼)',
+  '天气|气温|降雨|下雨|下雪|空气质量|雾霾|紫外线|穿什么|限行',
+  '\\bnear ?me\\b','nearby','\\baround me\\b','where am i','directions to','how far','\\bhow do i get\\b','closest','nearest'
+].join('|'),'i');
+function needsGeoLocation(q){
+  if(!q)return false;
+  return GEO_INTENT_RE.test(q);
 }
 function geoBtnClick(){
   if(geoBusy)return;
@@ -1543,11 +1572,38 @@ function geoBtnClick(){
   try{localStorage.setItem(GEO_PREF,'1')}catch(e){}
   requestGeo(false);
 }
-async function geoForSend(){
-  // 发送时取一份尽量新鲜的坐标；最多等 3s，绝不拖垮发送
-  if(!geoEnabled||!geoSupported()||!geoSecure())return null;
+async function geoForSend(force){
+  // 发送时取一份尽量新鲜的坐标。
+  // force=true（问题与位置相关）→ 即使没开定位也自动尝试开启；最多等几秒，绝不卡死发送。
+  if(!geoSupported())return null;
+  if(!geoSecure()){
+    if(force)toast('当前不是 HTTPS，浏览器不允许精确定位，本次改用 IP 定位（城市级）');
+    return null;
+  }
+  let perm='unknown';
+  try{
+    const st=await navigator.permissions.query({name:'geolocation'});
+    perm=st.state||'unknown';
+  }catch(e){/* 个别浏览器不支持 permissions.query */}
+  const autoOn=force&&!geoEnabled;
+  if(autoOn){
+    geoEnabled=true;                       // 位置相关的问题 → 直接开启
+    try{localStorage.setItem(GEO_PREF,'1')}catch(e){}
+    geoRender();
+    toast(perm==='prompt'?'这条问题需要位置信息，请在浏览器提示里点「允许」…':'这条问题需要位置信息，正在获取精确定位…');
+  }else if(!geoEnabled){
+    return null;
+  }
   if(geoFix&&Date.now()-(geoFix.ts||0)<180000)return geoFix;
-  await Promise.race([requestGeo(true),sleep(3000)]);
+  // 首次授权要等用户点浏览器弹窗，给足时间；已授权则很快
+  const wait=force?(perm==='prompt'?15000:(perm==='denied'?1200:7000)):3000;
+  await Promise.race([requestGeo(true),sleep(wait)]);
+  if(force){
+    if(geoFix&&autoOn)toast('已获取精确定位（精度约 ±'+Math.round(geoFix.acc||0)+' 米）');
+    else if(!geoFix)toast(perm==='denied'
+      ?'定位权限被拒绝，本次改用 IP 定位（城市级）；可在浏览器地址栏重新允许'
+      :'没拿到精确定位，本次改用 IP 定位（城市级）');
+  }
   return geoFix;
 }
 if(geoBtn)geoBtn.onclick=geoBtnClick;
