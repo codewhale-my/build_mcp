@@ -150,6 +150,7 @@ header{
 .ws-item .wi-check{flex:none;color:var(--accent1);font-weight:700}
 /* 回答下方的小字：本轮由哪个模型回答 */
 .msg-model{font-size:11px;color:var(--text3);margin-top:5px;opacity:.9}
+.msg-usage{font-size:11px;color:var(--text3);margin-top:2px;opacity:.85;font-variant-numeric:tabular-nums}
 .msg-model .mm-dot{
   display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent1);
   margin-right:5px;vertical-align:middle;opacity:.8;
@@ -922,6 +923,17 @@ function renderAll(){
   history.forEach(item=>chatBox.appendChild(buildMsg(item)));
   scrollBottom();
 }
+/* 用量小字：⚡缓存命中 96%（4.2k/4.4k tok）· 输出 131 tok · 2 轮 */
+function fmtUsage(u){
+  const hit=u.hit||0,miss=u.miss||0,out=u.out||0;
+  const tot=hit+miss,pct=tot?Math.round(hit*100/tot):100;
+  const k=n=>n>=10000?(Math.round(n/100)/10)+'k':(n>=1000?(Math.round(n/100)/10)+'k':''+n);
+  let s='⚡ 缓存命中 '+pct+'%';
+  if(tot)s+='（'+k(hit)+'/'+k(tot)+' tok）';
+  if(out)s+=' · 输出 '+k(out)+' tok';
+  if(u.rounds>1)s+=' · '+u.rounds+' 轮';
+  return s;
+}
 function buildMsg(item){
   const wrap=document.createElement('div');
   if(item.role==='user'){
@@ -941,7 +953,9 @@ function buildMsg(item){
     }
     const mchip=(item.role==='assistant'&&item.model)
       ? '<div class="msg-model"><span class="mm-dot"></span>'+esc(item.model)+'</div>' : '';
-    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+mchip+'</div>';
+    const uchip=(item.role==='assistant'&&item.usage&&(item.usage.in||item.usage.out))
+      ? '<div class="msg-usage">'+fmtUsage(item.usage)+'</div>' : '';
+    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+mchip+uchip+'</div>';
   }
   return wrap;
 }
@@ -1164,6 +1178,7 @@ async function send(){
   if(geoLine)settleLiveToolLine(geoLine,!!gf,gf?'精度约 ±'+Math.round(gf.acc||0)+' 米':'未取到，改用 IP 定位（城市级）');
   let answer='';
   let answeredModel='';
+  let lastUsage=null;   // 本轮用量（done 事件带回：hit/miss/in/out/rounds）
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
@@ -1229,6 +1244,7 @@ async function send(){
         }else if(ev.type==='done'){
           if(ev.answer!==undefined)answer=ev.answer;
           if(ev.model_key)answeredModel=modelLabel(ev.model_key);
+          if(ev.usage&&(ev.usage.in||ev.usage.out))lastUsage=ev.usage;
           completed=true;
         }else if(ev.type==='error'){
           throw new Error(ev.message||'服务端流式错误');
@@ -1238,7 +1254,7 @@ async function send(){
     }
     // 结束：用最终全文渲染替换直播气泡
     const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）',
-              model:answeredModel||modelLabel(modelKey)};
+              model:answeredModel||modelLabel(modelKey),usage:lastUsage};
     finishLiveStream(it);
   }catch(err){
     const el=liveMsgEl;el&&el.remove();liveCleanup();
