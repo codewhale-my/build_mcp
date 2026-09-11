@@ -276,6 +276,14 @@ header{
 .bubble a.filedl.ext-ppt .f-ico,.bubble a.filedl.ext-pptx .f-ico{background:linear-gradient(135deg,#ea580c,#fb923c)}
 .bubble a.filedl.ext-zip .f-ico,.bubble a.filedl.ext-tar .f-ico,.bubble a.filedl.ext-gz .f-ico{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
 .bubble a.filedl.ext-py .f-ico,.bubble a.filedl.ext-js .f-ico,.bubble a.filedl.ext-ts .f-ico,.bubble a.filedl.ext-json .f-ico,.bubble a.filedl.ext-sh .f-ico{background:linear-gradient(135deg,#0d9488,#2dd4bf)}
+/* Markdown 表格 */
+.bubble .tblwrap{overflow-x:auto;margin:.55em 0;border:1px solid var(--border);border-radius:10px}
+.bubble table{border-collapse:collapse;width:100%;font-size:.92em}
+.bubble th,.bubble td{border-bottom:1px solid var(--border);border-right:1px solid var(--border);padding:6px 11px;text-align:left;vertical-align:top}
+.bubble th:last-child,.bubble td:last-child{border-right:none}
+.bubble tbody tr:last-child td{border-bottom:none}
+.bubble thead th{background:var(--panel);font-weight:600;white-space:nowrap}
+.bubble tbody tr:nth-child(even) td{background:var(--panel)}
 /* 文件名过长省略 */
 .bubble a.filedl .f-name{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 右侧下载箭头：hover 时高亮 */
@@ -698,6 +706,17 @@ function mdInline(s){
   s=s.replace(/\u0000T(\d+)\u0000/g,(m,i)=>toks[+i]);
   return s;
 }
+/* 表格辅助：切分一行单元格 / 判断分隔行 */
+function splitRow(line){
+  let s=line.trim();
+  if(s.startsWith('|'))s=s.slice(1);
+  if(s.endsWith('|'))s=s.slice(0,-1);
+  return s.split('|').map(c=>c.trim());
+}
+function isTableSep(line){
+  const cells=splitRow(line);
+  return cells.length>0 && cells.every(c=>/^:?-+:?$/.test(c));
+}
 function renderMarkdown(src){
   src=esc(src);
   const blocks=[];
@@ -716,6 +735,30 @@ function renderMarkdown(src){
     if(cb){flush();out+=blocks[+cb[1]];i++;continue}
     // 分隔线
     if(/^([-*_])\1{2,}$/.test(line.trim())){flush();out+='<hr>';i++;continue}
+    // 表格：表头行(以|开头) + 分隔行(|---|---| 或 |--:|:-:| 等)
+    if(/^\s*\|/.test(line) && i+1<lines.length && isTableSep(lines[i+1])){
+      flush();
+      const head=splitRow(line);
+      const align=splitRow(lines[i+1]).map(c=>{
+        const l=c.startsWith(':'),r=c.endsWith(':');
+        return l&&r?'center':r?'right':l?'left':'';
+      });
+      i+=2;
+      const cell=(c,ci,tag)=>{
+        const a=align[ci]?' style="text-align:'+align[ci]+'"':'';
+        return '<'+tag+a+'>'+mdInline(c)+'</'+tag+'>';
+      };
+      let tbl='<div class="tblwrap"><table><thead><tr>'+
+        head.map((c,ci)=>cell(c,ci,'th')).join('')+'</tr></thead><tbody>';
+      while(i<lines.length && /^\s*\|/.test(lines[i])){
+        const cells=splitRow(lines[i]);
+        while(cells.length<head.length)cells.push('');
+        tbl+='<tr>'+cells.slice(0,head.length).map((c,ci)=>cell(c,ci,'td')).join('')+'</tr>';
+        i++;
+      }
+      tbl+='</tbody></table></div>';
+      out+=tbl;continue;
+    }
     // 标题
     const h=line.match(/^(#{1,4})\s+(.*)$/);
     if(h){flush();const n=h[1].length;out+='<h'+n+'>'+mdInline(h[2])+'</h'+n+'>';i++;continue}
