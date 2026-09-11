@@ -393,3 +393,50 @@ echo | openssl s_client -connect 47.108.234.194:443 2>/dev/null | openssl x509 -
 ssh admin@47.108.234.194 "sudo rm -f /etc/nginx/sites-enabled/hjmcp && sudo systemctl disable --now nginx"
 # 8000 完全不受影响；如需彻底清掉 80 端口配置，再删 /etc/nginx/sites-available/hjmcp
 ```
+
+---
+
+## 13. 更新说明弹窗（What's New，2026-09-11）
+
+用户登录后，若存在**没看过的更新**，会自动弹一次说明弹窗；关掉后不再重复提醒。
+顶栏 ✨ 按钮（有未读时带小红点）可随时重开，没有未读时展示全部历史更新。
+
+### 相关文件
+| 文件 | 作用 |
+|---|---|
+| `src/build_mcp/web/whatsnew.json` | **更新数据源**（唯一需要改的文件） |
+| `src/build_mcp/web/whatsnew.py` | 按 mtime 缓存加载 + `payload_for(seen)` 比对 |
+| `src/build_mcp/web/store.py` | `users.last_seen_version` 列（含 `_migrate`）+ `set_user_seen_version()` |
+| `src/build_mcp/web/main.py` | `GET /api/whatsnew`、`POST /api/whatsnew/seen` |
+| `static/index.html` | `loadWhatsNew()` / `showWhatsNew()` / `closeWhatsNew()` + `#updOverlay` 弹窗 |
+
+### 怎么发一条新更新
+编辑 `whatsnew.json`，把新条目**插到 `entries` 数组最前面**，并换一个**新的 `version` 字符串**即可：
+
+```json
+{
+  "entries": [
+    { "version": "2026.09.12.1", "date": "2026-09-12", "title": "一句话概括",
+      "points": ["做了什么改动，一条一句", "最多三四条"] }
+  ]
+}
+```
+- 判断"是否看过"只做 **version 字符串相等比较**，不做版本号语义解析，所以用 `日期.序号` 这种写法最省事。
+- 文件按 mtime 缓存，**改完不用重启服务**（但线上要 `./deploy.sh` 把文件推上去）。
+- 文件缺失或 JSON 写坏时接口退化为"没有更新"，不会 500，也不会把前端搞崩。
+
+### 行为细节
+- **已读记在用户维度**（`users.last_seen_version`）：换设备、清浏览器缓存都不会重复弹。
+- 全新用户只展示**最新一条**，不会一上来刷屏；老用户只展示上次看过的版本之后的条目。
+- 关闭方式：点「知道了」/ 点遮罩空白处 / 按 Esc，三种都会上报已读。
+- 万一 `POST /api/whatsnew/seen` 失败（网络抖动），下次登录会再弹一次，不会静默丢失。
+
+### 验证
+```bash
+# 用临时账号走一遍：首次 should_show=true → POST seen → 再查 should_show=false
+# 完整脚本思路见 §11/§12 的"临时邀请码 + curl"套路
+ssh admin@47.108.234.194 "cd ~/build-mcp && /home/admin/.local/bin/uv run python -m build_mcp.web.store invite UPDTEST 临时"
+curl -s -X POST https://47.108.234.194/api/auth -H 'Content-Type: application/json' \
+  -d '{"username":"updtest1","password":"updtest123456","invite":"UPDTEST"}'
+curl -s https://47.108.234.194/api/whatsnew -H "Authorization: Bearer <token>"
+```
