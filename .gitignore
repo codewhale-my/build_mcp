@@ -20,12 +20,15 @@ config.yaml
 *.yaml.bak
 *.yml.bak
 
-# 临时回滚备份（形如 foo.py.bak-20260911_170327 / foo.py.bak2-...）
-# 只用于本机排障，不入库，避免覆盖协作者的改动
+# 改代码时留下的备份副本（如 main.py.bak-20260911_154208、index.html.bak-wsfix-…、foo.py.bak2-…），不入库
+# 只用于本机排障，避免覆盖协作者的改动
 *.bak
 *.bak-*
+*.bak[0-9]*
+*.bak-*_*
 *.bak2-*
 *.bak3-*
+# patch/合并过程留下的副本（如 index.html.orig）
 *.orig
 *.rej
 

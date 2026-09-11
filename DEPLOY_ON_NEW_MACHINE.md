@@ -506,3 +506,50 @@ curl -s https://47.108.234.194/api/whatsnew -H "Authorization: Bearer <token>"
   线上真实链路 12 轮（临时账号，已清理）：第 1 轮 0 命中，第 2 轮起 **4096→4352 tok 随轮增长**，
   累计命中占比 **88.1%**，第 9 轮起 **96%**。同样位置滑动窗口会掉回「只剩固定前缀可命中」。
 
+
+---
+
+## 16. 与「服务器侧 agent」协作：合并流程与防覆盖闸门（2026-09-11）
+
+### 为什么会互相覆盖
+站点的内置 agent 直接在**服务器** `~/build-mcp` 上改代码（它的工作目录就是那儿）。
+这些改动一开始**不在 git 里**（服务器 HEAD 停在旧提交，`git status` 一堆 M 里还混着行尾噪音），
+而 `deploy.sh` 是「本机仓库 → tar → 覆盖服务器工作区」的单向同步 ——
+于是在服务器上写的代码会被下一次部署整份盖掉（2026-09-11 真实发生过一次）。
+
+### 合并流程（每次要从服务器取回改动时照这个走）
+1. 拉回服务器工作区（排除 .git/.venv/log/__pycache__/*.bak*）：
+   `ssh admin@... "cd ~/build-mcp && tar czf - --exclude=.git --exclude=.venv --exclude=log --exclude=__pycache__ --exclude='*.bak*' ." | tar xzf - -C /tmp/srv_tree`
+2. **全树对比**（务必先做，别只看几个文件）：
+   - A 服务器有、仓库没有（新增文件；注意 `*.orig` 这类合并副本不要入库）
+   - B 仓库有、服务器没有（部署未覆盖的文件）
+   - C 两侧都有但内容不同
+3. **逐文件判定方向**：`diff <(tr -d '\r' < repo/f) <(tr -d '\r' < srv/f)`。
+   行尾一定要归一化（本机经 UNC 编辑会写成 CRLF），否则 8000+ 行差异里八成是 `\r` 噪音。
+4. **用「关键标记」双向核对**，确认取哪一侧不会丢功能。本项目常用标记：
+   - `conversation.py`：`_tool_result_to_text`、`turn_note`、`_compose_user_message`、
+     `_usage_numbers`、`include_usage`、`truncate_tool_output`、`_dedup_key`
+   - `static/index.html`：`tblwrap`、`GEO_INTENT_RE`、`geoForSend`、`updOverlay`、
+     `netErrMsg`、`fmtUsage`、`curRun`
+5. 逐条看 `git diff -U0 | grep '^-'` 的**删除行**，确认是「同一段代码的重构替换」而不是功能被删。
+6. 验证后 commit + push；**再** deploy（此时闸门会放行，因为两侧一致）。
+
+### 防覆盖闸门（`deploy.sh` 默认开启）
+部署前对 `static/index.html`、`web/store.py`、`web/main.py`、`client/conversation.py`、
+`web/whatsnew.json` 逐个比对「本机仓库」与「服务器工作区」的哈希（行尾归一化后）。不一致时：
+
+- 先把服务器版本备份到 `~/build-mcp-backups/<时间戳>/<原相对路径>`；
+- 打印差异清单并**中止部署**（退出码 1），提示合并进 git 或 `--force`。
+
+实测（2026-09-11）：在服务器 `main.py` 尾部加一行注释 → 部署被拦下、备份生成、内容确认在备份里；
+去掉该行后重新部署打印「一致 ✅」并正常完成。
+
+**注意**：闸门只比对这 5 个文件。若新增了源码文件，记得加进 `deploy.sh` 的 `GUARD_FILES`。
+
+### 一句话规矩
+**服务器上的改动必须先合并进 git 再部署。** `deploy.sh` 现在会替你拦住那次覆盖，
+但拦下来的目的是让你合并，不是让你 `--force`。
+
+### 另外两条工程纪律（本次踩出来的）
+- 同一文件在一条消息里发多个 Edit 会**互相覆盖**（后写覆盖先写）；务必一次只改一处、改完立即 grep 验证。
+- 写脚本文件偶发掉字符（`err` → `er`）；辅助脚本写到 D: 盘再用 `/mnt/d/...` 跑，且跑前先 `ast.parse`/`node --check` 过一遍。
