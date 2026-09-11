@@ -365,6 +365,83 @@ def _delta_field(delta, name):
         return None
 
 
+# ====================== token 用量 / 前缀缓存统计 ======================
+# DeepSeek 的前缀缓存只比对「从第 0 个 token 开始完全相同」的前缀；命中部分的单价
+# 只有未命中的 1/30（2026-08-17 起 V4-Flash 高峰：命中 0.10 / 未命中 3.00 / 输出 9.00
+# 元每百万 token，空闲时段减半）。所以「命中率」是成本的第一杠杆，必须能看到它。
+# 单价可用环境变量覆盖（换模型/调价时不用改代码）。
+_PRICE_HIT = float(os.environ.get("MCP_WEB_PRICE_CACHE_HIT", "0.10"))
+_PRICE_MISS = float(os.environ.get("MCP_WEB_PRICE_CACHE_MISS", "3.00"))
+_PRICE_OUT = float(os.environ.get("MCP_WEB_PRICE_OUTPUT", "9.00"))
+
+# 是否向服务端索要 usage（stream 模式下必须显式打开）。若服务端不认这个参数，
+# 会被 _create_stream 自动关掉并重试一次，不会打断用户请求。
+_WANT_STREAM_USAGE = True
+
+
+def _usage_numbers(u) -> dict:
+    """把一帧 usage 归一化成 {hit, miss, in, out}（缺字段按 0，兼容 dict/对象两种形态）。"""
+    def g(*names) -> int:
+        for n in names:
+            v = None
+            try:
+                v = u.get(n) if isinstance(u, dict) else getattr(u, n, None)
+            except Exception:
+                v = None
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    return 0
+        return 0
+
+    hit = g("prompt_cache_hit_tokens")
+    miss = g("prompt_cache_miss_tokens")
+    pin = g("prompt_tokens") or (hit + miss)
+    return {"hit": hit, "miss": miss, "in": pin, "out": g("completion_tokens")}
+
+
+def _fmt_usage(u: dict) -> str:
+    """一行可读的用量摘要：输入(命中/未命中/命中率) + 输出 + 估算花费。"""
+    hit, miss, out = int(u.get("hit") or 0), int(u.get("miss") or 0), int(u.get("out") or 0)
+    pin = int(u.get("in") or 0) or (hit + miss)
+    rate = (hit / pin) if pin else 0.0
+    cost = (hit * _PRICE_HIT + miss * _PRICE_MISS + out * _PRICE_OUT) / 1_000_000
+    return (f"输入 {pin} tok（缓存命中 {hit} / 未命中 {miss}，命中率 {rate:.0%}）"
+            f" 输出 {out} tok ≈ ¥{cost:.4f}")
+
+
+async def _create_stream(client, req: Dict[str, Any]):
+    """发起流式请求；服务端不认 stream_options 时去掉它重试一次（自愈，不打断请求）。"""
+    global _WANT_STREAM_USAGE
+    try:
+        return await client.chat.completions.create(**req, stream=True)
+    except Exception:
+        if "stream_options" not in req:
+            raise
+        _WANT_STREAM_USAGE = False
+        print("⚠️ 服务端不支持 stream_options，已关闭 usage 统计并重试")
+        return await client.chat.completions.create(
+            **{k: v for k, v in req.items() if k != "stream_options"}, stream=True
+        )
+
+
+def _compose_user_message(user_query: str | list, turn_note: str = ""):
+    """把「随轮变化」的上下文挂到用户消息末尾，而不是塞进 system。
+
+    为什么：system 是前缀的最前面，只要它有一个字节变了，整段历史就全部按未命中
+    计费（30 倍差价）。公网 IP / GPS 坐标 / 图片说明这些东西每轮都可能不同，放在
+    最后一条用户消息里——那里本来每轮就不一样，吃掉它是免费的。
+    """
+    note = (turn_note or "").strip()
+    if not note:
+        return user_query
+    if isinstance(user_query, list):
+        return [*user_query, {"type": "text", "text": note}]
+    q = user_query if isinstance(user_query, str) else str(user_query)
+    return f"{q}\n\n{note}"
+
+
 def _build_llm_request(work_messages: list[dict], openai_tools, spec: dict | None = None) -> Dict[str, Any]:
     """组装一次 chat.completions 请求参数（按所选模型的 thinking 开关决定是否开思考模式）。"""
     spec = spec or resolve_llm_spec()
@@ -374,6 +451,9 @@ def _build_llm_request(work_messages: list[dict], openai_tools, spec: dict | Non
         "messages": _sanitize(work_messages),
         "tools": openai_tools,
     }
+    if _WANT_STREAM_USAGE:
+        # 流式模式下 usage 在最后一帧才给，必须显式索要，否则拿不到缓存命中数
+        req["stream_options"] = {"include_usage": True}
     if spec["thinking"]:
         # 开启 DeepSeek 思考模式：先输出 reasoning_content 再给 content
         req["extra_body"] = {"thinking": {"type": "enabled"}}
@@ -388,6 +468,7 @@ async def agent_loop_stream(
     openai_tools: List[Dict[str, Any]],
     user_query: str | list,   # str 或 OpenAI 多模态 content 列表(text/image_url 混排)
     history_messages: list[dict],
+    turn_note: str = "",      # 随轮变化的上下文(IP/定位/图片说明)，挂到最后一条用户消息
     model_key: str | None = None,
 ):
     """
@@ -400,17 +481,19 @@ async def agent_loop_stream(
       {"type": "answer",   "delta": str}    最终回答增量
       {"type": "tool", "name": str, "status": "start"|"ok"|"error", "note": str}
                                             (note 仅 start/error 时可能带参数或原因)
-      {"type": "done", "answer": str, "thinking": str, "model": str, "model_key": str}
-                                            整轮结束(携带全文与实际使用的模型)
+      {"type": "done", "answer": str, "thinking": str, "model": str, "model_key": str,
+       "usage": {"hit": int, "miss": int, "in": int, "out": int, "rounds": int, "summary": str}}
+                                            整轮结束(携带全文、实际使用的模型与 token 用量)
       {"type": "error", "message": str}    硬错误(网络/API/解析等)
 
-    不修改传入的 history_messages，中间工具过程只在本轮内部。
+    turn_note: 每轮都可能变化的上下文，会被拼到最后一条用户消息（不进 system，
+    以保住前缀缓存）。不修改传入的 history_messages，中间工具过程只在本轮内部。
     工具轮次的 reasoning_content 会随 assistant 消息一起回传(DeepSeek 要求，
     否则带 tools 的后续请求会 400)。
     """
     spec = resolve_llm_spec(model_key)
     work_messages = history_messages.copy()
-    work_messages.append({"role": "user", "content": user_query})
+    work_messages.append({"role": "user", "content": _compose_user_message(user_query, turn_note)})
 
     client = AsyncOpenAI(
         api_key=LLM_API_KEY,
@@ -419,13 +502,15 @@ async def agent_loop_stream(
 
     thinking_parts: List[str] = []   # 各轮思考文本，done 时合并
     max_round = 1000
+    # 本次对话的 token 用量累计（跨工具轮），命中率是成本的第一杠杆，见文件上方说明
+    totals = {"hit": 0, "miss": 0, "in": 0, "out": 0, "rounds": 0}
 
-    for _ in range(max_round):
+    for round_no in range(max_round):
         req = _build_llm_request(work_messages, openai_tools, spec)
 
         # ---------- 发起流式请求 ----------
         try:
-            stream = await client.chat.completions.create(**req, stream=True)
+            stream = await _create_stream(client, req)
         except Exception as e:
             yield {"type": "error", "message": f"模型请求失败：{e}"}
             return
@@ -433,8 +518,12 @@ async def agent_loop_stream(
         content_acc = ""            # 本轮最终回答累积
         thinking_acc = ""           # 本轮思考文本累积
         tool_slots: Dict[int, dict] = {}   # tool_call index -> 聚合后的调用
+        round_usage = {"hit": 0, "miss": 0, "in": 0, "out": 0}
         try:
             async for chunk in stream:
+                # usage 只在最后一帧出现，那一帧的 choices 是空数组——必须在 continue 之前取
+                if getattr(chunk, "usage", None) is not None:
+                    round_usage = _usage_numbers(chunk.usage)
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -471,6 +560,13 @@ async def agent_loop_stream(
             except Exception:
                 pass
 
+        # 累计本轮用量并落日志：命中率是成本的第一杠杆，必须每轮都看得见
+        if any(round_usage.get(k) for k in ("hit", "miss", "in", "out")):
+            totals["rounds"] += 1
+            for k in ("hit", "miss", "in", "out"):
+                totals[k] += int(round_usage.get(k) or 0)
+            print(f"📊 第{totals['rounds']}次请求 {_fmt_usage(round_usage)}")
+
         if thinking_acc:
             thinking_parts.append(thinking_acc)
 
@@ -484,6 +580,7 @@ async def agent_loop_stream(
                 "thinking": "\n\n".join(p for p in thinking_parts if p),
                 "model": spec["model"],
                 "model_key": spec["key"],
+                "usage": {**totals, "summary": _fmt_usage(totals)},
             }
             return
 
@@ -545,6 +642,7 @@ async def agent_loop_stream(
         "thinking": "\n\n".join(p for p in thinking_parts if p),
         "model": spec["model"],
         "model_key": spec["key"],
+        "usage": {**totals, "summary": _fmt_usage(totals)},
     }
 
 
@@ -552,7 +650,8 @@ async def agent_loop(
     tool_name_to_session: Dict[str, ClientSession],
     openai_tools: List[Dict[str, Any]],
     user_query: str,
-    history_messages: list[dict]
+    history_messages: list[dict],
+    turn_note: str = "",
 ) -> AgentResult:
     """
     聚合版：消费 agent_loop_stream，攒齐后返回 AgentResult(answer/thinking)。

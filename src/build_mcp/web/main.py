@@ -1305,9 +1305,15 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                 "(1) /proc、/sys、/dev、/run 属虚拟文件系统，已被护栏挡住，不要反复尝试；"
                 "(2) 搜索/列目录不要从 / 全盘递归（会遍历整块磁盘），请指定具体子目录。"
             )
-    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note + geo_note + img_note + perm_note + admin_note}]
+    # ★ 前缀缓存：DeepSeek 只比对「从第 0 个 token 起完全相同」的前缀，system 里只要有一个
+    #   字节变了，整段历史就全部按未命中计费（未命中单价是命中价的 30 倍）。
+    #   所以 system 只放「同一用户每轮都一样」的内容（系统提示 + 文件交付约定 + 权限说明），
+    #   而随轮变化的部分（公网 IP / GPS 坐标 / 图片说明）挂到最后一条用户消息——
+    #   那里本来每轮就不同，吃掉它不影响任何缓存。见 conversation._compose_user_message。
+    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + perm_note + admin_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
+    turn_note = (ip_note + geo_note + img_note).strip()
 
     lock = _chat_locks.setdefault(user["id"], asyncio.Lock())
     _spec = resolve_llm_spec(req.model)
@@ -1333,6 +1339,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                             openai_tools=openai_tools,
                             user_query=user_content,
                             history_messages=history_messages,
+                            turn_note=turn_note,
                             model_key=req.model,
                         ):
                             await queue.put(ev)
@@ -1355,6 +1362,12 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
                         used_model = _spec["label"] or ev.get("model") or _spec["model"]
+                        # token 用量/缓存命中率落日志（命中价是未命中价的 1/30，命中率越低越费钱）
+                        _u = ev.get("usage") or {}
+                        if _u:
+                            logger.info("📊 用户[%s] %s 轮 本次用量 %s",
+                                        user["username"], _u.get("rounds", "?"),
+                                        _u.get("summary") or _u)
                     elif ev.get("type") == "error":
                         failed = True
                     yield _sse(ev)
