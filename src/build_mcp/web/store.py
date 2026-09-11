@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS users(
   username   TEXT NOT NULL UNIQUE,
   pass_salt  TEXT NOT NULL,
   pass_hash  TEXT NOT NULL,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  last_seen_version TEXT NOT NULL DEFAULT '',
+  ws_mode    TEXT NOT NULL DEFAULT 'local'
 );
 CREATE TABLE IF NOT EXISTS invite_codes(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,10 +91,25 @@ CREATE TABLE IF NOT EXISTS messages(
   user_id INTEGER NOT NULL REFERENCES users(id),
   role    TEXT NOT NULL CHECK(role IN ('user','assistant')),
   text    TEXT NOT NULL,
-  ts      REAL NOT NULL
+  ts      REAL NOT NULL,
+  model   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量迁移：给已有库补上新增列（老库可能缺 model / last_seen_version）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "model" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+
+    ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "last_seen_version" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN last_seen_version TEXT NOT NULL DEFAULT ''")
+    if "ws_mode" not in ucols:
+        # local = 个人工作空间（默认）；server = 云服务器代码目录（仅管理员可选）
+        conn.execute("ALTER TABLE users ADD COLUMN ws_mode TEXT NOT NULL DEFAULT 'local'")
 
 
 def init_db(import_env_codes: str = ""):
@@ -100,6 +117,7 @@ def init_db(import_env_codes: str = ""):
     conn = _conn()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         for item in [c.strip() for c in (import_env_codes or "").split(",") if c.strip()]:
             code, _, note = item.partition(":")
             nc = normalize_code(code)
@@ -144,6 +162,32 @@ def get_user_by_id(uid: int) -> dict | None:
     try:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_user_seen_version(uid: int, version: str) -> None:
+    """记录该用户已看过的最新更新版本（用于"下次不再弹窗"）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET last_seen_version=? WHERE id=?",
+                ((version or "").strip(), uid),
+            )
+    finally:
+        conn.close()
+
+
+def set_user_ws_mode(uid: int, mode: str) -> None:
+    """记录用户选择的服务器端文件空间模式（local=个人工作空间 / server=云服务器）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET ws_mode=? WHERE id=?",
+                ((mode or "local").strip().lower(), uid),
+            )
     finally:
         conn.close()
 
@@ -269,13 +313,13 @@ def list_users() -> list[dict]:
 
 
 # ---------------- 消息 ----------------
-def add_message(user_id: int, role: str, text: str) -> None:
+def add_message(user_id: int, role: str, text: str, model: str = "") -> None:
     conn = _conn()
     try:
         with conn:
             conn.execute(
-                "INSERT INTO messages(user_id,role,text,ts) VALUES(?,?,?,?)",
-                (user_id, role, text, time.time()),
+                "INSERT INTO messages(user_id,role,text,ts,model) VALUES(?,?,?,?,?)",
+                (user_id, role, text, time.time(), model or ""),
             )
     finally:
         conn.close()
@@ -285,7 +329,7 @@ def list_messages(user_id: int, limit: int = 200) -> list[dict]:
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT id,role,text,ts FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            "SELECT id,role,text,ts,model FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
@@ -293,15 +337,65 @@ def list_messages(user_id: int, limit: int = 200) -> list[dict]:
         conn.close()
 
 
-def recent_llm_messages(user_id: int, turns: int = 8) -> list[dict]:
-    """取最近 turns 轮（user+assistant 各一条计 1 轮）作为 LLM 上下文。"""
+# ---------------- LLM 历史窗口 ----------------
+# 两种取法（user+assistant 各一条计 1 轮）：
+#
+# slide 滑动窗口：永远取最近 N 轮。每来一轮窗口整体前移一条 → 历史前缀每轮都变，
+#   而 DeepSeek 前缀缓存是「从第 0 个 token 起逐字节比对」，于是固定前缀之外的历史
+#   永远按未命中价（命中价的 30 倍）计费。
+#
+# block 分块累积（默认）：窗口起点对齐到 N 轮的整数倍、并往回退一整块。块内每来一轮
+#   只是在**尾部追加**，起点不动 → 之前发过的历史前缀逐轮复用，命中率显著提高；
+#   攒满一整块才整体前移一次（即每 N 轮失效一次，而不是每轮）。
+#   窗口长度落在 [N, 2N) 轮之间，**永远不小于**滑动窗口，最多多出一倍上下文；
+#   多出来的部分走缓存命中价，因此总成本反而更低。
+_HISTORY_TURNS = int(os.environ.get("MCP_WEB_HISTORY_TURNS", "8"))
+_HISTORY_MODE = os.environ.get("MCP_WEB_HISTORY_MODE", "block").strip().lower()
+
+
+def _history_window(total: int, turns: int, mode: str = "block") -> tuple[int, int]:
+    """按消息总条数算出历史窗口的 (offset, limit)，offset = 跳过最老的多少条。
+
+    - slide：最近 turns 轮，offset = max(0, total - 2*turns)。
+    - block：起点 = floor(total / 2*turns) 的整数倍再往回退一整块，
+      窗口长度落在 [2*turns, 4*turns) 条；块内 total 递增时 offset 保持不变。
+    """
+    if total <= 0:
+        return 0, 0
+    turns = max(1, int(turns))
+    chunk = turns * 2                      # 一块 = turns 轮
+    if mode == "slide":
+        offset = max(0, total - chunk)
+    else:
+        offset = max(0, (total // chunk - 1) * chunk)
+    return offset, total - offset
+
+
+def history_window_info() -> dict:
+    """当前历史窗口配置（供日志 / 排障）。"""
+    return {"turns": _HISTORY_TURNS, "mode": _HISTORY_MODE}
+
+
+def recent_llm_messages(user_id: int, turns: int | None = None,
+                        mode: str | None = None) -> list[dict]:
+    """取作为 LLM 上下文的历史消息（默认分块累积窗口，见上方说明）。"""
+    turns = _HISTORY_TURNS if turns is None else turns
+    mode = _HISTORY_MODE if mode is None else mode
     conn = _conn()
     try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,)
+        ).fetchone()[0]
+        offset, limit = _history_window(int(total or 0), turns, mode)
+        if limit <= 0:
+            return []
         rows = conn.execute(
-            "SELECT id,role,text FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, turns * 2),
+            # 用 ASC + OFFSET：offset 即「跳过最老的多少条」，语义与 _history_window 一致。
+            # （注意别用 DESC + OFFSET——那样 OFFSET 是从最新那头开始跳的，方向正好相反。）
+            "SELECT id,role,text FROM messages WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 

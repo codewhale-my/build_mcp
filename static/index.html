@@ -108,6 +108,13 @@ header{
 }
 .hbtn:hover{color:var(--text);border-color:var(--border-strong);background:var(--panel-solid)}
 .hbtn svg{width:17px;height:17px}
+/* 有未读更新时的小红点 */
+.hbtn{position:relative}
+.hdot{
+  position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;
+  background:#ff4d4f;box-shadow:0 0 0 2px var(--panel);
+}
+.hdot[hidden]{display:none}
 /* 本机文件授权按钮(桌面 Chrome/Edge 目录授权, 其余浏览器降级上传) */
 .lbtn{
   display:inline-flex;align-items:center;gap:6px;height:31px;padding:0 11px;border-radius:9px;
@@ -128,6 +135,26 @@ header{
 }
 .wsbar[hidden]{display:none}
 .ws-anchor{position:relative;display:inline-flex}
+/* 模型选择按钮(与工作空间按钮同款外观, 位于其右侧) */
+.m-anchor{position:relative;display:inline-flex}
+.mbtn .txt{max-width:150px}
+.mbtn .dot{background:var(--accent1);opacity:.85}
+/* 精确定位开关(浏览器 Geolocation) */
+.gbtn .dot{background:#94a3b8;opacity:.9}
+.gbtn.busy .dot{background:var(--accent1);animation:a-pulse 1s ease-in-out infinite}
+.gbtn.err .txt{color:var(--text3)}
+.ws-item .wi-tag{
+  flex:none;font-size:10.5px;padding:1px 6px;border-radius:6px;
+  background:var(--panel);color:var(--text3);border:1px solid var(--border);
+}
+.ws-item .wi-check{flex:none;color:var(--accent1);font-weight:700}
+/* 回答下方的小字：本轮由哪个模型回答 */
+.msg-model{font-size:11px;color:var(--text3);margin-top:5px;opacity:.9}
+.msg-usage{font-size:11px;color:var(--text3);margin-top:2px;opacity:.85;font-variant-numeric:tabular-nums}
+.msg-model .mm-dot{
+  display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--accent1);
+  margin-right:5px;vertical-align:middle;opacity:.8;
+}
 .lbtn .chev{width:11px;height:11px;flex:none;opacity:.7;transition:transform .18s}
 .lbtn.open .chev{transform:rotate(180deg)}
 .ws-menu{
@@ -173,8 +200,12 @@ header{
 /* ============ 消息区 ============ */
 /* 隐藏原生滚动条（长度由浏览器控制，无法自定义），改用自绘"米粒"指示条 */
 #chatBox{
-  flex:1;overflow-y:auto;padding:20px 10px 12px 2px;scroll-behavior:smooth;
+  flex:1;overflow-y:auto;padding:20px 10px 12px 2px;
+  /* 不能用 scroll-behavior:smooth：流式输出时内容不停长高，平滑动画会被后续的贴底
+     请求反复打断，滚动"卡在半路"反而到不了底。贴底改由 JS 每帧直接赋值 scrollTop。 */
   scrollbar-width:none; /* Firefox 隐藏 */
+  overflow-anchor:none; /* 关掉浏览器自带滚动锚定，否则会和手动贴底互抢控制权 */
+  overscroll-behavior:contain;
 }
 #chatBox::-webkit-scrollbar{display:none}
 /* 自绘滚动指示条：固定高度的小短条，滚动时出现，停止后淡出 */
@@ -183,6 +214,32 @@ header{
   background:var(--text3);opacity:0;transition:opacity .4s;pointer-events:none;z-index:5;
 }
 .chat-scroll-ind.show{opacity:.75}
+/* 一键回到底部：已贴底时隐藏；用户往回翻 / 未跟随时淡入 */
+.jump-btn{
+  position:absolute;left:50%;transform:translateX(-50%) translateY(6px);
+  bottom:calc(132px + env(safe-area-inset-bottom));
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 14px;border-radius:999px;cursor:pointer;font-family:inherit;
+  border:1px solid var(--border-strong);background:var(--panel-solid);color:var(--text2);
+  font-size:12.5px;font-weight:500;line-height:1;
+  box-shadow:0 6px 18px rgba(0,0,0,.16);
+  opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;z-index:6;
+}
+.jump-btn.show{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0)}
+.jump-btn:active{transform:translateX(-50%) scale(.96)}
+@media (max-width:600px){.jump-btn{bottom:calc(104px + env(safe-area-inset-bottom))}}
+/* 「正在回答」状态胶囊：挂在直播间的时间行上，让用户一眼知道已经在跑了 */
+.live-status{
+  display:inline-flex;align-items:center;gap:6px;margin-left:9px;
+  padding:2.5px 9px;border-radius:999px;font-size:11px;color:var(--accent1);
+  background:color-mix(in srgb,var(--accent1) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent1) 30%,transparent);
+}
+.live-status .ls-dot{
+  width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;
+  animation:ls-pulse 1.1s ease-in-out infinite;
+}
+@keyframes ls-pulse{0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
 .msg{display:flex;gap:11px;margin-bottom:22px;animation:pop .22s ease}
 @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .avatar{
@@ -250,6 +307,14 @@ header{
 .bubble a.filedl.ext-ppt .f-ico,.bubble a.filedl.ext-pptx .f-ico{background:linear-gradient(135deg,#ea580c,#fb923c)}
 .bubble a.filedl.ext-zip .f-ico,.bubble a.filedl.ext-tar .f-ico,.bubble a.filedl.ext-gz .f-ico{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
 .bubble a.filedl.ext-py .f-ico,.bubble a.filedl.ext-js .f-ico,.bubble a.filedl.ext-ts .f-ico,.bubble a.filedl.ext-json .f-ico,.bubble a.filedl.ext-sh .f-ico{background:linear-gradient(135deg,#0d9488,#2dd4bf)}
+/* Markdown 表格 */
+.bubble .tblwrap{overflow-x:auto;margin:.55em 0;border:1px solid var(--border);border-radius:10px}
+.bubble table{border-collapse:collapse;width:100%;font-size:.92em}
+.bubble th,.bubble td{border-bottom:1px solid var(--border);border-right:1px solid var(--border);padding:6px 11px;text-align:left;vertical-align:top}
+.bubble th:last-child,.bubble td:last-child{border-right:none}
+.bubble tbody tr:last-child td{border-bottom:none}
+.bubble thead th{background:var(--panel);font-weight:600;white-space:nowrap}
+.bubble tbody tr:nth-child(even) td{background:var(--panel)}
 /* 文件名过长省略 */
 .bubble a.filedl .f-name{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* 右侧下载箭头：hover 时高亮 */
@@ -418,7 +483,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   #inputBox{font-size:16px} /* ≥16px 防 iOS 聚焦时页面自动放大 */
   #sendBtn{width:38px;height:38px;border-radius:12px}
   #plusBtn{width:38px;height:38px;border-radius:12px}
-  .wsbar{display:none!important} /* 移动端不提供本机工作空间（File System Access 仅桌面浏览器支持） */
+  /* 移动端隐藏“本机工作空间”按钮（File System Access 仅桌面浏览器支持），但保留模型选择 */
+  .wsbar .ws-anchor{display:none!important}
+  .mbtn,.gbtn{height:30px;padding:0 10px;font-size:12px}
+  .mbtn .txt,.gbtn .txt{max-width:110px}
   .hint{display:none}
   .auth-overlay{padding:14px}
   .auth-card{padding:28px 22px 22px}
@@ -468,6 +536,60 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 .auth-tip{font-size:11px;color:var(--text3);margin-top:16px;line-height:1.6}
 @keyframes shake{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}30%,50%,70%{transform:translateX(-6px)}40%,60%{transform:translateX(6px)}}
 .shake{animation:shake .5s ease}
+
+/* ============ 更新说明弹窗 ============ */
+.upd-overlay{
+  position:fixed;inset:0;z-index:210;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb, var(--bg0) 76%, transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  padding:20px;
+}
+.upd-overlay[hidden]{display:none}
+.upd-card{
+  width:min(560px,94vw);max-height:min(78vh,720px);display:flex;flex-direction:column;
+  background:var(--panel-solid);border:1px solid var(--border-strong);
+  border-radius:20px;box-shadow:var(--shadow);animation:pop .28s ease;overflow:hidden;
+}
+.upd-head{padding:22px 26px 14px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:13px}
+.upd-badge{
+  flex:none;width:38px;height:38px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#3d6dff,#8b5cf6);font-size:19px;
+  box-shadow:0 8px 20px rgba(76,125,255,.3);
+}
+.upd-head h3{font-size:17px;margin:1px 0 5px}
+.upd-head .upd-sub{font-size:12.5px;color:var(--text2);line-height:1.6}
+.upd-body{padding:6px 26px 2px;overflow:auto;flex:1;text-align:left}
+.upd-item{padding:14px 0;border-bottom:1px dashed var(--border)}
+.upd-item:last-child{border-bottom:none}
+.upd-meta{display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap}
+.upd-ver{
+  font-size:11.5px;padding:2px 9px;border-radius:999px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:color-mix(in srgb, var(--accent1) 15%, transparent);
+  color:var(--accent1);
+  border:1px solid color-mix(in srgb, var(--accent1) 32%, transparent);
+}
+.upd-date{font-size:11.5px;color:var(--text3)}
+.upd-title{font-size:14.5px;font-weight:600;margin-bottom:8px;color:var(--text)}
+.upd-item ul{margin:0;padding-left:19px}
+.upd-item li{font-size:13px;color:var(--text2);line-height:1.78;margin-bottom:5px}
+.upd-item li::marker{color:var(--accent1)}
+.upd-foot{padding:14px 26px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--border)}
+.upd-tip{font-size:11.5px;color:var(--text3);line-height:1.5}
+.upd-ok{
+  flex:none;padding:10px 26px;border:none;border-radius:11px;cursor:pointer;
+  background:var(--user-grad);color:#fff;font-size:14px;font-weight:600;transition:.18s;
+}
+.upd-ok:hover{opacity:.92;transform:translateY(-1px)}
+@media (max-width:600px){
+  .upd-overlay{padding:12px}
+  .upd-card{max-height:82vh;border-radius:17px}
+  .upd-head{padding:17px 18px 12px}
+  .upd-body{padding:4px 18px 2px}
+  .upd-foot{padding:12px 18px 15px}
+  .upd-ok{padding:9px 18px;font-size:13.5px}
+  .upd-tip{display:none}
+}
 </style>
 </head>
 <body>
@@ -484,6 +606,24 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
     <input id="authInvite" class="auth-input" type="text" placeholder="邀请码（新用户注册时填写）" autocomplete="off">
     <button id="authLoginBtn" class="auth-btn">登 录 / 注 册</button>
     <p id="authErr" class="auth-err"></p>
+  </div>
+</div>
+
+<!-- 更新说明层（登录后若有未读更新自动弹出；顶栏「更新日志」按钮可随时重开） -->
+<div id="updOverlay" class="upd-overlay" hidden>
+  <div class="upd-card">
+    <div class="upd-head">
+      <div class="upd-badge">✨</div>
+      <div>
+        <h3 id="updHeadTitle">版本更新</h3>
+        <div class="upd-sub" id="updHeadSub">看看这次更新了什么</div>
+      </div>
+    </div>
+    <div class="upd-body" id="updBody"></div>
+    <div class="upd-foot">
+      <span class="upd-tip" id="updTip"></span>
+      <button class="upd-ok" id="updOk">知道了</button>
+    </div>
   </div>
 </div>
 
@@ -506,6 +646,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
     </div>
     <div class="hbtns">
       <span id="userBadge" class="user-badge" hidden></span>
+      <button class="hbtn" id="updBtn" title="更新日志">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.6l1.9 5.5 5.5 1.9-5.5 1.9L12 17.4l-1.9-5.5L4.6 10l5.5-1.9z"/><path d="M18.6 15.3l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/></svg>
+        <span class="hdot" id="updDot" hidden></span>
+      </button>
       <button class="hbtn" id="clearBtn" title="清空对话">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14z"/></svg>
       </button>
@@ -521,6 +665,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   <!-- 消息区 -->
   <main id="chatBox"></main>
   <div id="scrollInd" class="chat-scroll-ind"></div>
+  <button id="jumpBtn" class="jump-btn" type="button">↓ 新内容</button>
 
   <!-- 输入区 -->
   <div class="composer-wrap">
@@ -530,6 +675,11 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
         <div class="ws-menu" id="wsMenu" hidden></div>
       </div>
       <input type="file" id="localUpload" hidden multiple>
+      <div class="m-anchor">
+        <button class="lbtn mbtn" id="modelBtn" title="选择回答模型"><span class="dot"></span><span class="txt" id="modelTxt">模型</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+        <div class="ws-menu" id="modelMenu" hidden></div>
+      </div>
+      <button class="lbtn gbtn" id="geoBtn" title="开启精确定位"><span class="dot"></span><span class="txt" id="geoTxt">开启定位</span></button>
     </div>
     <input type="file" id="fileInput" hidden multiple>
     <div class="composer">
@@ -551,8 +701,9 @@ const $ = s => document.querySelector(s);
 const chatBox = $('#chatBox'), inputBox = $('#inputBox'), sendBtn = $('#sendBtn');
 const THEME_KEY = 'mcp-theme';
 const TOKEN_KEY = 'mcp-auth-token';
-let authToken='', me={name:''};
+let authToken='', me={name:'',isAdmin:false,serverRoot:''};
 let myUserRoot='';   // 当前用户工作空间绝对路径，用于把回答里的文件路径变成下载链接
+let wsMode='local';  // 'local'=个人工作空间 / 'server'=云服务器代码目录(仅管理员)
 try{authToken=localStorage.getItem(TOKEN_KEY)||''}catch(e){}
 const authOverlay=$('#authOverlay'), authUser=$('#authUser'), authPwd=$('#authPwd'),
       authInvite=$('#authInvite'), authErr=$('#authErr'), authLoginBtn=$('#authLoginBtn');
@@ -588,6 +739,17 @@ function mdInline(s){
   s=s.replace(/\u0000T(\d+)\u0000/g,(m,i)=>toks[+i]);
   return s;
 }
+/* 表格辅助：切分一行单元格 / 判断分隔行 */
+function splitRow(line){
+  let s=line.trim();
+  if(s.startsWith('|'))s=s.slice(1);
+  if(s.endsWith('|'))s=s.slice(0,-1);
+  return s.split('|').map(c=>c.trim());
+}
+function isTableSep(line){
+  const cells=splitRow(line);
+  return cells.length>0 && cells.every(c=>/^:?-+:?$/.test(c));
+}
 function renderMarkdown(src){
   src=esc(src);
   const blocks=[];
@@ -606,6 +768,30 @@ function renderMarkdown(src){
     if(cb){flush();out+=blocks[+cb[1]];i++;continue}
     // 分隔线
     if(/^([-*_])\1{2,}$/.test(line.trim())){flush();out+='<hr>';i++;continue}
+    // 表格：表头行(以|开头) + 分隔行(|---|---| 或 |--:|:-:| 等)
+    if(/^\s*\|/.test(line) && i+1<lines.length && isTableSep(lines[i+1])){
+      flush();
+      const head=splitRow(line);
+      const align=splitRow(lines[i+1]).map(c=>{
+        const l=c.startsWith(':'),r=c.endsWith(':');
+        return l&&r?'center':r?'right':l?'left':'';
+      });
+      i+=2;
+      const cell=(c,ci,tag)=>{
+        const a=align[ci]?' style="text-align:'+align[ci]+'"':'';
+        return '<'+tag+a+'>'+mdInline(c)+'</'+tag+'>';
+      };
+      let tbl='<div class="tblwrap"><table><thead><tr>'+
+        head.map((c,ci)=>cell(c,ci,'th')).join('')+'</tr></thead><tbody>';
+      while(i<lines.length && /^\s*\|/.test(lines[i])){
+        const cells=splitRow(lines[i]);
+        while(cells.length<head.length)cells.push('');
+        tbl+='<tr>'+cells.slice(0,head.length).map((c,ci)=>cell(c,ci,'td')).join('')+'</tr>';
+        i++;
+      }
+      tbl+='</tbody></table></div>';
+      out+=tbl;continue;
+    }
     // 标题
     const h=line.match(/^(#{1,4})\s+(.*)$/);
     if(h){flush();const n=h[1].length;out+='<h'+n+'>'+mdInline(h[2])+'</h'+n+'>';i++;continue}
@@ -642,13 +828,19 @@ function linkifyUserFiles(html){
   // 生成下载卡片；失败返回 null（调用方保留原文）
   const mk=(rel)=>{
     // 去掉结尾被顺带吸进来的常见标点/括号
-    const clean=rel.replace(/[，。、；：,.!?;:'")\]}>】》]+$/,'');
+    let clean=rel.replace(/[，。、；：,.!?;:'")\]}>】》]+$/,'');
+    // AI 有时把产出文件写成沙箱内绝对路径(如 /home/admin/fs_workspace/users/u1_xxx/a.docx)。
+    // 后端 /api/files/download 的语义是"相对用户沙箱根"，直接把绝对路径去掉一个 "/" 会拼出
+    // <沙箱>/home/admin/fs_workspace/... → 404 文件不存在。这里先归一化成相对沙箱根的路径。
+    const ROOT=(myUserRoot||'').replace(/\/+$/,'');
+    if(ROOT&&clean.startsWith(ROOT))clean=clean.slice(ROOT.length);
+    while(clean.startsWith('/'))clean=clean.slice(1);
     if(!clean||clean==='/')return null;
     const name=decodeURIComponent(clean.split('/').pop());
     // 最后一段没有扩展名 → 大概率是目录(如"查看工作目录"回复的路径),不做下载链接
     if(!name.includes('.'))return null;
     // 下载走新标签页直接导航，无法带 Authorization 头 → 把 token 拼进查询参数让后端认
-    const href='/api/files/download?path='+encodeURIComponent(clean.replace(/^\//,''))+
+    const href='/api/files/download?path='+encodeURIComponent(clean)+
       '&token='+encodeURIComponent(authToken);
     // 按扩展名着色的文件类型徽标 + 文件名 + 下载箭头
     const ext=(name.split('.').pop()||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,8);
@@ -683,6 +875,27 @@ function fmtHM(ts){
   const d=new Date(ts*1000);
   return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
 }
+// 【唯一的用户上下文填充入口】/api/me 是权威来源。
+// 历史 bug：doAuth(点登录按钮) 只填了 me.name，漏了 isAdmin/serverRoot，
+// 导致重启后重新登录的用户看不到「云服务器」工作空间入口。所有登录/启动路径都必须走这里。
+function applyMe(d){
+  if(!d)return;
+  if(d.username)me.name=d.username;
+  me.isAdmin=!!d.is_admin;
+  me.serverRoot=d.server_root||'';
+  if(d.user_root)myUserRoot=d.user_root;
+  if(d.ws_mode)wsMode=d.ws_mode;
+}
+// 主动拉一次 /api/me 并套用（登录后必须调用：/api/auth 不返回 is_admin/server_root）
+async function refreshMe(){
+  try{
+    const r=await fetch('/api/me',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return false;
+    applyMe(await r.json());
+    return true;
+  }catch(e){return false}
+}
+
 // 从服务端拉取“当前用户自己的”历史消息（按用户隔离）
 async function loadServerHistory(){
   try{
@@ -691,9 +904,10 @@ async function loadServerHistory(){
     const d=await r.json();
     if(d&&d.username)me.name=d.username;
     if(d&&d.user_root)myUserRoot=d.user_root;
+    if(d&&d.ws_mode)wsMode=d.ws_mode;
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
-      .map(m=>({role:m.role,text:m.text,ts:m.ts}));
+      .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||''}));
   }catch(e){
     history=[];
   }
@@ -708,6 +922,17 @@ function renderAll(){
   if(!history.length){showWelcome();return}
   history.forEach(item=>chatBox.appendChild(buildMsg(item)));
   scrollBottom();
+}
+/* 用量小字：⚡缓存命中 96%（4.2k/4.4k tok）· 输出 131 tok · 2 轮 */
+function fmtUsage(u){
+  const hit=u.hit||0,miss=u.miss||0,out=u.out||0;
+  const tot=hit+miss,pct=tot?Math.round(hit*100/tot):100;
+  const k=n=>n>=10000?(Math.round(n/100)/10)+'k':(n>=1000?(Math.round(n/100)/10)+'k':''+n);
+  let s='⚡ 缓存命中 '+pct+'%';
+  if(tot)s+='（'+k(hit)+'/'+k(tot)+' tok）';
+  if(out)s+=' · 输出 '+k(out)+' tok';
+  if(u.rounds>1)s+=' · '+u.rounds+' 轮';
+  return s;
 }
 function buildMsg(item){
   const wrap=document.createElement('div');
@@ -726,7 +951,11 @@ function buildMsg(item){
     }else{
       body='<div class="bubble">'+linkifyUserFiles(renderMarkdown(item.text))+'</div>';
     }
-    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+'</div>';
+    const mchip=(item.role==='assistant'&&item.model)
+      ? '<div class="msg-model"><span class="mm-dot"></span>'+esc(item.model)+'</div>' : '';
+    const uchip=(item.role==='assistant'&&item.usage&&(item.usage.in||item.usage.out))
+      ? '<div class="msg-usage">'+fmtUsage(item.usage)+'</div>' : '';
+    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+mchip+uchip+'</div>';
   }
   return wrap;
 }
@@ -740,7 +969,62 @@ function insertLoading(){
   chatBox.appendChild(buildMsg({role:'loading',text:''}));
   scrollBottom();
 }
-function scrollBottom(){chatBox.scrollTop=chatBox.scrollHeight}
+/* ================= 粘底引擎（stick-to-bottom） =================
+   三条原则：
+   1) 贴底一律直接赋值 scrollTop，不做平滑动画 —— 流式期间每帧都要真的到底；
+   2) 「是否跟随」由用户手势决定，不用 scrollTop 反推 —— 否则流式输出时位置稍有
+      滞后就会被误判成"用户往上翻了"，从而永久停止跟随（原 bug）；
+   3) 用 rAF 合并同一帧内的多次贴底请求，避免每个 delta 都触发一次布局。 */
+let stick=true;          // 是否自动跟随最新内容
+let stickRaf=0;          // 同帧贴底请求合并标志
+let lastUserGesture=0;   // 最近一次用户主动滚动的时间戳
+
+const BOTTOM_SLACK=72;   // 距底部多少像素以内算"贴底"
+function distToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight}
+function isAtBottom(slack){return distToBottom()<=(slack==null?BOTTOM_SLACK:slack)}
+
+// 立即贴底（发送、新增消息、点回到底部时用）
+function scrollToBottomNow(){
+  stick=true;
+  if(stickRaf){cancelAnimationFrame(stickRaf);stickRaf=0}
+  chatBox.scrollTop=chatBox.scrollHeight;
+  syncJumpBtn();
+}
+// 本帧末贴底（流式增量时用，若仍处于跟随状态）
+function stickToBottom(){
+  if(!stick||stickRaf)return;
+  stickRaf=requestAnimationFrame(()=>{
+    stickRaf=0;
+    if(stick){chatBox.scrollTop=chatBox.scrollHeight;syncJumpBtn()}
+  });
+}
+// 兼容历史调用名
+function scrollBottom(){scrollToBottomNow()}
+function scrollKeep(){stickToBottom()}
+function pinnedToBottom(){return stick&&isAtBottom()}
+
+function noteUserGesture(){lastUserGesture=performance.now()}
+['wheel','touchstart','touchmove','pointerdown','mousedown'].forEach(ev=>
+  chatBox.addEventListener(ev,noteUserGesture,{passive:true}));
+chatBox.addEventListener('keydown',noteUserGesture,true);
+
+// 「↓ 新内容」按钮
+const jumpBtn=$('#jumpBtn');
+function syncJumpBtn(){
+  if(!jumpBtn)return;
+  if(stick&&isAtBottom())jumpBtn.classList.remove('show');
+  else jumpBtn.classList.add('show');
+}
+if(jumpBtn)jumpBtn.onclick=()=>{scrollToBottomNow();updateScrollInd()};
+
+// 内容异步变高（图片解码、表格/代码块渲染完成）也要继续跟随
+if(window.ResizeObserver){
+  const ro=new ResizeObserver(()=>{if(stick)stickToBottom()});
+  new MutationObserver(ms=>ms.forEach(m=>m.addedNodes.forEach(n=>{
+    if(n.nodeType===1)ro.observe(n);
+  }))).observe(chatBox,{childList:true});
+  ro.observe(chatBox);
+}
 
 /* ================= 自绘"米粒"滚动指示条 ================= */
 const scrollInd=$('#scrollInd');
@@ -759,7 +1043,12 @@ function updateScrollInd(){
   clearTimeout(indTimer);
   indTimer=setTimeout(()=>scrollInd.classList.remove('show'),900);
 }
-chatBox.addEventListener('scroll',updateScrollInd,{passive:true});
+chatBox.addEventListener('scroll',()=>{
+  // 只在"用户自己动的"滚动上重新判定跟随状态，程序化贴底不会误伤
+  if(performance.now()-lastUserGesture<700)stick=isAtBottom(24);
+  updateScrollInd();
+  syncJumpBtn();
+},{passive:true});
 window.addEventListener('resize',updateScrollInd);
 
 /* ================= 欢迎页 ================= */
@@ -787,15 +1076,17 @@ function showWelcome(){
 /* ================= 发送逻辑（SSE 流式） ================= */
 let liveMsgEl=null,liveBubbleEl=null,liveTextNode=null;
 let liveActLines={}; // 工具名 -> 最近一条动作行元素（完成时更新 / 同名重试收尾）
+let curRun=null;     // 当前「连续同名工具调用」合并组：{name,el,count,notes,closed}
 function liveCleanup(){
-  liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};
+  liveMsgEl=null;liveBubbleEl=null;liveTextNode=null;liveActLines={};curRun=null;
 }
-function pinnedToBottom(){return chatBox.scrollHeight-chatBox.scrollTop-chatBox.clientHeight<160}
-function scrollKeep(){if(pinnedToBottom())scrollBottom()}
+/* 粘底相关函数已集中到上方「粘底引擎」，此处不再重复定义 */
 function ensureLiveMsg(){
   liveMsgEl=document.createElement('div');liveMsgEl.className='msg bot';liveMsgEl.id='liveMsg';
   liveMsgEl.innerHTML='<div class="avatar">'+STAR+'</div><div class="col">'+
-    '<div class="live-top"><div class="time">'+now()+'</div><button class="stop-mini" id="liveStop" title="停止生成">⏹ 停止</button></div>'+
+    '<div class="live-top"><div class="time">'+now()+'</div>'+
+    '<span class="live-status" id="liveStatus"><i class="ls-dot"></i>正在回答</span>'+
+    '<button class="stop-mini" id="liveStop" title="停止生成">⏹ 停止</button></div>'+
     '<div class="bubble live" id="liveBubble"></div></div>';
   chatBox.appendChild(liveMsgEl);
   liveBubbleEl=liveMsgEl.querySelector('#liveBubble');
@@ -803,7 +1094,7 @@ function ensureLiveMsg(){
   liveTextNode=document.createTextNode('⏳ 正在思考…');
   liveBubbleEl.appendChild(liveTextNode);
   liveMsgEl.querySelector('#liveStop').onclick=()=>controller&&controller.abort();
-  scrollKeep();
+  scrollToBottomNow(); // 直播间一出现就贴底，别让用户以为没反应
 }
 // 工具名 -> 中文短名（未收录则显示原名）
 const TOOL_LABEL={
@@ -813,7 +1104,15 @@ const TOOL_LABEL={
   create_directory:'新建目录',move_file:'移动文件',copy_file:'复制文件',
   delete_file:'删除文件',run_command:'执行终端命令',
   user_filesystem:'读写本机文件',
-  terminal_session_create:'开启终端',web_search:'联网搜索',fetch_page:'抓取网页'
+  // 真实工具名（此前缺映射，界面直接暴露英文名，看不出在干什么）
+  search:'联网搜索',search_nearby:'搜索周边',locate_ip:'定位位置',regeo:'地址解析',
+  fetchWebContent:'抓取网页',fetchCsdnArticle:'读 CSDN 文章',fetchGithubReadme:'读 GitHub 说明',
+  fetchJuejinArticle:'读掘金文章',fetchLinuxDoArticle:'读 LinuxDo 帖',
+  terminal_run:'执行命令',terminal_session_list:'列出终端会话',terminal_type:'输入命令',
+  terminal_read_output:'读取终端输出',terminal_press_key:'终端按键',
+  terminal_snapshot:'读取终端画面',terminal_session_close:'关闭终端会话',
+  terminal_click:'终端点击',terminal_wait_for:'等待终端输出',terminal_session_resize:'调整终端尺寸',
+  web_search:'联网搜索',fetch_page:'抓取网页'
 };
 function toolLabel(name){
   const t=String(name||'');
@@ -854,12 +1153,66 @@ function settleLiveToolLine(line,ok,note){
   line.querySelector('.a-txt').textContent=ok?(line.dataset.label||''):('失败：'+(line.dataset.label||''));
   if(note)line.title=note;
 }
+// ============ 连续同名工具调用合并成一行（「搜索 ×4」） ============
+// 模型常拿同一个词反复搜（实测一屏里 search ×4、fetchWebContent ×3），以前一行一个，
+// 把回答挤得看不见。这里把**连续的**同名调用合并成一行并标次数，点一下可展开每次参数。
+// 注意：合并只是少画几行，**省不了 token**；真正省 token 的是后端「同名同参数短路」。
+function applyRunText(run,phase){
+  const label=toolLabel(run.name);
+  const n=run.count>1?(' ×'+run.count):'';
+  const txt=run.el.querySelector('.a-txt');
+  if(!txt)return;
+  // count>1 时不能直接写「失败：X ×N」——前面几次可能是成功的，只标「最后一次失败」
+  if(phase==='fail')txt.textContent=run.count>1?(label+n+' · 最后一次失败'):('失败：'+label);
+  else if(phase==='done')txt.textContent=label+n;
+  else txt.textContent='正在执行 '+label+n+' …';
+}
+function bumpToolRun(run,note){
+  run.count+=1;
+  if(note)run.notes.push(note);
+  // 上一次已收尾（打勾）后又来了同名的下一次：重新标回「进行中」。否则后续的 ok/error
+  // 会被 sealToolRun 里的 closed 判断挡掉，文案永远停在「正在执行…」（测试抓出来的）
+  if(run.closed){run.closed=false;run.el.className='live-act run';}
+  applyRunText(run,'running');
+}
+function sealToolRun(run,phase){
+  if(!run||run.closed)return;
+  run.closed=true;
+  if(phase==='fail')run.failed=true;
+  run.el.className='live-act '+(phase==='fail'?'fail':'done');
+  const ico=run.el.querySelector('.a-ico');
+  if(ico)ico.textContent=phase==='fail'?'✕':'✓';
+  applyRunText(run,phase);
+  if(run.count>1)attachRunDetail(run);
+}
+function attachRunDetail(run){
+  if(run.detailEl||!run.el.parentNode)return;
+  const d=document.createElement('div');
+  d.style.cssText='display:none;margin:2px 0 6px 22px;font-size:11.5px;color:var(--text3);'+
+    'line-height:1.7;white-space:pre-wrap;word-break:break-all';
+  d.textContent=run.notes.map((n,i)=>{
+    const last=(i===run.notes.length-1)&&run.failed;
+    return '#'+(i+1)+'  '+(n||'(无参数)')+(last?'   ← 失败':'');
+  }).join('\n');
+  run.el.parentNode.insertBefore(d,run.el.nextSibling);
+  run.detailEl=d;
+  run.el.style.cursor='pointer';
+  run.el.title='点击展开／收起每次调用的参数';
+  run.el.onclick=()=>{d.style.display=d.style.display==='none'?'block':'none'};
+}
 function finishLiveStream(item){
   // 用正式渲染替换直播节点，并写入页面历史（服务端已完成持久化，无需本地保存）
   const fresh=buildMsg(item);
   if(liveMsgEl)liveMsgEl.replaceWith(fresh);
   liveCleanup();
   history.push(item);scrollKeep();
+}
+/* 网络类错误的友好文案：iOS Safari 断流报 "Load failed"，桌面报 "Failed to fetch" */
+function netErrMsg(err){
+  const m=(err&&err.message)?String(err.message):'未知错误';
+  if(/Load failed|Failed to fetch|NetworkError|network connection was lost|The Internet connection|net::/i.test(m))
+    return '网络连接中断。手机锁屏、切换 Wi-Fi/流量或切后台太久都会导致断开；请回到页面检查网络后重试';
+  return m+'（若反复出现请确认服务是否正常）';
 }
 async function send(){
   const q=inputBox.value.trim();
@@ -869,12 +1222,23 @@ async function send(){
   busy=true;sendBtn.disabled=true;
   controller=new AbortController();
   ensureLiveMsg();
+  const wantGeo=needsGeoLocation(q);
+  let geoLine=null;
+  if(wantGeo&&geoSupported()&&geoSecure()&&!geoFix){
+    geoLine=addLiveToolLine('locate_ip');
+    geoLine.dataset.label='获取精确定位';
+    geoLine.querySelector('.a-txt').textContent='正在获取精确定位…';
+  }
+  const gf=await geoForSend(wantGeo);   // 位置相关问题会自动开启精确定位（最多等几秒）
+  if(geoLine)settleLiveToolLine(geoLine,!!gf,gf?'精度约 ±'+Math.round(gf.acc||0)+' 米':'未取到，改用 IP 定位（城市级）');
   let answer='';
+  let answeredModel='';
+  let lastUsage=null;   // 本轮用量（done 事件带回：hit/miss/in/out/rounds）
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
       headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
-      body:JSON.stringify({query:q}),
+      body:JSON.stringify({query:q,model:modelKey,geo:gf?{lat:gf.lat,lng:gf.lng,acc:gf.acc}:undefined}),
       signal:controller.signal
     });
     if(resp.status===401){
@@ -923,17 +1287,26 @@ async function send(){
         }else if(ev.type==='tool'&&ev.name){
           const name=ev.name;
           if(ev.status==='start'){
-            // 结束当前文本段，把工具行插在这段文字正下方
-            const prev=liveActLines[name];
-            if(prev&&prev.className==='live-act')settleLiveToolLine(prev,true); // 同名重试：上一行先收尾
-            liveBreakSegment();
-            liveActLines[name]=addLiveToolLine(name);
+            // 连续的**同名**调用合并成一行（「搜索 ×4」）；换了工具名就另起一行
+            if(curRun&&curRun.name===name){
+              bumpToolRun(curRun,ev.note||'');
+            }else{
+              sealToolRun(curRun,'done');   // 上一组先收尾
+              liveBreakSegment();           // 结束当前文本段，把工具行插在这段文字正下方
+              curRun={name:name,el:addLiveToolLine(name),count:0,notes:[],closed:false};
+              liveActLines[name]=curRun.el;
+              bumpToolRun(curRun,ev.note||'');
+            }
+          }else if(curRun&&curRun.name===name){
+            sealToolRun(curRun,ev.status==='ok'?'done':'fail');
           }else{
             settleLiveToolLine(liveActLines[name],ev.status==='ok',ev.note||'');
           }
           scrollKeep();
         }else if(ev.type==='done'){
           if(ev.answer!==undefined)answer=ev.answer;
+          if(ev.model_key)answeredModel=modelLabel(ev.model_key);
+          if(ev.usage&&(ev.usage.in||ev.usage.out))lastUsage=ev.usage;
           completed=true;
         }else if(ev.type==='error'){
           throw new Error(ev.message||'服务端流式错误');
@@ -942,14 +1315,18 @@ async function send(){
       if(completed)break;
     }
     // 结束：用最终全文渲染替换直播气泡
-    const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）'};
+    const it={role:'assistant',text:(answer&&answer.trim())?answer:'（无回答）',
+              model:answeredModel||modelLabel(modelKey),usage:lastUsage};
     finishLiveStream(it);
   }catch(err){
     const el=liveMsgEl;el&&el.remove();liveCleanup();
     if(err&&err.name==='AbortError'){
       push({role:'assistant',text:'⚠️ 已停止生成。'});
+    }else if(answer&&answer.trim()){
+      // 生成中途断线：保留已生成的部分，不整条丢弃
+      push({role:'assistant',text:answer.trim()+'\n\n⚠️ 网络中断，以上是已生成的部分。可回复「继续」让我接着说'});
     }else{
-      push({role:'error',text:'请求出错：'+(err&&err.message?err.message:'未知错误')+'（请确认服务已启动）'});
+      push({role:'error',text:'请求出错：'+netErrMsg(err)});
     }
   }finally{
     busy=false;sendBtn.disabled=false;controller=null;
@@ -1021,8 +1398,12 @@ async function doAuth(){
       if(authPwd)authPwd.value='';
       if(authInvite)authInvite.value='';
       hideAuth();
+      await refreshMe();           // 【必须】/api/auth 不返回 is_admin，补齐后才能显示云服务器入口
       await loadServerHistory();   // 拉取该用户自己的历史
-      localStatus();wsStart();await restoreLocalHandle();
+      await loadModels();          // 拉取可选模型清单
+      localStatus();wsStart();await restoreLocalHandle();geoRender();
+      loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
+      if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;
     }
@@ -1040,7 +1421,14 @@ async function doLogout(){
   try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+authToken}})}catch(e){}
   authToken='';me={name:''};
   try{localStorage.removeItem(TOKEN_KEY)}catch(e){}
-  wsStop();localHandle=null;closeWsMenu();
+  wsStop();localHandle=null;closeWsMenu();closeModelMenu();
+  modelList=[];modelKey='';
+  geoEnabled=false;geoFix=null;
+  try{localStorage.removeItem(GEO_PREF)}catch(e){}
+  geoRender();
+  updData=null;                       // 更新说明数据随账号走，退出即清
+  if(updOverlay)updOverlay.hidden=true;
+  if(updDot)updDot.hidden=true;
   localStatus();
   history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
@@ -1112,6 +1500,12 @@ function localStatus(){
   if(!me.name){bar.hidden=true;return}
   bar.hidden=false;
   if(!localBtn)return;
+  if(wsMode==='server'){
+    localBtn.className='lbtn on';
+    localBtn.querySelector('.txt').textContent='云服务器 · 整机';
+    localBtn.title='当前工作空间：整台云服务器（'+(me.serverRoot||myUserRoot)+'）。点击可切换';
+    return;
+  }
   if(localHandle){
     localBtn.className='lbtn on';
     localBtn.querySelector('.txt').textContent=localHandle.name;
@@ -1135,11 +1529,37 @@ async function restoreLocalHandle(){
   }catch(e){}
   localHandle=null;localStatus();
 }
+/* 切换服务器端文件空间模式: local=个人工作空间 / server=整台云服务器(仅管理员) */
+async function postWsMode(mode){
+  try{
+    const r=await fetch('/api/workspace',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify({mode})
+    });
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){toast(d.detail||('切换失败（HTTP '+r.status+'）'));return false}
+    wsMode=d.ws_mode||mode;
+    if(d.user_root)myUserRoot=d.user_root;
+    localStatus();
+    return true;
+  }catch(e){toast('切换失败：'+e.message);return false}
+}
+async function switchToServerWs(){
+  if(wsMode==='server'){toast('当前已是云服务器工作空间：'+(me.serverRoot||myUserRoot));return}
+  if(await postWsMode('server'))toast('已切到云服务器工作空间：'+(me.serverRoot||myUserRoot));
+}
+/* 用本机文件夹时自动切回个人工作空间，避免“看着是文件夹、其实文件空间在服务器” */
+async function ensureLocalMode(){
+  if(wsMode!=='local')await postWsMode('local');
+}
+
 async function pickLocalDir(){
   try{
     const h=await window.showDirectoryPicker({mode:'readwrite'});
     localHandle=h;
     await rememberWs(h);
+    await ensureLocalMode();
     localStatus();toast('已授权本机文件夹：'+h.name+'。现在可以让我读写它了');
   }catch(e){if(!e||e.name!=='AbortError')toast('无法授权：'+e.message)}
 }
@@ -1154,6 +1574,7 @@ async function switchWsTo(name){
     if(p!=='granted'){toast('未能取得「'+name+'」的读写权限');return}
     localHandle=it.handle;
     await rememberWs(it.handle);
+    await ensureLocalMode();
     localStatus();closeWsMenu();toast('已切换工作空间：'+name);
   }catch(e){toast('切换失败：'+e.message)}
 }
@@ -1279,7 +1700,9 @@ document.addEventListener('paste',e=>{
 /* =============== 文件上传 end =============== */
 
 async function localBtnClick(){
-  if(!window.showDirectoryPicker||!window.FileSystemDirectoryHandle){
+  // 不支持目录授权的浏览器(多为手机)：普通用户维持“点一下就上传”的原行为；
+  // 管理员仍要能打开菜单，否则永远切不到云服务器工作空间。
+  if(!(window.showDirectoryPicker&&window.FileSystemDirectoryHandle)&&!me.isAdmin){
     localUp.click();
     return;
   }
@@ -1288,18 +1711,20 @@ async function localBtnClick(){
 }
 function toggleWsMenu(){
   const menu=$('#wsMenu');
-  if(!menu||!localSupported)return;
+  if(!menu)return;   // 不再要求 localSupported：管理员在手机上也要能切云服务器
   if(!menu.hidden){closeWsMenu();return}
   openWsMenu();
   if(localBtn)localBtn.classList.add('open');
 }
 async function openWsMenu(){
   const menu=$('#wsMenu');
-  if(!menu||!localSupported)return;
-  const list=await loadWsList();
+  if(!menu)return;
+  const list=localSupported?await loadWsList():[];
   const curName=localHandle?localHandle.name:'';
   let html='<div class="ws-hd"><span>最近工作空间</span><span>'+list.length+'/'+MAX_WS+'</span></div>';
-  if(!list.length){
+  if(!localSupported){
+    html+='<div style="padding:8px 10px;font-size:12px;color:var(--text3)">此浏览器不支持选择本机文件夹，可用输入框旁的 ＋ 上传文件</div>';
+  }else if(!list.length){
     html+='<div style="padding:8px 10px;font-size:12px;color:var(--text3)">还没有工作空间，点下面按钮新建</div>';
   }else{
     list.forEach(it=>{
@@ -1312,26 +1737,47 @@ async function openWsMenu(){
       '</button>';
     });
   }
-  html+='<div class="ws-sep"></div>';
-  html+='<button class="ws-add" id="wsAddNew">＋ 新建工作空间</button>';
+  if(me.isAdmin){
+    const srvName=me.serverRoot||'/';
+    html+='<div class="ws-sep"></div>';
+    html+='<div class="ws-hd"><span>云服务器（管理员）</span></div>';
+    html+='<button class="ws-item" id="wsServerItem">'+
+      '<span class="wi-ico">☁️</span>'+
+      '<span class="wi-name">云服务器 · 整台服务器</span>'+
+      (wsMode==='server'?'<span class="wi-now">当前</span>':'<span class="wi-tag">'+esc(srvName)+'</span>')+
+    '</button>';
+  }
+  if(localSupported){
+    html+='<div class="ws-sep"></div>';
+    html+='<button class="ws-add" id="wsAddNew">＋ 新建工作空间</button>';
+  }
   menu.innerHTML=html;
-  menu.querySelectorAll('.ws-item').forEach(btn=>{
-    const nm=btn.dataset.name;
-    btn.querySelector('.wi-del').onclick=async ev=>{
-      ev.stopPropagation();
-      await forgetWs(nm);
-      if(localHandle&&localHandle.name===nm)localHandle=null;
-      openWsMenu();localStatus();
-    };
-    btn.onclick=async()=>{
-      const name=btn.dataset.name;
-      if(localHandle&&localHandle.name===name){closeWsMenu();return}
-      await switchWsTo(name);
-    };
-  });
-  const add=menu.querySelector('#wsAddNew');
-  if(add)add.onclick=()=>{closeWsMenu();pickLocalDir()};
+  // 先显示菜单：后面的事件绑定即使出错，也不该让菜单变成“点不出来”
   menu.hidden=false;
+  try{
+    menu.querySelectorAll('.ws-item').forEach(btn=>{
+      const nm=btn.dataset.name;
+      if(!nm)return;   // 云服务器项没有 data-name，其事件在下方单独绑定
+      const del=btn.querySelector('.wi-del');
+      if(del)del.onclick=async ev=>{   // 必须判空：非列表项不一定有删除按钮
+        ev.stopPropagation();
+        await forgetWs(nm);
+        if(localHandle&&localHandle.name===nm)localHandle=null;
+        openWsMenu();localStatus();
+      };
+      btn.onclick=async()=>{
+        const name=btn.dataset.name;
+        if(localHandle&&localHandle.name===name){closeWsMenu();return}
+        await switchWsTo(name);
+      };
+    });
+    const srv=menu.querySelector('#wsServerItem');
+    if(srv)srv.onclick=async()=>{closeWsMenu();await switchToServerWs();};
+    const add=menu.querySelector('#wsAddNew');
+    if(add)add.onclick=()=>{closeWsMenu();pickLocalDir()};
+  }catch(err){
+    console.warn('工作空间菜单事件绑定失败',err);
+  }
 }
 function closeWsMenu(){
   const menu=$('#wsMenu');
@@ -1344,7 +1790,290 @@ document.addEventListener('click',e=>{
 });
 if(localBtn)localBtn.onclick=localBtnClick;
 if(localUp)localUp.onchange=e=>{uploadFiles([...e.target.files]);e.target.value=''};
+
+/* =============== 模型选择(回答用哪个模型, 逐轮生效) =============== */
+const MODEL_KEY='hj_mcp_model';
+const modelBtn=$('#modelBtn'), modelMenu=$('#modelMenu');
+let modelList=[], modelDefault='', modelKey='';
+function modelLabel(key){
+  const it=modelList.find(m=>m.key===key);
+  return it?it.label:(key||'');
+}
+function renderModelBtn(){
+  if(!modelBtn)return;
+  modelBtn.hidden=false;
+  const cur=modelList.find(m=>m.key===modelKey);
+  const txt=$('#modelTxt');
+  if(txt)txt.textContent=cur?cur.label:(modelList.length?'模型':'模型');
+  modelBtn.title=cur
+    ? ('当前模型：'+cur.label+(cur.thinking?'（思考模式）':'')+'　点击切换')
+    : '选择回答模型';
+}
+function openModelMenu(){
+  if(!modelMenu)return;
+  if(!modelList.length){
+    modelMenu.innerHTML='<div class="ws-hd"><span>回答模型</span></div>'+
+      '<div style="padding:8px 10px;font-size:12px;color:var(--text3)">模型列表未加载</div>';
+    modelMenu.hidden=false;return;
+  }
+  let html='<div class="ws-hd"><span>选择回答模型</span><span>'+(modelKey===modelDefault?'默认':'')+'</span></div>';
+  modelList.forEach(m=>{
+    const isCur=m.key===modelKey;
+    html+='<button class="ws-item" data-key="'+esc(m.key)+'">'+
+      '<span class="wi-ico">'+(m.thinking?'🧠':'⚡')+'</span>'+
+      '<span class="wi-name">'+esc(m.label)+'</span>'+
+      '<span class="wi-tag">'+(m.thinking?'思考':'快答')+'</span>'+
+      (isCur?'<span class="wi-check">✓</span>':'')+
+    '</button>';
+  });
+  modelMenu.innerHTML=html;
+  modelMenu.querySelectorAll('.ws-item').forEach(btn=>{
+    btn.onclick=()=>{setModel(btn.dataset.key);closeModelMenu()};
+  });
+  modelMenu.hidden=false;
+}
+function closeModelMenu(){
+  if(modelMenu)modelMenu.hidden=true;
+  if(modelBtn)modelBtn.classList.remove('open');
+}
+function toggleModelMenu(){
+  if(!modelMenu)return;
+  if(!modelMenu.hidden){closeModelMenu();return}
+  openModelMenu();
+  if(modelBtn)modelBtn.classList.add('open');
+}
+function setModel(key){
+  if(!key)return;
+  modelKey=key;
+  try{localStorage.setItem(MODEL_KEY,key)}catch(e){}
+  renderModelBtn();
+}
+async function loadModels(){
+  try{
+    const r=await fetch('/api/models',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return;
+    const d=await r.json();
+    modelList=Array.isArray(d.models)?d.models:[];
+    modelDefault=d.default||((modelList[0]&&modelList[0].key)||'');
+    let saved='';
+    try{saved=localStorage.getItem(MODEL_KEY)||''}catch(e){}
+    modelKey=modelList.some(m=>m.key===saved)?saved:modelDefault;
+    renderModelBtn();
+  }catch(e){/* 拉不到就用默认, 不影响对话 */}
+}
+if(modelBtn)modelBtn.onclick=toggleModelMenu;
+document.addEventListener('click',e=>{
+  if(!modelMenu||modelMenu.hidden)return;
+  const anchor=modelBtn&&modelBtn.parentElement;
+  if(anchor&&!anchor.contains(e.target))closeModelMenu();
+});
+/* =============== 模型选择 end =============== */
+
+/* =============== 精确定位(浏览器 Geolocation, 优先级高于 IP 定位) =============== */
+const GEO_PREF='hj_mcp_geo_on';          // 只记"用户是否想开启"，坐标永不落盘
+let geoEnabled=false, geoFix=null, geoBusy=false;
+try{geoEnabled=localStorage.getItem(GEO_PREF)==='1'}catch(e){}
+const geoBtn=$('#geoBtn'), geoTxt=$('#geoTxt');
+function geoSupported(){return !!(navigator&&navigator.geolocation)}
+function geoSecure(){
+  // 浏览器只在安全上下文暴露定位：https 或 localhost
+  return !!window.isSecureContext||location.hostname==='localhost'||location.hostname==='127.0.0.1';
+}
+function geoRender(){
+  if(!geoBtn)return;
+  geoBtn.hidden=false;
+  if(geoBusy){geoBtn.className='lbtn gbtn busy';geoTxt.textContent='定位中…';geoBtn.title='正在获取定位…';return}
+  if(!geoSupported()){
+    geoBtn.className='lbtn gbtn err';geoTxt.textContent='定位不可用';
+    geoBtn.title='当前浏览器不支持定位';
+  }else if(!geoSecure()){
+    geoBtn.className='lbtn gbtn err';geoTxt.textContent='定位需HTTPS';
+    geoBtn.title='浏览器要求 HTTPS 才允许精确定位；当前是 http 访问，暂时沿用 IP 定位（城市级）。配好域名+HTTPS 后即可开启。';
+  }else if(geoEnabled&&geoFix){
+    geoBtn.className='lbtn gbtn on';geoTxt.textContent='定位已开启';
+    geoBtn.title='已获取定位（精度约 ±'+Math.round(geoFix.acc||0)+' 米），点击关闭';
+  }else if(geoEnabled){
+    geoBtn.className='lbtn gbtn';geoTxt.textContent='定位未就绪';
+    geoBtn.title='已开启精确定位，但暂时没拿到坐标（信号弱/超时）。点一下可重试，发消息时也会自动重试。';
+  }else{
+    geoBtn.className='lbtn gbtn';geoTxt.textContent='开启定位';
+    geoBtn.title='点击开启精确定位（浏览器会询问授权）。问“我在哪 / 附近 / 怎么走 / 天气”这类问题时，也会自动尝试开启。';
+  }
+}
+function geoErrHint(err){
+  const c=err&&err.code;
+  if(c===1)return '定位权限被拒绝，可在浏览器地址栏的权限设置里重新允许';
+  if(c===2)return '暂时拿不到定位（信号弱），继续使用 IP 定位';
+  if(c===3)return '定位超时，继续使用 IP 定位';
+  return '定位失败：'+((err&&err.message)||'未知原因');
+}
+let geoPending=null;   // 并发合并：同一时刻只跑一次定位，避免重复弹权限
+function requestGeo(silent){
+  if(geoPending)return geoPending;
+  const p=new Promise(resolve=>{
+    if(!geoSupported()||!geoSecure()){resolve(null);return}
+    geoBusy=true;geoRender();
+    navigator.geolocation.getCurrentPosition(pos=>{
+      geoBusy=false;
+      const c=pos.coords||{};
+      geoFix={lat:c.latitude,lng:c.longitude,acc:c.accuracy,ts:Date.now()};
+      geoRender();
+      if(!silent)toast('定位已开启（精度约 ±'+Math.round(c.accuracy||0)+' 米）');
+      resolve(geoFix);
+    },err=>{
+      geoBusy=false;geoFix=null;
+      if(err&&err.code===1){geoEnabled=false;try{localStorage.removeItem(GEO_PREF)}catch(e){}}
+      geoRender();
+      if(!silent)toast(geoErrHint(err));
+      resolve(null);
+    },{enableHighAccuracy:true,timeout:12000,maximumAge:60000});
+  });
+  geoPending=p;
+  p.then(()=>{geoPending=null},()=>{geoPending=null});
+  return p;
+}
+// —— 位置意图识别：命中则发送前自动尝试开启精确定位 ——
+const GEO_INTENT_RE=new RegExp([
+  '我在(哪|什么位置|什么地方|哪个位置)','我的位置','当前位置','我这边(在哪|什么位置)','现在在哪',
+  '附近','周边','周围','就近','最近的','离我(多|有)远','距离我',
+  '怎么(走|去|到)','导航','路线','带我去','怎么过去','怎么到达',
+  '离.{0,10}(多远|几点几公里|多少公里)','几公里','车程','打车','步行','骑行','坐地铁','公交',
+  '(去哪|哪里|哪儿)(吃|玩|逛|买)','去哪儿',
+  '(推荐|找个|找一家|帮我找|有没有|哪家).{0,10}(餐厅|饭店|吃的|美食|咖啡|奶茶|酒店|宾馆|民宿|超市|商场|便利店|医院|药店|银行|ATM|加油站|充电桩|停车场|厕所|洗手间|景点|公园|地铁站|健身房|快递|菜市场)',
+  '(找一家|找个|推荐个|推荐一家|来一家|哪家好|去哪家).{0,6}(店|馆|城|铺|吧|站|场|园|楼)',
+  '天气|气温|降雨|下雨|下雪|空气质量|雾霾|紫外线|穿什么|限行',
+  '\\bnear ?me\\b','nearby','\\baround me\\b','where am i','directions to','how far','\\bhow do i get\\b','closest','nearest'
+].join('|'),'i');
+function needsGeoLocation(q){
+  if(!q)return false;
+  return GEO_INTENT_RE.test(q);
+}
+function geoBtnClick(){
+  if(geoBusy)return;
+  if(!geoSupported()){toast('当前浏览器不支持定位');return}
+  if(!geoSecure()){
+    toast('浏览器只在 HTTPS 下允许精确定位；当前是 http 访问，先用 IP 定位，配好域名+HTTPS 后即可开启');
+    return;
+  }
+  if(geoEnabled&&geoFix){   // 已就绪 → 这次点击用来关闭
+    geoEnabled=false;geoFix=null;
+    try{localStorage.removeItem(GEO_PREF)}catch(e){}
+    geoRender();toast('已关闭精确定位，改回 IP 定位');
+    return;
+  }
+  geoEnabled=true;          // 未开启 / 已开启但没坐标 → 开启并取一次
+  try{localStorage.setItem(GEO_PREF,'1')}catch(e){}
+  requestGeo(false);
+}
+async function geoForSend(force){
+  // 发送时取一份尽量新鲜的坐标。
+  // force=true（问题与位置相关）→ 即使没开定位也自动尝试开启；最多等几秒，绝不卡死发送。
+  if(!geoSupported())return null;
+  if(!geoSecure()){
+    if(force)toast('当前不是 HTTPS，浏览器不允许精确定位，本次改用 IP 定位（城市级）');
+    return null;
+  }
+  let perm='unknown';
+  try{
+    const st=await navigator.permissions.query({name:'geolocation'});
+    perm=st.state||'unknown';
+  }catch(e){/* 个别浏览器不支持 permissions.query */}
+  const autoOn=force&&!geoEnabled;
+  if(autoOn){
+    geoEnabled=true;                       // 位置相关的问题 → 直接开启
+    try{localStorage.setItem(GEO_PREF,'1')}catch(e){}
+    geoRender();
+    toast(perm==='prompt'?'这条问题需要位置信息，请在浏览器提示里点「允许」…':'这条问题需要位置信息，正在获取精确定位…');
+  }else if(!geoEnabled){
+    return null;
+  }
+  if(geoFix&&Date.now()-(geoFix.ts||0)<180000)return geoFix;
+  // 首次授权要等用户点浏览器弹窗，给足时间；已授权则很快
+  const wait=force?(perm==='prompt'?15000:(perm==='denied'?1200:7000)):3000;
+  await Promise.race([requestGeo(true),sleep(wait)]);
+  if(force){
+    if(geoFix&&autoOn)toast('已获取精确定位（精度约 ±'+Math.round(geoFix.acc||0)+' 米）');
+    else if(!geoFix)toast(perm==='denied'
+      ?'定位权限被拒绝，本次改用 IP 定位（城市级）；可在浏览器地址栏重新允许'
+      :'没拿到精确定位，本次改用 IP 定位（城市级）');
+  }
+  return geoFix;
+}
+if(geoBtn)geoBtn.onclick=geoBtnClick;
+geoRender();
+/* =============== 精确定位 end =============== */
 /* =============== 本机文件桥 end =============== */
+
+/* =============== 更新说明(What's New) =============== */
+// 数据源与"是否已读"都在服务端：/api/whatsnew 返回 unseen（没看过的新版本）+ entries（全部）。
+// 看过与否按用户维度记在 users.last_seen_version，换设备/清缓存都不会重复弹。
+let updData=null;
+const updOverlay=$('#updOverlay'), updBody=$('#updBody'), updOkBtn=$('#updOk'),
+      updDot=$('#updDot'), updHeadTitle=$('#updHeadTitle'), updHeadSub=$('#updHeadSub'),
+      updTip=$('#updTip'), updBtn=$('#updBtn');
+function updEsc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function updItemHtml(e){
+  const pts=(e.points||[]).map(p=>'<li>'+updEsc(p)+'</li>').join('');
+  return '<div class="upd-item">'
+    +'<div class="upd-meta"><span class="upd-ver">'+updEsc(e.version)+'</span>'
+    +(e.date?'<span class="upd-date">'+updEsc(e.date)+'</span>':'')+'</div>'
+    +(e.title?'<div class="upd-title">'+updEsc(e.title)+'</div>':'')
+    +(pts?'<ul>'+pts+'</ul>':'')
+    +'</div>';
+}
+async function loadWhatsNew(auto){
+  if(!authToken)return null;
+  try{
+    const r=await fetch('/api/whatsnew',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return null;
+    updData=await r.json();
+  }catch(e){return null}
+  const hasNew=!!(updData&&updData.should_show);
+  if(updDot)updDot.hidden=!hasNew;
+  if(auto&&hasNew)showWhatsNew('unseen');   // 登录后自动弹
+  return updData;
+}
+function showWhatsNew(mode){
+  if(!updOverlay||!updData)return;
+  const list=(mode==='all')?(updData.entries||[]):(updData.unseen||[]);
+  if(!list.length)return;
+  updHeadTitle.textContent=(mode==='all')?'更新日志':('版本更新 · '+list[0].version);
+  updHeadSub.textContent=(mode==='all')
+    ?('共 '+list.length+' 个版本，最新 '+updData.latest)
+    :'本次更新内容如下';
+  updTip.textContent=(mode==='all')?'':'关闭后不再重复提醒';
+  updBody.innerHTML=list.map(updItemHtml).join('');
+  updOverlay.hidden=false;
+  updBody.scrollTop=0;
+}
+async function closeWhatsNew(){
+  if(updOverlay)updOverlay.hidden=true;
+  const unseen=(updData&&updData.unseen)||[];
+  const latest=(updData&&updData.latest)||'';
+  if(updDot)updDot.hidden=true;
+  if(!unseen.length)return;              // 只是翻看历史，无需上报
+  if(updData){updData.should_show=false;updData.unseen=[]}
+  try{
+    await fetch('/api/whatsnew/seen',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify({version:latest})
+    });
+  }catch(e){/* 上报失败也无所谓，下次登录再弹一次而已 */}
+}
+if(updOkBtn)updOkBtn.onclick=()=>closeWhatsNew();
+if(updOverlay)updOverlay.addEventListener('click',e=>{if(e.target===updOverlay)closeWhatsNew()});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&updOverlay&&!updOverlay.hidden)closeWhatsNew();
+});
+if(updBtn)updBtn.onclick=async()=>{
+  if(!updData)await loadWhatsNew(false);
+  if(!updData||!(updData.entries||[]).length){toast('暂时没有更新内容');return}
+  showWhatsNew((updData.unseen||[]).length?'unseen':'all');   // 有未读先看未读，否则翻全部
+};
+/* =============== 更新说明 end =============== */
 
 (async function initAuth(){
   if(!authToken){showAuth();return}
@@ -1352,11 +2081,13 @@ if(localUp)localUp.onchange=e=>{uploadFiles([...e.target.files]);e.target.value=
     const r=await fetch('/api/me',{headers:{'Authorization':'Bearer '+authToken}});
     if(r.ok){
       const d=await r.json();
-      me.name=(d&&d.username)||'';
-      myUserRoot=(d&&d.user_root)||'';
+      applyMe(d);          // 统一填充，勿在此另写一份（曾因此漏掉 isAdmin）
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
-      localStatus();wsStart();await restoreLocalHandle();
+      await loadModels();          // 可选模型清单
+      localStatus();wsStart();await restoreLocalHandle();geoRender();
+      loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
+      if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;
     }

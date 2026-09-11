@@ -1,13 +1,43 @@
-# Python-generated files
+Python-generated files
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+
+# 虚拟环境
+.venv
+.venv*/
+
+# 日志
 log/
 *.log
-# Virtual environments
-.venv
+
 # 本地敏感配置（含 LLM/高德 key），不入库；新机器需自行复制/填写
 src/build_mcp/config.yaml
+config.yaml
+*.yaml.bak
+*.yml.bak
+
+# 临时回滚备份（形如 foo.py.bak-20260911_170327 / foo.py.bak2-...）
+# 只用于本机排障，不入库，避免覆盖协作者的改动
+*.bak
+*.bak-*
+*.bak2-*
+*.bak3-*
+*.orig
+*.rej
+
+# 测试 / 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地数据与数据库
+*.db
+*.sqlite
+*.sqlite3
+data/

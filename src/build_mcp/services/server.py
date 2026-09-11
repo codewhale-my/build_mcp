@@ -51,17 +51,18 @@ def amap_assistant(query: str) -> str:
   return (
     "你是高德地图智能导航助手，精通 IP 定位 和 周边POI查询。请你根据用户的需求获取调取工具，获取用户需要的相关信息。\n"
     "## 调用工具的步骤：\n"
-    "1. 调用 `locate_ip` 工具到获取用户的经纬度。\n"
+    "1. 调用 `locate_ip` 工具到获取用户的经纬度（结果里的 location 字段就是 'lng,lat'）。\n"
     "2. 若成功获取经纬度，使用该经纬度调用 `search_nearby` 工具，结合搜索关键词进行周边信息的搜索。\n"
     "## 注意事项：\n"
     "- 不要主动要求用户提供经纬度信息，直接使用 `locate_ip` 工具获取。\n"
     "- 如果用户的需求中包含经纬度信息，可以直接使用该信息进行周边搜索。\n"
+    "- 需要把经纬度说成地址时用 `regeo`（逆地理编码）。\n"
     f"用户的需求为：\n\n {query}。\n"
   )
 
 
-@mcp.tool(name="locate_ip", description="获取用户的 IP 地址定位信息，返回省市区经纬度等信息。")
-async def locate_ip(ip: Annotated[Optional[str], Field(description="用户的ip地址")] = None) -> ApiResponse:
+@mcp.tool(name="locate_ip", description="IP 定位：根据 IP 返回省、市、区县和经纬度。data.location 是可直接喂给 search_nearby 的 'lng,lat' 中心点；data.source 标明结果来自 amap 还是备用 IP 库。传 ip 参数按该 IP 定位；不传则按服务端出口 IP（通常是机房地址，定位不准）。")
+async def locate_ip(ip: Annotated[Optional[str], Field(description="要定位的公网 IP；务必传用户真实公网 IP")] = None) -> ApiResponse:
   """
   根据 IP 地址定位位置。
 
@@ -69,17 +70,39 @@ async def locate_ip(ip: Annotated[Optional[str], Field(description="用户的ip�
       ip (str): 要定位的 IP 地址。
 
   Returns:
-      dict: 包含定位结果的字典。
+      dict: 包含定位结果的字典（province/city/location/source）。
   """
   logger.info(f"Locating IP: {ip}")
   try:
     result = await sdk.locate_ip(ip)
     if not result:
-      ApiResponse.fail("定位结果为空，请检查日志，系统异常请检查相关日志。")
+      return ApiResponse.fail("IP 定位失败：高德接口与备用 IP 库均无该 IP 的归属地数据。", meta={"ip": ip})
     logger.info(f"Locate IP result: {result}")
-    return ApiResponse.ok(data=result, meta={"ip": ip})
+    return ApiResponse.ok(data=result, meta={"ip": ip, "source": result.get("source", "amap")})
   except Exception as e:
     logger.error(f"Error locating IP {ip}: {e}")
+    return ApiResponse.fail(str(e))
+
+
+@mcp.tool(name="regeo", description="逆地理编码：把经纬度（'lng,lat'）换算成文字地址（省市区+街道门牌）。用于把用户精确定位坐标变成人类可读地址。")
+async def regeo(location: Annotated[str, Field(description="经纬度，格式 'lng,lat'，如 '116.397128,39.916527'")]) -> ApiResponse:
+  """
+  逆地理编码：经纬度 → 结构化地址。
+
+  Args:
+      location (str): "lng,lat"。
+
+  Returns:
+      dict: regeocode 结果（formatted_address、addressComponent）。
+  """
+  logger.info(f"Regeo: location={location}")
+  try:
+    result = await sdk.regeo(location)
+    if not result:
+      return ApiResponse.fail("逆地理编码失败，请检查经纬度格式是否为 'lng,lat'。", meta={"location": location})
+    return ApiResponse.ok(data=result, meta={"location": location})
+  except Exception as e:
+    logger.error(f"Error regeo {location}: {e}")
     return ApiResponse.fail(str(e))
 
 

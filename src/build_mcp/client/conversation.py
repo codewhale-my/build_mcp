@@ -19,11 +19,76 @@ from build_mcp.common.config import load_config
 config = load_config("config.yaml")
 LLM_BASE_URL = config["llm_base_url"]
 LLM_API_KEY = config["llm_api_key"]
-LLM_MODEL = config["llm_model"]
-# 思考模式：true=先推理(reasoning_content)再回答，前端可展示思考过程。
-# 注：DeepSeek 思考模式下 temperature 无效(被忽略)，由 reasoning_effort 控制风格。
-LLM_THINKING = bool(config.get("llm_thinking", True))
-LLM_REASONING_EFFORT = str(config.get("llm_reasoning_effort", "low")).strip() or "low"
+
+
+def _load_model_catalog() -> tuple[List[dict], str]:
+    """解析模型目录。
+
+    推荐写法：`llm_models` 列出可选模型（key/label/model/thinking/reasoning_effort），
+    `llm_model` 填其中某一项的 key 作为默认。
+    兼容旧写法：`llm_model` 直接写模型名，思考模式看 `llm_thinking` / `llm_reasoning_effort`。
+    """
+    specs: List[dict] = []
+    raw = config.get("llm_models")
+    if isinstance(raw, list):
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            model = str(item.get("model") or "").strip()
+            if not model:
+                continue
+            key = str(item.get("key") or "").strip() or f"m{i + 1}"
+            specs.append({
+                "key": key,
+                "label": str(item.get("label") or key).strip(),
+                "model": model,
+                "thinking": bool(item.get("thinking", False)),
+                "reasoning_effort": str(item.get("reasoning_effort") or "low").strip() or "low",
+            })
+
+    default_key = str(config.get("llm_model") or "").strip()
+    if not specs:
+        # 旧配置兼容：llm_model 本身就是模型名
+        model = default_key or "deepseek-flash"
+        specs = [{
+            "key": model,
+            "label": model,
+            "model": model,
+            "thinking": bool(config.get("llm_thinking", False)),
+            "reasoning_effort": str(config.get("llm_reasoning_effort", "low")).strip() or "low",
+        }]
+        default_key = model
+    elif default_key not in {s["key"] for s in specs}:
+        # llm_model 里写的是模型名（而非 key）时，按模型名匹配，匹配不到就用第一项
+        same_model = [s["key"] for s in specs if s["model"] == default_key]
+        default_key = same_model[0] if same_model else specs[0]["key"]
+    return specs, default_key
+
+
+LLM_SPECS, LLM_DEFAULT_KEY = _load_model_catalog()
+
+
+def list_llm_models() -> Dict[str, Any]:
+    """给前端下拉用的模型清单（只含展示信息，不含密钥）。"""
+    return {
+        "default": LLM_DEFAULT_KEY,
+        "models": [
+            {"key": s["key"], "label": s["label"], "model": s["model"], "thinking": s["thinking"]}
+            for s in LLM_SPECS
+        ],
+    }
+
+
+def resolve_llm_spec(model_key: str | None = None) -> Dict[str, Any]:
+    """按前端提交的 key 取模型配置；空值 / 非法值一律回落到默认项。"""
+    key = (model_key or "").strip()
+    for spec in LLM_SPECS:
+        if spec["key"] == key:
+            return spec
+    for spec in LLM_SPECS:
+        if spec["key"] == LLM_DEFAULT_KEY:
+            return spec
+    return LLM_SPECS[0]
 
 # ========== 对话 System Prompt（CLI 与 Web 共用） ==========
 SYSTEM_PROMPT = (
@@ -179,6 +244,136 @@ def mcp_tool_to_openai_function(tool: Tool) -> Dict[str, Any]:
     }
 
 
+def _content_block_to_text(block: Any) -> str | None:
+    """把单个 MCP 内容块转成文本；图片/二进制块降级为占位说明，绝不抛异常。"""
+    if hasattr(block, "text"):
+        return block.text
+    mime = getattr(block, "mimeType", "") or getattr(block, "mime_type", "") or ""
+    data = getattr(block, "data", None)
+    if data is not None:
+        kb = max(1, len(data) * 3 // 4 // 1024)
+        return (
+            f"[工具返回了一张图片（{mime or '未知格式'}，base64 约 {kb} KB）。"
+            "当前模型无法查看图片画面——不要反复重试读取图片的工具；"
+            "如需图片里的文字，请告知用户系统仅支持图片文字识别（OCR）。]"
+        )
+    res = getattr(block, "resource", None)
+    if res is not None:
+        t = getattr(res, "text", None)
+        if isinstance(t, str):
+            return t
+        blob = getattr(res, "blob", None)
+        if blob is not None:
+            return (
+                f"[工具返回了二进制资源（{getattr(res, 'mimeType', '') or '未知格式'}，"
+                f"约 {max(1, len(blob) * 3 // 4 // 1024)} KB），无法作为文本使用。]"
+            )
+    return None
+
+
+def _tool_result_to_text(tool_result: Any) -> str:
+    """把 MCP 工具返回的任意 content 块列表安全转成文本（修复 ImageContent 崩溃）。"""
+    blocks = getattr(tool_result, "content", None) or []
+    parts = [t for t in (_content_block_to_text(b) for b in blocks) if t]
+    if parts:
+        return "\n".join(parts)
+    if getattr(tool_result, "isError", False):
+        return "工具执行失败（无详细输出）"
+    return "(工具无返回内容)"
+
+
+# ====================== 工具输出截断（省 token） ======================
+# 工具返回（尤其终端整屏输出、大文件读取）动辄几千到几万字符，而一次工具调用就会让
+# 之后的每一轮请求都把这段文本重发一遍——不截断时，一个 20 步的任务输入量能到几十万
+# token。这里统一压到上限：保留头部（交代上下文）+ 尾部（错误/结果通常在后半段）。
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, "")).strip() or default)
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+TOOL_OUTPUT_LIMIT = _env_int("MCP_WEB_TOOL_OUTPUT_LIMIT", 4000)
+TOOL_OUTPUT_HEAD = _env_int("MCP_WEB_TOOL_OUTPUT_HEAD", 2400)
+TOOL_OUTPUT_TAIL = _env_int("MCP_WEB_TOOL_OUTPUT_TAIL", 1400)
+
+
+def truncate_tool_output(text: str, name: str = "") -> tuple[str, int]:
+    """工具输出过长时截断，返回 (截断后的文本, 被省略的字符数)；未截断时省略数为 0。"""
+    if not isinstance(text, str) or len(text) <= TOOL_OUTPUT_LIMIT:
+        return text, 0
+    head = text[:TOOL_OUTPUT_HEAD]
+    tail = text[-TOOL_OUTPUT_TAIL:]
+    omitted = max(0, len(text) - len(head) - len(tail))
+    marker = (
+        f"\n\n…〔{name or '工具'} 输出过长，此处省略 {omitted} 字符（原文共 {len(text)} 字符）〕\n"
+        "提示：不要为了看到被省略的部分而重试同一次调用；改用更精确的参数"
+        "（tail / head / grep / 限定行数）只取你真正需要的那几行。\n\n"
+    )
+    return head + marker + tail, omitted
+
+
+# ====================== 重复只读调用短路（省 token） ======================
+# 模型经常拿**一模一样的参数**反复调同一个只读工具（实测一次对话里 search 连发 4 次、
+# fetchWebContent 连发 3 次）。每次重复调用都要把完整结果再塞进上下文，而上下文会在
+# 之后每一轮被整份重发——这是平方级的钱。这里在「同名 + 参数一字不差」时直接短路：
+# 不发网络请求，也不再重复结果内容，只回一句「结果同上，别再重试」。
+#
+# 只对**纯网络查询**类工具开启。故意不含 read_text_file / terminal_*：同一次对话里
+# 文件可能刚被 write_file 改过、终端输出会随命令变化，短路它们会返回过期内容——
+# 那是 bug，不是省钱。
+_DEDUP_TOOL_NAMES = {
+    "search",
+    "search_nearby",
+    "locate_ip",
+    "regeo",
+    "fetchWebContent",
+    "fetchCsdnArticle",
+    "fetchGithubReadme",
+    "fetchJuejinArticle",
+    "fetchLinuxDoArticle",
+}
+
+
+def _dedup_enabled() -> bool:
+    """环境变量 MCP_WEB_DEDUP=0 可整体关掉这个优化。"""
+    return os.environ.get("MCP_WEB_DEDUP", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _dedup_key(tool_name: str, args_raw: str) -> str:
+    """
+    生成「这次调用是否与之前完全相同」的指纹；不适用时返回空串（=不做去重）。
+
+    参数没解析成功时返回空串：否则所有解析失败的调用会共用同一个空 key，
+    把本来不同的调用错判成重复，进而返回错误的结果。
+    """
+    if not _dedup_enabled() or tool_name not in _DEDUP_TOOL_NAMES:
+        return ""
+    text = (args_raw or "").strip()
+    try:
+        parsed = json.loads(text) if text else {}
+    except Exception:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    try:
+        canon = json.dumps(parsed, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ""
+    return f"{tool_name}\x00{canon}"
+
+
+def _dedup_notice(tool_name: str) -> str:
+    """短路时回给模型的内容：短，且明确要求它别再重试。"""
+    return (
+        f"⚠️ 本次 [{tool_name}] 调用与本次对话中之前的一次**完全相同**（参数一字不差），"
+        "已直接跳过、未再次请求。\n"
+        "上一次的完整结果就在上面的历史里，请直接使用它；不要再用同样的参数调用这个工具。\n"
+        "若信息仍然不足，请换关键词 / 换参数 / 换工具，或直接基于已获得的信息作答。"
+    )
+
+
 def _sanitize(obj: Any) -> Any:
     """
     递归清除字符串中的非法代理项(surrogate, U+D800~U+DFFF)。
@@ -230,18 +425,99 @@ def _delta_field(delta, name):
         return None
 
 
-def _build_llm_request(work_messages: list[dict], openai_tools) -> Dict[str, Any]:
-    """组装一次 chat.completions 请求参数（按 llm_thinking 开关决定是否开思考模式）。"""
+# ====================== token 用量 / 前缀缓存统计 ======================
+# DeepSeek 的前缀缓存只比对「从第 0 个 token 开始完全相同」的前缀；命中部分的单价
+# 只有未命中的 1/30（2026-08-17 起 V4-Flash 高峰：命中 0.10 / 未命中 3.00 / 输出 9.00
+# 元每百万 token，空闲时段减半）。所以「命中率」是成本的第一杠杆，必须能看到它。
+# 单价可用环境变量覆盖（换模型/调价时不用改代码）。
+_PRICE_HIT = float(os.environ.get("MCP_WEB_PRICE_CACHE_HIT", "0.10"))
+_PRICE_MISS = float(os.environ.get("MCP_WEB_PRICE_CACHE_MISS", "3.00"))
+_PRICE_OUT = float(os.environ.get("MCP_WEB_PRICE_OUTPUT", "9.00"))
+
+# 是否向服务端索要 usage（stream 模式下必须显式打开）。若服务端不认这个参数，
+# 会被 _create_stream 自动关掉并重试一次，不会打断用户请求。
+_WANT_STREAM_USAGE = True
+
+
+def _usage_numbers(u) -> dict:
+    """把一帧 usage 归一化成 {hit, miss, in, out}（缺字段按 0，兼容 dict/对象两种形态）。"""
+    def g(*names) -> int:
+        for n in names:
+            v = None
+            try:
+                v = u.get(n) if isinstance(u, dict) else getattr(u, n, None)
+            except Exception:
+                v = None
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    return 0
+        return 0
+
+    hit = g("prompt_cache_hit_tokens")
+    miss = g("prompt_cache_miss_tokens")
+    pin = g("prompt_tokens") or (hit + miss)
+    return {"hit": hit, "miss": miss, "in": pin, "out": g("completion_tokens")}
+
+
+def _fmt_usage(u: dict) -> str:
+    """一行可读的用量摘要：输入(命中/未命中/命中率) + 输出 + 估算花费。"""
+    hit, miss, out = int(u.get("hit") or 0), int(u.get("miss") or 0), int(u.get("out") or 0)
+    pin = int(u.get("in") or 0) or (hit + miss)
+    rate = (hit / pin) if pin else 0.0
+    cost = (hit * _PRICE_HIT + miss * _PRICE_MISS + out * _PRICE_OUT) / 1_000_000
+    return (f"输入 {pin} tok（缓存命中 {hit} / 未命中 {miss}，命中率 {rate:.0%}）"
+            f" 输出 {out} tok ≈ ¥{cost:.4f}")
+
+
+async def _create_stream(client, req: Dict[str, Any]):
+    """发起流式请求；服务端不认 stream_options 时去掉它重试一次（自愈，不打断请求）。"""
+    global _WANT_STREAM_USAGE
+    try:
+        return await client.chat.completions.create(**req, stream=True)
+    except Exception:
+        if "stream_options" not in req:
+            raise
+        _WANT_STREAM_USAGE = False
+        print("⚠️ 服务端不支持 stream_options，已关闭 usage 统计并重试")
+        return await client.chat.completions.create(
+            **{k: v for k, v in req.items() if k != "stream_options"}, stream=True
+        )
+
+
+def _compose_user_message(user_query: str | list, turn_note: str = ""):
+    """把「随轮变化」的上下文挂到用户消息末尾，而不是塞进 system。
+
+    为什么：system 是前缀的最前面，只要它有一个字节变了，整段历史就全部按未命中
+    计费（30 倍差价）。公网 IP / GPS 坐标 / 图片说明这些东西每轮都可能不同，放在
+    最后一条用户消息里——那里本来每轮就不一样，吃掉它是免费的。
+    """
+    note = (turn_note or "").strip()
+    if not note:
+        return user_query
+    if isinstance(user_query, list):
+        return [*user_query, {"type": "text", "text": note}]
+    q = user_query if isinstance(user_query, str) else str(user_query)
+    return f"{q}\n\n{note}"
+
+
+def _build_llm_request(work_messages: list[dict], openai_tools, spec: dict | None = None) -> Dict[str, Any]:
+    """组装一次 chat.completions 请求参数（按所选模型的 thinking 开关决定是否开思考模式）。"""
+    spec = spec or resolve_llm_spec()
     req: Dict[str, Any] = {
-        "model": LLM_MODEL,
+        "model": spec["model"],
         # 统一清洗后再发送：工具返回等外部文本可能携带非法代理项，会炸序列化
         "messages": _sanitize(work_messages),
         "tools": openai_tools,
     }
-    if LLM_THINKING:
+    if _WANT_STREAM_USAGE:
+        # 流式模式下 usage 在最后一帧才给，必须显式索要，否则拿不到缓存命中数
+        req["stream_options"] = {"include_usage": True}
+    if spec["thinking"]:
         # 开启 DeepSeek 思考模式：先输出 reasoning_content 再给 content
         req["extra_body"] = {"thinking": {"type": "enabled"}}
-        req["reasoning_effort"] = LLM_REASONING_EFFORT
+        req["reasoning_effort"] = spec["reasoning_effort"]
     else:
         req["temperature"] = 0.3  # 非思考模式沿用原温度
     return req
@@ -250,26 +526,34 @@ def _build_llm_request(work_messages: list[dict], openai_tools) -> Dict[str, Any
 async def agent_loop_stream(
     tool_name_to_session: Dict[str, ClientSession],
     openai_tools: List[Dict[str, Any]],
-    user_query: str,
+    user_query: str | list,   # str 或 OpenAI 多模态 content 列表(text/image_url 混排)
     history_messages: list[dict],
+    turn_note: str = "",      # 随轮变化的上下文(IP/定位/图片说明)，挂到最后一条用户消息
+    model_key: str | None = None,
 ):
     """
     流式执行一轮「推理 + 工具调用」，逐事件产出给调用方(Web SSE / CLI)。
+
+    model_key: 前端选择的模型 key(见 config.yaml 的 llm_models)；None/非法 → 用默认模型。
 
     产出的事件 dict：
       {"type": "thinking", "delta": str}    思考过程增量(模型思考时实时下发)
       {"type": "answer",   "delta": str}    最终回答增量
       {"type": "tool", "name": str, "status": "start"|"ok"|"error", "note": str}
                                             (note 仅 start/error 时可能带参数或原因)
-      {"type": "done", "answer": str, "thinking": str}   整轮结束(携带全文)
+      {"type": "done", "answer": str, "thinking": str, "model": str, "model_key": str,
+       "usage": {"hit": int, "miss": int, "in": int, "out": int, "rounds": int, "summary": str}}
+                                            整轮结束(携带全文、实际使用的模型与 token 用量)
       {"type": "error", "message": str}    硬错误(网络/API/解析等)
 
-    不修改传入的 history_messages，中间工具过程只在本轮内部。
+    turn_note: 每轮都可能变化的上下文，会被拼到最后一条用户消息（不进 system，
+    以保住前缀缓存）。不修改传入的 history_messages，中间工具过程只在本轮内部。
     工具轮次的 reasoning_content 会随 assistant 消息一起回传(DeepSeek 要求，
     否则带 tools 的后续请求会 400)。
     """
+    spec = resolve_llm_spec(model_key)
     work_messages = history_messages.copy()
-    work_messages.append({"role": "user", "content": user_query})
+    work_messages.append({"role": "user", "content": _compose_user_message(user_query, turn_note)})
 
     client = AsyncOpenAI(
         api_key=LLM_API_KEY,
@@ -278,13 +562,18 @@ async def agent_loop_stream(
 
     thinking_parts: List[str] = []   # 各轮思考文本，done 时合并
     max_round = 1000
+    # 本次对话的 token 用量累计（跨工具轮），命中率是成本的第一杠杆，见文件上方说明
+    totals = {"hit": 0, "miss": 0, "in": 0, "out": 0, "rounds": 0}
+    # 本次对话内「同名 + 同参数」的只读调用记录，用于短路重复调用（省 token）
+    seen_calls: Dict[str, bool] = {}
+    dedup_hits = 0
 
-    for _ in range(max_round):
-        req = _build_llm_request(work_messages, openai_tools)
+    for round_no in range(max_round):
+        req = _build_llm_request(work_messages, openai_tools, spec)
 
         # ---------- 发起流式请求 ----------
         try:
-            stream = await client.chat.completions.create(**req, stream=True)
+            stream = await _create_stream(client, req)
         except Exception as e:
             yield {"type": "error", "message": f"模型请求失败：{e}"}
             return
@@ -292,8 +581,12 @@ async def agent_loop_stream(
         content_acc = ""            # 本轮最终回答累积
         thinking_acc = ""           # 本轮思考文本累积
         tool_slots: Dict[int, dict] = {}   # tool_call index -> 聚合后的调用
+        round_usage = {"hit": 0, "miss": 0, "in": 0, "out": 0}
         try:
             async for chunk in stream:
+                # usage 只在最后一帧出现，那一帧的 choices 是空数组——必须在 continue 之前取
+                if getattr(chunk, "usage", None) is not None:
+                    round_usage = _usage_numbers(chunk.usage)
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -330,6 +623,13 @@ async def agent_loop_stream(
             except Exception:
                 pass
 
+        # 累计本轮用量并落日志：命中率是成本的第一杠杆，必须每轮都看得见
+        if any(round_usage.get(k) for k in ("hit", "miss", "in", "out")):
+            totals["rounds"] += 1
+            for k in ("hit", "miss", "in", "out"):
+                totals[k] += int(round_usage.get(k) or 0)
+            print(f"📊 第{totals['rounds']}次请求 {_fmt_usage(round_usage)}")
+
         if thinking_acc:
             thinking_parts.append(thinking_acc)
 
@@ -341,6 +641,9 @@ async def agent_loop_stream(
                 "type": "done",
                 "answer": content_acc,
                 "thinking": "\n\n".join(p for p in thinking_parts if p),
+                "model": spec["model"],
+                "model_key": spec["key"],
+                "usage": {**totals, "summary": _fmt_usage(totals)},
             }
             return
 
@@ -370,15 +673,40 @@ async def agent_loop_stream(
                 yield {"type": "tool", "name": tool_name, "status": "error", "note": tool_content}
             else:
                 session = tool_name_to_session[tool_name]
-                try:
-                    tool_result = await session.call_tool(tool_name, arguments=tool_args)
-                    tool_content = tool_result.content[0].text
-                    print(f"✅工具[{tool_name}]返回结果")
-                    yield {"type": "tool", "name": tool_name, "status": "ok"}
-                except Exception as e:
-                    tool_content = f"工具调用异常: {str(e)}"
-                    print(f"❌{tool_content}")
-                    yield {"type": "tool", "name": tool_name, "status": "error", "note": str(e)[:200]}
+                dedup_key = _dedup_key(tool_name, args_raw)
+                if dedup_key and dedup_key in seen_calls:
+                    # 与之前某次调用一字不差：直接短路，不发请求、不重复结果内容
+                    dedup_hits += 1
+                    tool_content = _dedup_notice(tool_name)
+                    print(
+                        f"♻️ 工具[{tool_name}]与之前的调用完全相同，已跳过重复执行"
+                        f"（本次对话累计跳过 {dedup_hits} 次）"
+                    )
+                    yield {
+                        "type": "tool", "name": tool_name, "status": "ok",
+                        "note": "与该轮之前的调用完全相同，已跳过重复执行",
+                    }
+                else:
+                    try:
+                        tool_result = await session.call_tool(tool_name, arguments=tool_args)
+                        tool_content = _tool_result_to_text(tool_result)
+                        # 过长输出就地压缩：省 token，也让后续每一轮请求都更小更快
+                        tool_content, _omitted = truncate_tool_output(tool_content, tool_name)
+                        if dedup_key:
+                            seen_calls[dedup_key] = True   # 只登记成功的调用；失败允许重试
+                        print(f"✅工具[{tool_name}]返回结果")
+                        if _omitted:
+                            print(f"✂️ 工具[{tool_name}]输出过长，已省略 {_omitted} 字符")
+                        yield {
+                            "type": "tool", "name": tool_name, "status": "ok",
+                            "note": f"输出过长，已省略 {_omitted} 字符" if _omitted else "",
+                        }
+                    except Exception as e:
+                        tool_content, _ = truncate_tool_output(
+                            f"工具调用异常: {str(e)}", tool_name
+                        )
+                        print(f"❌{tool_content}")
+                        yield {"type": "tool", "name": tool_name, "status": "error", "note": str(e)[:200]}
 
             work_messages.append({
                 "role": "tool",
@@ -391,6 +719,9 @@ async def agent_loop_stream(
         "type": "done",
         "answer": "已达到最大工具调用轮次，停止处理。",
         "thinking": "\n\n".join(p for p in thinking_parts if p),
+        "model": spec["model"],
+        "model_key": spec["key"],
+        "usage": {**totals, "summary": _fmt_usage(totals)},
     }
 
 
@@ -398,7 +729,8 @@ async def agent_loop(
     tool_name_to_session: Dict[str, ClientSession],
     openai_tools: List[Dict[str, Any]],
     user_query: str,
-    history_messages: list[dict]
+    history_messages: list[dict],
+    turn_note: str = "",
 ) -> AgentResult:
     """
     聚合版：消费 agent_loop_stream，攒齐后返回 AgentResult(answer/thinking)。

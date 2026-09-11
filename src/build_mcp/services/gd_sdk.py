@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from build_mcp.services import ip_locate
+
 
 class GdSDK:
   """
@@ -121,16 +123,87 @@ class GdSDK:
     """
     await self._client.aclose()
 
-  async def locate_ip(self, ip: str = None) -> Any | None:
+  @staticmethod
+  def _center_of_rectangle(rect: str = None) -> str | None:
     """
-    IP定位接口
+    把高德 rectangle 字段（"lng1,lat1;lng2,lat2"）取中心点，返回 "lng,lat"。
+
+    高德 IP 定位只给经纬度范围、不给中心点，下游 search_nearby 需要精确的
+    "lng,lat"，所以这里补一个 location 字段，省得模型自己猜。
+    """
+    if not rect or ";" not in str(rect):
+      return None
+    try:
+      p1, p2 = str(rect).split(";")[:2]
+      lng1, lat1 = (float(x) for x in p1.split(",")[:2])
+      lng2, lat2 = (float(x) for x in p2.split(",")[:2])
+      return f"{(lng1 + lng2) / 2:.6f},{(lat1 + lat2) / 2:.6f}"
+    except Exception:
+      return None
+
+  async def geocode(self, address: str, city: str = None) -> dict | None:
+    """
+    地理编码：结构化地址 → 经纬度。
+    https://lbs.amap.com/api/webservice/guide/api/georegeo
+
+    Returns:
+        dict | None: 第一条匹配结果（含 location "lng,lat"、adcode、level），失败 None。
+    """
+    if not address:
+      return None
+    params = {"key": self.api_key, "address": address}
+    if city:
+      params["city"] = city
+    result = await self._request_with_retry(
+      method="GET",
+      url=f"{self.base_url}/v3/geocode/geo",
+      params=params,
+    )
+    if result and result.get("status") == "1":
+      geocodes = result.get("geocodes") or []
+      if geocodes:
+        return geocodes[0]
+    self.logger.warning(f"地理编码无结果: address={address} city={city}")
+    return None
+
+  async def regeo(self, location: str) -> dict | None:
+    """
+    逆地理编码：经纬度 → 文字地址。
+    https://lbs.amap.com/api/webservice/guide/api/georegeo
+
+    Args:
+        location (str): "lng,lat"，如 "116.397128,39.916527"。
+
+    Returns:
+        dict | None: regeocode 节点（含 formatted_address、addressComponent），失败 None。
+    """
+    if not location:
+      return None
+    result = await self._request_with_retry(
+      method="GET",
+      url=f"{self.base_url}/v3/geocode/regeo",
+      params={"key": self.api_key, "location": location, "extensions": "base"},
+    )
+    if result and result.get("status") == "1":
+      return result.get("regeocode")
+    self.logger.warning(f"逆地理编码无结果: location={location}")
+    return None
+
+  async def locate_ip(self, ip: str = None, fallback: bool = True) -> Any | None:
+    """
+    IP 定位：高德 /v3/ip 为主，免费 IP 库兜底。
     https://lbs.amap.com/api/webservice/guide/api/ipconfig
+
+    高德对运营商蜂窝出口等网段覆盖不全，会返回 status=1 但省市为空；
+    此时用 ip_locate 里的免费库查省市，再用高德地理编码换成经纬度，
+    返回结构与高德保持一致（额外带 source / location 两个字段）。
 
     Args:
         ip (str, optional): 要查询的 IP，若为空，则使用请求方公网 IP。
+        fallback (bool): 高德无数据时是否走备用库，默认 True。
 
     Returns:
-        dict: 定位结果，若失败则返回 None。
+        dict: 定位结果（含 source、location），全失败返回 None。
     """
     url = f"{self.base_url}/v3/ip"
     params = {
@@ -146,10 +219,53 @@ class GdSDK:
     )
 
     if result and result.get("status") == "1":
-      return result
+      result.setdefault("source", "amap")
+      if not result.get("location"):
+        center = self._center_of_rectangle(result.get("rectangle"))
+        if center:
+          result["location"] = center
+      if result.get("province") or result.get("city"):
+        return result
+      self.logger.warning(f"高德 IP 定位为空(该网段无数据): ip={ip} result={result}")
     else:
       self.logger.error(f"IP定位失败: {result}")
-      return None
+
+    if not fallback:
+      return result if (result and result.get("status") == "1") else None
+
+    # ---- 备用免费 IP 库兜底 ----
+    fb = await ip_locate.locate(ip, client=self._client)
+    if not fb:
+      return result if (result and result.get("status") == "1") else None
+
+    merged = dict(result or {})
+    merged.update({
+      "status": "1",
+      "info": "OK",
+      "infocode": merged.get("infocode") or "10000",
+      "source": fb["source"],
+      "province": fb.get("province", ""),
+      "city": fb.get("city", ""),
+    })
+    if fb.get("isp"):
+      merged.setdefault("isp", fb["isp"])
+    # 用高德地理编码把 省/市 换成经纬度，保证 search_nearby 可用
+    try:
+      geo = await self.geocode(fb.get("city") or fb.get("province"), city=fb.get("province"))
+      if geo and geo.get("location"):
+        merged["location"] = geo["location"]
+        if geo.get("adcode"):
+          merged["adcode"] = geo["adcode"]
+        if geo.get("level"):
+          merged["level"] = geo["level"]
+    except Exception as e:
+      self.logger.warning(f"备用 IP 定位结果地理编码失败: {e}")
+    if not merged.get("location") and fb.get("lnglat"):
+      # 地理编码没成功时，退而用备用库自带的经纬度（精度略差但能用）
+      merged["location"] = fb["lnglat"]
+      merged["level"] = merged.get("level") or "备用库坐标"
+    self.logger.info(f"IP 定位走备用库({fb['source']}): {merged}")
+    return merged
 
   async def search_nearby(self, location: str, keywords: str = "", types: str = "", radius: int = 1000, page_num: int = 1, page_size: int = 20) -> dict | None:
     """
