@@ -244,6 +244,44 @@ def mcp_tool_to_openai_function(tool: Tool) -> Dict[str, Any]:
     }
 
 
+def _content_block_to_text(block: Any) -> str | None:
+    """把单个 MCP 内容块转成文本；图片/二进制块降级为占位说明，绝不抛异常。"""
+    if hasattr(block, "text"):
+        return block.text
+    mime = getattr(block, "mimeType", "") or getattr(block, "mime_type", "") or ""
+    data = getattr(block, "data", None)
+    if data is not None:
+        kb = max(1, len(data) * 3 // 4 // 1024)
+        return (
+            f"[工具返回了一张图片（{mime or '未知格式'}，base64 约 {kb} KB）。"
+            "当前模型无法查看图片画面——不要反复重试读取图片的工具；"
+            "如需图片里的文字，请告知用户系统仅支持图片文字识别（OCR）。]"
+        )
+    res = getattr(block, "resource", None)
+    if res is not None:
+        t = getattr(res, "text", None)
+        if isinstance(t, str):
+            return t
+        blob = getattr(res, "blob", None)
+        if blob is not None:
+            return (
+                f"[工具返回了二进制资源（{getattr(res, 'mimeType', '') or '未知格式'}，"
+                f"约 {max(1, len(blob) * 3 // 4 // 1024)} KB），无法作为文本使用。]"
+            )
+    return None
+
+
+def _tool_result_to_text(tool_result: Any) -> str:
+    """把 MCP 工具返回的任意 content 块列表安全转成文本（修复 ImageContent 崩溃）。"""
+    blocks = getattr(tool_result, "content", None) or []
+    parts = [t for t in (_content_block_to_text(b) for b in blocks) if t]
+    if parts:
+        return "\n".join(parts)
+    if getattr(tool_result, "isError", False):
+        return "工具执行失败（无详细输出）"
+    return "(工具无返回内容)"
+
+
 def _sanitize(obj: Any) -> Any:
     """
     递归清除字符串中的非法代理项(surrogate, U+D800~U+DFFF)。
@@ -445,7 +483,7 @@ async def agent_loop_stream(
                 session = tool_name_to_session[tool_name]
                 try:
                     tool_result = await session.call_tool(tool_name, arguments=tool_args)
-                    tool_content = tool_result.content[0].text
+                    tool_content = _tool_result_to_text(tool_result)
                     print(f"✅工具[{tool_name}]返回结果")
                     yield {"type": "tool", "name": tool_name, "status": "ok"}
                 except Exception as e:
