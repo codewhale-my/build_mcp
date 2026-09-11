@@ -196,7 +196,7 @@ header{
 }
 .user-badge::before{content:"👤";font-size:12px;flex:none}
 .user-badge[hidden]{display:none}
-@media (max-width:600px){.user-badge{max-width:92px;padding:0 10px;font-size:11.5px;height:31px}}
+@media (max-width:600px){.user-badge{max-width:64px;padding:0 8px;font-size:11px;height:30px;gap:4px}}
 /* ============ 消息区 ============ */
 /* 隐藏原生滚动条（长度由浏览器控制，无法自定义），改用自绘"米粒"指示条 */
 #chatBox{
@@ -454,12 +454,15 @@ header{
 button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 @media (max-width:600px){
   .app{padding:0 10px}
-  header{padding:10px 2px}
-  .logo{width:32px;height:32px;border-radius:9px}
-  .logo svg{width:16px;height:16px}
-  .brand h1{font-size:15px}
-  .tool-chip{display:none}
-  .hbtn{width:31px;height:31px;border-radius:9px}
+  header{padding:9px 2px;gap:8px}
+  .brand{gap:8px}
+  .brand>div{min-width:0}
+  .brand h1{font-size:14.5px;overflow:hidden;text-overflow:ellipsis}
+  .logo{width:29px;height:29px;border-radius:9px}
+  .logo svg{width:15px;height:15px}
+  .tools{display:none} /* 手机上整行工具标签都隐藏，省掉 6px 上边距 */
+  .hbtns{gap:4px}
+  .hbtn{width:30px;height:30px;border-radius:9px}
   .hbtn svg{width:15px;height:15px}
   #chatBox{padding:14px 6px 10px 0} /* 移动端系统滚动条贴边，无需留白 */
   .msg{gap:8px;margin-bottom:16px}
@@ -479,14 +482,17 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
   .sugg{padding:11px 12px;border-radius:12px}
   .sugg b{font-size:12.5px}
   .sugg span{font-size:11px}
-  .composer{border-radius:16px;padding:7px 7px 7px 13px;gap:8px}
-  #inputBox{font-size:16px} /* ≥16px 防 iOS 聚焦时页面自动放大 */
+  .composer-wrap{padding:8px 0 calc(10px + env(safe-area-inset-bottom))}
+  .composer{border-radius:18px;padding:6px 6px 6px 13px;gap:6px}
+  #inputBox{font-size:16px;line-height:1.45;padding:9px 0} /* ≥16px 防 iOS 聚焦时页面自动放大 */
+  #inputBox::placeholder{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #sendBtn{width:38px;height:38px;border-radius:12px}
   #plusBtn{width:38px;height:38px;border-radius:12px}
+  .wsbar{gap:6px;padding:0 2px 8px}
   /* 移动端隐藏“本机工作空间”按钮（File System Access 仅桌面浏览器支持），但保留模型选择 */
   .wsbar .ws-anchor{display:none!important}
-  .mbtn,.gbtn{height:30px;padding:0 10px;font-size:12px}
-  .mbtn .txt,.gbtn .txt{max-width:110px}
+  .mbtn,.gbtn{height:29px;padding:0 9px;font-size:11.5px}
+  .mbtn .txt,.gbtn .txt{max-width:104px}
   .hint{display:none}
   .auth-overlay{padding:14px}
   .auth-card{padding:28px 22px 22px}
@@ -494,7 +500,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 /* 超窄屏：建议卡退化为单列 */
 @media (max-width:380px){
   .suggests{grid-template-columns:1fr}
-  .brand h1{font-size:14px}
+  .brand h1{font-size:13.5px}
+  .user-badge{max-width:54px}
+  .hbtn{width:29px;height:29px}
+  .hbtns{gap:3px}
 }
 /* ============ 登录层 ============ */
 .auth-overlay{
@@ -699,6 +708,15 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 /* ================= 工具函数 ================= */
 const $ = s => document.querySelector(s);
 const chatBox = $('#chatBox'), inputBox = $('#inputBox'), sendBtn = $('#sendBtn');
+/* 输入框提示语：宽屏显示完整说明；窄屏只留短句，避免 placeholder 折行把输入框挤成两行 */
+const PH_WIDE='输入你的问题…（Enter 发送，Shift+Enter 换行）', PH_NARROW='输入你的问题…';
+function syncPlaceholder(){
+  const ph = window.innerWidth<=600 ? PH_NARROW : PH_WIDE;
+  if(inputBox && inputBox.placeholder!==ph) inputBox.placeholder=ph;
+}
+syncPlaceholder();
+let phTimer=0;
+window.addEventListener('resize',()=>{clearTimeout(phTimer);phTimer=setTimeout(syncPlaceholder,150)},{passive:true});
 const THEME_KEY = 'mcp-theme';
 const TOKEN_KEY = 'mcp-auth-token';
 let authToken='', me={name:'',isAdmin:false,serverRoot:''};
