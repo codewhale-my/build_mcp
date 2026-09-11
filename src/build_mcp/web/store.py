@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS messages(
   role    TEXT NOT NULL CHECK(role IN ('user','assistant')),
   text    TEXT NOT NULL,
   ts      REAL NOT NULL,
-  model   TEXT NOT NULL DEFAULT ''
+  model   TEXT NOT NULL DEFAULT '',
+  interrupted INTEGER NOT NULL DEFAULT 0   -- 1=这轮回答没生成完（断网/关页面），可继续
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
 """
@@ -103,6 +104,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
     if "model" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+    if "interrupted" not in cols:
+        # interrupted=1：回答因断网/关页面未写完，前端据此在气泡下显示「继续」按钮
+        conn.execute("ALTER TABLE messages ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0")
 
     ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
     if "last_seen_version" not in ucols:
@@ -313,14 +317,17 @@ def list_users() -> list[dict]:
 
 
 # ---------------- 消息 ----------------
-def add_message(user_id: int, role: str, text: str, model: str = "") -> None:
+def add_message(user_id: int, role: str, text: str, model: str = "",
+                interrupted: int = 0) -> int:
+    """追加一条消息，返回新行 id。interrupted=1 表示这轮没答完（可继续）。"""
     conn = _conn()
     try:
         with conn:
-            conn.execute(
-                "INSERT INTO messages(user_id,role,text,ts,model) VALUES(?,?,?,?,?)",
-                (user_id, role, text, time.time(), model or ""),
+            cur = conn.execute(
+                "INSERT INTO messages(user_id,role,text,ts,model,interrupted) VALUES(?,?,?,?,?,?)",
+                (user_id, role, text, time.time(), model or "", 1 if interrupted else 0),
             )
+            return int(cur.lastrowid)
     finally:
         conn.close()
 
@@ -329,10 +336,61 @@ def list_messages(user_id: int, limit: int = 200) -> list[dict]:
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT id,role,text,ts,model FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            "SELECT id,role,text,ts,model,interrupted FROM messages "
+            "WHERE user_id=? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
+def get_message(msg_id: int, user_id: int) -> dict | None:
+    """取单条消息（限本人），不存在或不属于该用户则返回 None。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id,role,text,ts,model,interrupted FROM messages "
+            "WHERE id=? AND user_id=?",
+            (msg_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def update_message(msg_id: int, user_id: int, text: str,
+                   interrupted: int | None = None, model: str | None = None) -> bool:
+    """回写消息正文（续写补完后用）。interrupted 传 0 表示「已补完」。"""
+    sets, vals = ["text=?"], [text]
+    if interrupted is not None:
+        sets.append("interrupted=?")
+        vals.append(1 if interrupted else 0)
+    if model is not None:
+        sets.append("model=?")
+        vals.append(model)
+    vals += [msg_id, user_id]
+    conn = _conn()
+    try:
+        with conn:
+            cur = conn.execute(
+                f"UPDATE messages SET {','.join(sets)} WHERE id=? AND user_id=?", vals
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def prev_user_message(msg_id: int, user_id: int) -> dict | None:
+    """取该消息之前最近的一条 user 消息（续写时用来还原「当初问的是什么」）。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT id,role,text,ts,model,interrupted FROM messages "
+            "WHERE user_id=? AND id<? AND role='user' ORDER BY id DESC LIMIT 1",
+            (user_id, msg_id),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 

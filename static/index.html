@@ -360,6 +360,16 @@ header{
   padding:3px 9px;transition:.15s;display:flex;align-items:center;gap:4px;
 }
 .stop-btn:hover{color:var(--err-tx);border-color:var(--err-bd)}
+/* ---------- 「继续」按钮：接在被截断的回答下面 ---------- */
+.cont-btn{
+  margin:8px 0 2px;padding:5px 13px;font-size:13px;cursor:pointer;color:#2563eb;
+  background:transparent;border:1px dashed #9aa4b2;border-radius:14px;
+  display:inline-flex;align-items:center;gap:6px;line-height:1.2;
+}
+.cont-btn:hover{color:#fff;background:#2563eb;border-style:solid;border-color:#2563eb}
+.cont-btn[disabled]{opacity:.55;cursor:default}
+.cont-hint{font-size:12px;color:var(--text2,#8b949e);margin-left:8px}
+.cont-live{white-space:pre-wrap}
 /* ---------- 流式消息：头部行/停止按钮/工具徽章 ---------- */
 .live-top{display:flex;align-items:center;width:100%;margin:0 0 2px}
 .live-top .time{margin:0}
@@ -949,7 +959,7 @@ async function refreshMe(){
 }
 
 // 从服务端拉取“当前用户自己的”历史消息（按用户隔离）
-async function loadServerHistory(){
+async function loadServerHistory(doRender=true){
   try{
     const r=await fetch('/api/history',{headers:{'Authorization':'Bearer '+authToken}});
     if(!r.ok){throw new Error('HTTP '+r.status)}
@@ -959,12 +969,14 @@ async function loadServerHistory(){
     if(d&&d.ws_mode)wsMode=d.ws_mode;
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
-      .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||''}));
+      .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||'',
+                id:m.id,interrupted:m.interrupted?1:0}));
   }catch(e){
-    history=[];
+    if(doRender)history=[];
   }
   updateUserBadge();
-  renderAll();
+  if(doRender)renderAll();
+  return true;
 }
 
 const STAR='<svg viewBox="0 0 24 24" fill="none"><path d="M12 2l2.3 7.7L22 12l-7.7 2.3L12 22l-2.3-7.7L2 12l7.7-2.3z" fill="#fff"/></svg>';
@@ -1007,7 +1019,15 @@ function buildMsg(item){
       ? '<div class="msg-model"><span class="mm-dot"></span>'+esc(item.model)+'</div>' : '';
     const uchip=(item.role==='assistant'&&item.usage&&(item.usage.in||item.usage.out))
       ? '<div class="msg-usage">'+fmtUsage(item.usage)+'</div>' : '';
-    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+mchip+uchip+'</div>';
+    // 上一轮没答完（断网/关页面/手动停）→ 气泡下挂一个「继续」按钮
+    const cbtn=(item.role==='assistant'&&item.interrupted)
+      ? '<div class="cont-row"><button class="cont-btn" type="button">▶ 继续生成</button>'+
+        '<span class="cont-hint">上次没答完，从这里接着写</span></div>' : '';
+    wrap.innerHTML='<div class="avatar">'+STAR+'</div><div class="col"><div class="time">'+fmtHM(item.ts)+'</div>'+body+cbtn+mchip+uchip+'</div>';
+    if(cbtn){
+      const cb=wrap.querySelector('.cont-btn');
+      if(cb)cb.onclick=()=>continueFrom(item,wrap);
+    }
   }
   return wrap;
 }
@@ -1259,6 +1279,82 @@ function finishLiveStream(item){
   liveCleanup();
   history.push(item);scrollKeep();
 }
+/* 「继续」：接着这条没写完的回答往下写。
+   服务端拿 partial 作为断点锚点让模型接着写，完成后把新内容接在原文后回写同一条记录
+   （历史不新增条目），所以这里也只就地重建这一个气泡。 */
+async function continueFrom(msg,wrapEl){
+  if(busy||!msg||!msg.id)return;
+  const bubble=wrapEl.querySelector('.bubble');
+  if(!bubble)return;
+  busy=true;sendBtn.disabled=true;controller=new AbortController();
+  const btn=wrapEl.querySelector('.cont-btn');
+  if(btn){btn.disabled=true;btn.textContent='续写中…'}
+  const base=msg.text||'';
+  let tail='',answeredModel='',lastUsage=null;
+  bubble.classList.add('live');
+  bubble.textContent=base;                    // 先按纯文本连续追加，结束时再统一渲染
+  const tspan=document.createElement('span');
+  tspan.className='cont-live';
+  bubble.appendChild(tspan);
+  const rebuild=()=>{
+    const item={role:'assistant',text:base.trim()+(tail.trim()?'\n\n'+tail.trim():''),ts:msg.ts,
+                model:msg.model||answeredModel,usage:lastUsage||msg.usage,
+                id:msg.id,interrupted:msg.interrupted};
+    const fresh=buildMsg(item);
+    wrapEl.replaceWith(fresh);
+    Object.assign(msg,item);
+    scrollKeep();
+  };
+  try{
+    const resp=await fetch('/api/chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify({query:'继续',model:modelKey,continue_msg_id:msg.id}),
+      signal:controller.signal
+    });
+    if(resp.status===401)throw new Error('登录已过期，请刷新页面重新登录');
+    if(!resp.ok||!resp.body)throw new Error('HTTP '+resp.status);
+    const reader=resp.body.getReader();const dec=new TextDecoder();
+    let bf='',completed=false;
+    while(true){
+      const{value,done}=await reader.read();if(done)break;
+      bf+=dec.decode(value,{stream:true});
+      const parts=bf.split('\n\n');bf=parts.pop();
+      for(const raw of parts){
+        const line=raw.trim();if(!line.startsWith('data:'))continue;
+        const payload=line.slice(5).trim();if(!payload)continue;
+        let ev=null;try{ev=JSON.parse(payload)}catch(e){continue}
+        if(ev.type==='answer'&&ev.delta){tail+=ev.delta;tspan.textContent=tail;scrollKeep();}
+        else if(ev.type==='done'){
+          if(ev.answer!==undefined&&!tail)tail=ev.answer;
+          if(ev.model_key)answeredModel=modelLabel(ev.model_key);
+          if(ev.usage&&(ev.usage.in||ev.usage.out))lastUsage=ev.usage;
+          completed=true;
+        }else if(ev.type==='error'){throw new Error(ev.message||'服务端流式错误');}
+      }
+      if(completed)break;
+    }
+    if(tail.trim())msg.interrupted=0;   // 确实续上了才算写完；没输出则保留按钮
+    rebuild();
+  }catch(err){
+    // 续写途中又断了：已续上的部分保留，按钮重新挂回，服务端也已将半截回写
+    msg.interrupted=1;
+    rebuild();
+    if(err&&err.name==='AbortError')toast('已停止续写');
+    else toast('续写中断：'+netErrMsg(err));
+  }finally{
+    busy=false;sendBtn.disabled=false;controller=null;
+  }
+}
+/* 断线后确认服务端是否已存下半截（存了就会返回 interrupted=1）→ 重绘出「继续」按钮 */
+async function confirmInterrupted(tries=4){
+  for(let i=0;i<tries;i++){
+    await new Promise(r=>setTimeout(r,700));
+    await loadServerHistory(false);   // 只更新数据不重绘，避免把本地刚显示的内容闪掉
+    if(history.length&&history[history.length-1].interrupted){renderAll();return true}
+  }
+  return false;
+}
 /* 网络类错误的友好文案：iOS Safari 断流报 "Load failed"，桌面报 "Failed to fetch" */
 function netErrMsg(err){
   const m=(err&&err.message)?String(err.message):'未知错误';
@@ -1380,8 +1476,9 @@ async function send(){
     if(err&&err.name==='AbortError'){
       push({role:'assistant',text:'⚠️ 已停止生成。'});
     }else if(answer&&answer.trim()){
-      // 生成中途断线：保留已生成的部分，不整条丢弃
-      push({role:'assistant',text:answer.trim()+'\n\n⚠️ 网络中断，以上是已生成的部分。可回复「继续」让我接着说'});
+      // 生成中途断线：先保留已生成的部分，再向服务端确认——它已把半截存下并标记「未完成」
+      push({role:'assistant',text:answer.trim()+'\n\n⚠️ 网络中断，以上是已生成的部分。'});
+      confirmInterrupted();   // 确认到后重绘，气泡下会出现「继续」按钮
     }else{
       push({role:'error',text:'请求出错：'+netErrMsg(err)});
     }

@@ -71,6 +71,9 @@ from build_mcp.web.store import (
     normalize_code,
     add_message,
     list_messages,
+    get_message,              # 续写：取要接着写的那条消息
+    update_message,           # 续写：补完后回写正文
+    prev_user_message,        # 续写：还原该条回答对应的原始提问
     recent_llm_messages,
     history_window_info,
     clear_messages,
@@ -768,6 +771,7 @@ class ChatRequest(BaseModel):
     query: str
     model: str = ""   # 前端选择的模型 key（见 config.yaml 的 llm_models）；空=用默认
     geo: Optional[GeoFix] = None   # 用户已授权精确定位时的坐标，优先于 IP 定位
+    continue_msg_id: Optional[int] = None   # 点「继续」时带上：要接着写下去的那条回答的消息 id
 
 
 class SeenRequest(BaseModel):
@@ -903,7 +907,8 @@ async def history(user: dict = Depends(require_user), limit: int = 200):
         "ws_mode": user_ws_mode(user),
         "messages": [
             {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"],
-             "model": m.get("model") or ""}
+             "model": m.get("model") or "",
+             "interrupted": int(m.get("interrupted") or 0)}
             for m in msgs
         ],
     }
@@ -1280,6 +1285,28 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         )
     # 图片：优先原生直传(DeepSeek 支持 image_url)；发不出去才降级 OCR 注入
     user_content, img_note = await _build_user_content(user, req.query)
+
+    # ── 「继续」：上一轮因断网/关页面/手动停止没写完，接着那条回答往下写 ──
+    #    关键在于让模型知道「我写到哪了、别重复」：那条未完成的回答已存在对话历史里
+    #    （interrupted=1），这里再补一条续写指令，并附上结尾锚点防止模型重头写。
+    cont_msg = None
+    cont_partial = ""
+    cont_note = ""
+    if req.continue_msg_id:
+        cont_msg = get_message(int(req.continue_msg_id), user["id"])
+        if not cont_msg or cont_msg["role"] != "assistant":
+            raise HTTPException(status_code=400, detail="要续写的回答不存在（可能历史已被清空）")
+        cont_partial = (cont_msg.get("text") or "").strip()
+        tail_hint = cont_partial[-500:]
+        cont_note = (
+            "\n\n[续写任务] 用户点的是「继续」：你上一条回答被截断了（网络中断、页面关闭或用户手动停止），"
+            "已生成的部分已在对话历史里（最后那条 assistant 消息）。请紧接着它往下写："
+            "直接输出后续内容，不要重复已经写过的段落，不要重新开头、不要复述前文摘要，"
+            "也不要解释或致歉。\n"
+            + (f"（你上次写到：「…{tail_hint}」——请从这之后接着写）" if tail_hint else "")
+        )
+        logger.info("↩️ 用户[%s] 续写消息 id=%s（已有 %d 字）",
+                    user["username"], cont_msg["id"], len(cont_partial))
     # 非管理员：明确告知没有服务器操作能力，避免模型反复试探或编造"已完成"
     perm_note = "" if is_admin(user) else (
         "\n\n[权限说明] 当前账号不具备服务器操作权限：你没有终端（terminal）类工具，"
@@ -1314,7 +1341,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
     history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + perm_note + admin_note}]
     for m in recent_llm_messages(user["id"]):
         history_messages.append({"role": m["role"], "content": m["text"]})
-    turn_note = (ip_note + geo_note + img_note).strip()
+    turn_note = (ip_note + geo_note + img_note + cont_note).strip()
     _hist_win = history_window_info()
 
     lock = _chat_locks.setdefault(user["id"], asyncio.Lock())
@@ -1327,6 +1354,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         answer: str | None = None
         failed = False
         used_model = ""
+        partial = ""   # 累积已推给前端的正文增量：中途断线时靠它守住半截回答
         try:
             # 同一用户串行：锁跨整个流式过程持有，防止上下文竞态。
             # 生产者/队列 + 心跳：模型长生成期间没有事件，移动网络(运营商 NAT/iOS Safari)
@@ -1362,6 +1390,8 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                         continue
                     if ev is _STOP:
                         break
+                    if ev.get("type") == "answer" and ev.get("delta"):
+                        partial += ev["delta"]
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
                         used_model = _spec["label"] or ev.get("model") or _spec["model"]
@@ -1386,10 +1416,26 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             failed = True
             yield _sse({"type": "error", "message": f"服务内部错误：{e}"})
         finally:
-            # 完整结束才写入历史（中止/出错不写，保持历史干净成对）
-            if answer is not None and answer.strip() and not failed:
+            _model_col = used_model or _spec["label"] or _spec["model"]
+            if cont_msg is not None:
+                # 续写：把新写的部分接到原文后面，回写同一条消息（历史不新增条目，保持成对）
+                tail = (answer or "").strip()
+                if tail:
+                    full = (cont_partial + "\n\n" + tail).strip() if cont_partial else tail
+                    update_message(cont_msg["id"], user["id"], full,
+                                   interrupted=0, model=_model_col or None)
+                    logger.info("✅ 续写完成并回写 id=%s（共 %d 字）", cont_msg["id"], len(full))
+                # 一个字都没续上：不动库，interrupted 保持 1，界面上的「继续」按钮还在
+            elif answer is not None and answer.strip() and not failed:
                 add_message(user["id"], "user", req.query)
                 add_message(user["id"], "assistant", answer.strip(), used_model)
+            elif partial.strip():
+                # 中途断线/出错/手动停止：把「提问 + 已生成的部分」成对落库，并标记未完成，
+                # 前端据此在气泡下显示「继续」按钮；重开页面/换设备也能接着写。
+                add_message(user["id"], "user", req.query)
+                add_message(user["id"], "assistant", partial.strip(),
+                            _model_col, interrupted=1)
+                logger.info("✂️ 回答未写完，已保存半截（%d 字）并标记可继续", len(partial.strip()))
 
     return StreamingResponse(
         event_gen(),
