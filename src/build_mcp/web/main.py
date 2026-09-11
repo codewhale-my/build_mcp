@@ -72,6 +72,7 @@ from build_mcp.web.store import (
     add_message,
     list_messages,
     recent_llm_messages,
+    history_window_info,
     clear_messages,
     user_filesystem_dir,
     set_user_seen_version,
@@ -1311,14 +1312,16 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
     #   而随轮变化的部分（公网 IP / GPS 坐标 / 图片说明）挂到最后一条用户消息——
     #   那里本来每轮就不同，吃掉它不影响任何缓存。见 conversation._compose_user_message。
     history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + perm_note + admin_note}]
-    for m in recent_llm_messages(user["id"], turns=8):
+    for m in recent_llm_messages(user["id"]):
         history_messages.append({"role": m["role"], "content": m["text"]})
     turn_note = (ip_note + geo_note + img_note).strip()
+    _hist_win = history_window_info()
 
     lock = _chat_locks.setdefault(user["id"], asyncio.Lock())
     _spec = resolve_llm_spec(req.model)
-    logger.info("💬 用户[%s] 提问 → 模型 %s(%s, thinking=%s)",
-                user["username"], _spec["model"], _spec["key"], _spec["thinking"])
+    logger.info("💬 用户[%s] 提问 → 模型 %s(%s, thinking=%s)｜历史 %d 条(窗口 %s/%d轮)",
+                user["username"], _spec["model"], _spec["key"], _spec["thinking"],
+                max(0, len(history_messages) - 1), _hist_win["mode"], _hist_win["turns"])
 
     async def event_gen():
         answer: str | None = None

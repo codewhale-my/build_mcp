@@ -337,15 +337,65 @@ def list_messages(user_id: int, limit: int = 200) -> list[dict]:
         conn.close()
 
 
-def recent_llm_messages(user_id: int, turns: int = 8) -> list[dict]:
-    """取最近 turns 轮（user+assistant 各一条计 1 轮）作为 LLM 上下文。"""
+# ---------------- LLM 历史窗口 ----------------
+# 两种取法（user+assistant 各一条计 1 轮）：
+#
+# slide 滑动窗口：永远取最近 N 轮。每来一轮窗口整体前移一条 → 历史前缀每轮都变，
+#   而 DeepSeek 前缀缓存是「从第 0 个 token 起逐字节比对」，于是固定前缀之外的历史
+#   永远按未命中价（命中价的 30 倍）计费。
+#
+# block 分块累积（默认）：窗口起点对齐到 N 轮的整数倍、并往回退一整块。块内每来一轮
+#   只是在**尾部追加**，起点不动 → 之前发过的历史前缀逐轮复用，命中率显著提高；
+#   攒满一整块才整体前移一次（即每 N 轮失效一次，而不是每轮）。
+#   窗口长度落在 [N, 2N) 轮之间，**永远不小于**滑动窗口，最多多出一倍上下文；
+#   多出来的部分走缓存命中价，因此总成本反而更低。
+_HISTORY_TURNS = int(os.environ.get("MCP_WEB_HISTORY_TURNS", "8"))
+_HISTORY_MODE = os.environ.get("MCP_WEB_HISTORY_MODE", "block").strip().lower()
+
+
+def _history_window(total: int, turns: int, mode: str = "block") -> tuple[int, int]:
+    """按消息总条数算出历史窗口的 (offset, limit)，offset = 跳过最老的多少条。
+
+    - slide：最近 turns 轮，offset = max(0, total - 2*turns)。
+    - block：起点 = floor(total / 2*turns) 的整数倍再往回退一整块，
+      窗口长度落在 [2*turns, 4*turns) 条；块内 total 递增时 offset 保持不变。
+    """
+    if total <= 0:
+        return 0, 0
+    turns = max(1, int(turns))
+    chunk = turns * 2                      # 一块 = turns 轮
+    if mode == "slide":
+        offset = max(0, total - chunk)
+    else:
+        offset = max(0, (total // chunk - 1) * chunk)
+    return offset, total - offset
+
+
+def history_window_info() -> dict:
+    """当前历史窗口配置（供日志 / 排障）。"""
+    return {"turns": _HISTORY_TURNS, "mode": _HISTORY_MODE}
+
+
+def recent_llm_messages(user_id: int, turns: int | None = None,
+                        mode: str | None = None) -> list[dict]:
+    """取作为 LLM 上下文的历史消息（默认分块累积窗口，见上方说明）。"""
+    turns = _HISTORY_TURNS if turns is None else turns
+    mode = _HISTORY_MODE if mode is None else mode
     conn = _conn()
     try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,)
+        ).fetchone()[0]
+        offset, limit = _history_window(int(total or 0), turns, mode)
+        if limit <= 0:
+            return []
         rows = conn.execute(
-            "SELECT id,role,text FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, turns * 2),
+            # 用 ASC + OFFSET：offset 即「跳过最老的多少条」，语义与 _history_window 一致。
+            # （注意别用 DESC + OFFSET——那样 OFFSET 是从最新那头开始跳的，方向正好相反。）
+            "SELECT id,role,text FROM messages WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
