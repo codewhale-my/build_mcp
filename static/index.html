@@ -1022,6 +1022,13 @@ function finishLiveStream(item){
   liveCleanup();
   history.push(item);scrollKeep();
 }
+/* 网络类错误的友好文案：iOS Safari 断流报 "Load failed"，桌面报 "Failed to fetch" */
+function netErrMsg(err){
+  const m=(err&&err.message)?String(err.message):'未知错误';
+  if(/Load failed|Failed to fetch|NetworkError|network connection was lost|The Internet connection|net::/i.test(m))
+    return '网络连接中断。手机锁屏、切换 Wi-Fi/流量或切后台太久都会导致断开；请回到页面检查网络后重试';
+  return m+'（若反复出现请确认服务是否正常）';
+}
 async function send(){
   const q=inputBox.value.trim();
   if(!q||busy)return;
@@ -1121,8 +1128,11 @@ async function send(){
     const el=liveMsgEl;el&&el.remove();liveCleanup();
     if(err&&err.name==='AbortError'){
       push({role:'assistant',text:'⚠️ 已停止生成。'});
+    }else if(answer&&answer.trim()){
+      // 生成中途断线：保留已生成的部分，不整条丢弃
+      push({role:'assistant',text:answer.trim()+'\n\n⚠️ 网络中断，以上是已生成的部分。可回复「继续」让我接着说'});
     }else{
-      push({role:'error',text:'请求出错：'+(err&&err.message?err.message:'未知错误')+'（请确认服务已启动）'});
+      push({role:'error',text:'请求出错：'+netErrMsg(err)});
     }
   }finally{
     busy=false;sendBtn.disabled=false;controller=null;

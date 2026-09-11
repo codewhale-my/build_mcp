@@ -21,7 +21,9 @@ import logging
 import os
 import secrets
 import shutil
+import subprocess
 import time
+import re
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,6 +544,83 @@ def _safe_user_file(user: dict, path: str) -> Path:
     return cand
 
 
+# ================== 图片 OCR：让纯文本模型也能"读到"图片里的文字 ==================
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+OCR_LANGS = "chi_sim+eng"
+OCR_TIMEOUT = 40          # 单张图片识别上限秒数
+OCR_MAX_CHARS = 1200      # 注入提示词的单图文本上限
+
+def _ocr_image(path: Path) -> str:
+    """调用 tesseract 识别图片文字；未安装 / 失败 / 超时一律返回空串。"""
+    if not shutil.which("tesseract"):
+        return ""
+    try:
+        r = subprocess.run(
+            ["tesseract", str(path), "stdout", "-l", OCR_LANGS, "--psm", "6"],
+            capture_output=True, text=True, timeout=OCR_TIMEOUT,
+        )
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+def _ocr_sidecar(path: Path) -> Path:
+    return path.with_name(path.name + ".ocr.txt")
+
+def _image_ocr_text(path: Path) -> str:
+    """取图片 OCR 文本：优先读缓存 sidecar，没有则现识别并落盘缓存。"""
+    side = _ocr_sidecar(path)
+    try:
+        if side.is_file():
+            return side.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    text = _ocr_image(path)
+    if text:
+        try:
+            side.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+    return text
+
+async def _image_note_for_query(user: dict, query: str) -> str:
+    """
+    扫描用户消息里的 [图片: 路径] 引用，把图片 OCR 文本注入系统提示词，
+    并禁止模型去 read_media_file / 终端读图片二进制（纯文本模型只会拿到乱码）。
+    """
+    refs = re.findall(r"\[图片:\s*([^\]]+?)\s*\]", query or "")
+    if not refs:
+        return ""
+    items = []
+    for raw in refs[:3]:
+        p = raw.strip()
+        try:
+            f = _safe_user_file(user, p)
+        except HTTPException:
+            items.append(f"- {p}：文件不存在或不在你的工作空间")
+            continue
+        if f.suffix.lower() not in IMG_EXTS:
+            items.append(f"- {f.name}：不是常见图片格式")
+            continue
+        text = await asyncio.to_thread(_image_ocr_text, f)
+        if text:
+            ell = "…" if len(text) > OCR_MAX_CHARS else ""
+            items.append(f"- {f.name}，OCR 识别到 {len(text)} 字：\n「{text[:OCR_MAX_CHARS]}{ell}」")
+        else:
+            items.append(f"- {f.name}：没有识别出文字（可能是照片/画面类图片，而非文字截图）")
+    if not items:
+        return ""
+    return (
+        "\n\n[图片内容（系统自动注入）] 用户在消息中引用了图片。当前模型无法直接观看图片画面，"
+        "回答涉及图片时请完全依据下面的 OCR 文本，并严格遵守：\n"
+        "1. 禁止调用 read_media_file / read_file / get_file_info / 终端命令去读取图片本体——"
+        "图片是二进制文件，读出来只会是乱码，浪费工具调用；\n"
+        "2. OCR 文本里有答案就直接回答，不要复述本段系统说明；\n"
+        "3. 若 OCR 文本为空或与问题无关（图片是照片、画面而非文字截图），"
+        "请坦诚告知用户：你目前只能读出图片里的文字，看不到画面内容。\n"
+        + "\n".join(items)
+    )
+
+
 @app.get("/api/files/download")
 async def file_download(
     path: str,
@@ -705,7 +784,9 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
             "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
         )
-    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note + geo_note}]
+    # 图片引用：预 OCR 并注入提示词（纯文本模型看不了图，只能给它文字）
+    img_note = await _image_note_for_query(user, req.query)
+    history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + ip_note + geo_note + img_note}]
     for m in recent_llm_messages(user["id"], turns=8):
         history_messages.append({"role": m["role"], "content": m["text"]})
 
@@ -719,24 +800,52 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         failed = False
         used_model = ""
         try:
-            # 同一用户串行：锁跨整个流式过程持有，防止上下文竞态
-            async with lock:
-                async for ev in agent_loop_stream(
-                    tool_name_to_session=tool_map,
-                    openai_tools=openai_tools,
-                    user_query=req.query,
-                    history_messages=history_messages,
-                    model_key=req.model,
-                ):
+            # 同一用户串行：锁跨整个流式过程持有，防止上下文竞态。
+            # 生产者/队列 + 心跳：模型长生成期间没有事件，移动网络(运营商 NAT/iOS Safari)
+            # 会掐断静默连接（前端报 Load failed），所以每 15s 发一条 SSE 注释帧保活。
+            queue: asyncio.Queue = asyncio.Queue()
+            _STOP = object()
+
+            async def producer():
+                try:
+                    async with lock:
+                        async for ev in agent_loop_stream(
+                            tool_name_to_session=tool_map,
+                            openai_tools=openai_tools,
+                            user_query=req.query,
+                            history_messages=history_messages,
+                            model_key=req.model,
+                        ):
+                            await queue.put(ev)
+                except Exception as e:
+                    logger.exception("❌ /api/chat 流式处理异常")
+                    await queue.put({"type": "error", "message": f"服务内部错误：{e}"})
+                finally:
+                    await queue.put(_STOP)
+
+            task = asyncio.create_task(producer())
+            try:
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"   # SSE 注释帧，前端解析器会忽略
+                        continue
+                    if ev is _STOP:
+                        break
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
                         used_model = _spec["label"] or ev.get("model") or _spec["model"]
                     elif ev.get("type") == "error":
                         failed = True
                     yield _sse(ev)
-        except asyncio.CancelledError:
-            # 客户端断开/中止：正常结束生成器，不落库
-            raise
+            except asyncio.CancelledError:
+                # 客户端断开/中止：取消生产者并正常结束生成器，不落库
+                task.cancel()
+                raise
+            finally:
+                if not task.done():
+                    task.cancel()
         except Exception as e:
             logger.exception("❌ /api/chat 流式处理异常")
             failed = True
