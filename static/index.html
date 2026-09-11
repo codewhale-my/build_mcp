@@ -669,13 +669,19 @@ function linkifyUserFiles(html){
   // 生成下载卡片；失败返回 null（调用方保留原文）
   const mk=(rel)=>{
     // 去掉结尾被顺带吸进来的常见标点/括号
-    const clean=rel.replace(/[，。、；：,.!?;:'")\]}>】》]+$/,'');
+    let clean=rel.replace(/[，。、；：,.!?;:'")\]}>】》]+$/,'');
+    // AI 有时把产出文件写成沙箱内绝对路径(如 /home/admin/fs_workspace/users/u1_xxx/a.docx)。
+    // 后端 /api/files/download 的语义是"相对用户沙箱根"，直接把绝对路径去掉一个 "/" 会拼出
+    // <沙箱>/home/admin/fs_workspace/... → 404 文件不存在。这里先归一化成相对沙箱根的路径。
+    const ROOT=(myUserRoot||'').replace(/\/+$/,'');
+    if(ROOT&&clean.startsWith(ROOT))clean=clean.slice(ROOT.length);
+    while(clean.startsWith('/'))clean=clean.slice(1);
     if(!clean||clean==='/')return null;
     const name=decodeURIComponent(clean.split('/').pop());
     // 最后一段没有扩展名 → 大概率是目录(如"查看工作目录"回复的路径),不做下载链接
     if(!name.includes('.'))return null;
     // 下载走新标签页直接导航，无法带 Authorization 头 → 把 token 拼进查询参数让后端认
-    const href='/api/files/download?path='+encodeURIComponent(clean.replace(/^\//,''))+
+    const href='/api/files/download?path='+encodeURIComponent(clean)+
       '&token='+encodeURIComponent(authToken);
     // 按扩展名着色的文件类型徽标 + 文件名 + 下载箭头
     const ext=(name.split('.').pop()||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,8);
