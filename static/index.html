@@ -108,6 +108,13 @@ header{
 }
 .hbtn:hover{color:var(--text);border-color:var(--border-strong);background:var(--panel-solid)}
 .hbtn svg{width:17px;height:17px}
+/* 有未读更新时的小红点 */
+.hbtn{position:relative}
+.hdot{
+  position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;
+  background:#ff4d4f;box-shadow:0 0 0 2px var(--panel);
+}
+.hdot[hidden]{display:none}
 /* 本机文件授权按钮(桌面 Chrome/Edge 目录授权, 其余浏览器降级上传) */
 .lbtn{
   display:inline-flex;align-items:center;gap:6px;height:31px;padding:0 11px;border-radius:9px;
@@ -490,6 +497,60 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 .auth-tip{font-size:11px;color:var(--text3);margin-top:16px;line-height:1.6}
 @keyframes shake{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}30%,50%,70%{transform:translateX(-6px)}40%,60%{transform:translateX(6px)}}
 .shake{animation:shake .5s ease}
+
+/* ============ 更新说明弹窗 ============ */
+.upd-overlay{
+  position:fixed;inset:0;z-index:210;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb, var(--bg0) 76%, transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  padding:20px;
+}
+.upd-overlay[hidden]{display:none}
+.upd-card{
+  width:min(560px,94vw);max-height:min(78vh,720px);display:flex;flex-direction:column;
+  background:var(--panel-solid);border:1px solid var(--border-strong);
+  border-radius:20px;box-shadow:var(--shadow);animation:pop .28s ease;overflow:hidden;
+}
+.upd-head{padding:22px 26px 14px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;gap:13px}
+.upd-badge{
+  flex:none;width:38px;height:38px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#3d6dff,#8b5cf6);font-size:19px;
+  box-shadow:0 8px 20px rgba(76,125,255,.3);
+}
+.upd-head h3{font-size:17px;margin:1px 0 5px}
+.upd-head .upd-sub{font-size:12.5px;color:var(--text2);line-height:1.6}
+.upd-body{padding:6px 26px 2px;overflow:auto;flex:1;text-align:left}
+.upd-item{padding:14px 0;border-bottom:1px dashed var(--border)}
+.upd-item:last-child{border-bottom:none}
+.upd-meta{display:flex;align-items:center;gap:8px;margin-bottom:7px;flex-wrap:wrap}
+.upd-ver{
+  font-size:11.5px;padding:2px 9px;border-radius:999px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:color-mix(in srgb, var(--accent1) 15%, transparent);
+  color:var(--accent1);
+  border:1px solid color-mix(in srgb, var(--accent1) 32%, transparent);
+}
+.upd-date{font-size:11.5px;color:var(--text3)}
+.upd-title{font-size:14.5px;font-weight:600;margin-bottom:8px;color:var(--text)}
+.upd-item ul{margin:0;padding-left:19px}
+.upd-item li{font-size:13px;color:var(--text2);line-height:1.78;margin-bottom:5px}
+.upd-item li::marker{color:var(--accent1)}
+.upd-foot{padding:14px 26px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--border)}
+.upd-tip{font-size:11.5px;color:var(--text3);line-height:1.5}
+.upd-ok{
+  flex:none;padding:10px 26px;border:none;border-radius:11px;cursor:pointer;
+  background:var(--user-grad);color:#fff;font-size:14px;font-weight:600;transition:.18s;
+}
+.upd-ok:hover{opacity:.92;transform:translateY(-1px)}
+@media (max-width:600px){
+  .upd-overlay{padding:12px}
+  .upd-card{max-height:82vh;border-radius:17px}
+  .upd-head{padding:17px 18px 12px}
+  .upd-body{padding:4px 18px 2px}
+  .upd-foot{padding:12px 18px 15px}
+  .upd-ok{padding:9px 18px;font-size:13.5px}
+  .upd-tip{display:none}
+}
 </style>
 </head>
 <body>
@@ -506,6 +567,24 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
     <input id="authInvite" class="auth-input" type="text" placeholder="邀请码（新用户注册时填写）" autocomplete="off">
     <button id="authLoginBtn" class="auth-btn">登 录 / 注 册</button>
     <p id="authErr" class="auth-err"></p>
+  </div>
+</div>
+
+<!-- 更新说明层（登录后若有未读更新自动弹出；顶栏「更新日志」按钮可随时重开） -->
+<div id="updOverlay" class="upd-overlay" hidden>
+  <div class="upd-card">
+    <div class="upd-head">
+      <div class="upd-badge">✨</div>
+      <div>
+        <h3 id="updHeadTitle">版本更新</h3>
+        <div class="upd-sub" id="updHeadSub">看看这次更新了什么</div>
+      </div>
+    </div>
+    <div class="upd-body" id="updBody"></div>
+    <div class="upd-foot">
+      <span class="upd-tip" id="updTip"></span>
+      <button class="upd-ok" id="updOk">知道了</button>
+    </div>
   </div>
 </div>
 
@@ -528,6 +607,10 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
     </div>
     <div class="hbtns">
       <span id="userBadge" class="user-badge" hidden></span>
+      <button class="hbtn" id="updBtn" title="更新日志">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.6l1.9 5.5 5.5 1.9-5.5 1.9L12 17.4l-1.9-5.5L4.6 10l5.5-1.9z"/><path d="M18.6 15.3l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/></svg>
+        <span class="hdot" id="updDot" hidden></span>
+      </button>
       <button class="hbtn" id="clearBtn" title="清空对话">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14z"/></svg>
       </button>
@@ -1071,6 +1154,7 @@ async function doAuth(){
       await loadServerHistory();   // 拉取该用户自己的历史
       await loadModels();          // 拉取可选模型清单
       localStatus();wsStart();await restoreLocalHandle();geoRender();
+      loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
       if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;
@@ -1094,6 +1178,9 @@ async function doLogout(){
   geoEnabled=false;geoFix=null;
   try{localStorage.removeItem(GEO_PREF)}catch(e){}
   geoRender();
+  updData=null;                       // 更新说明数据随账号走，退出即清
+  if(updOverlay)updOverlay.hidden=true;
+  if(updDot)updDot.hidden=true;
   localStatus();
   history=[];renderAll();updateUserBadge();
   if(authPwd)authPwd.value='';
@@ -1611,6 +1698,77 @@ geoRender();
 /* =============== 精确定位 end =============== */
 /* =============== 本机文件桥 end =============== */
 
+/* =============== 更新说明(What's New) =============== */
+// 数据源与"是否已读"都在服务端：/api/whatsnew 返回 unseen（没看过的新版本）+ entries（全部）。
+// 看过与否按用户维度记在 users.last_seen_version，换设备/清缓存都不会重复弹。
+let updData=null;
+const updOverlay=$('#updOverlay'), updBody=$('#updBody'), updOkBtn=$('#updOk'),
+      updDot=$('#updDot'), updHeadTitle=$('#updHeadTitle'), updHeadSub=$('#updHeadSub'),
+      updTip=$('#updTip'), updBtn=$('#updBtn');
+function updEsc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function updItemHtml(e){
+  const pts=(e.points||[]).map(p=>'<li>'+updEsc(p)+'</li>').join('');
+  return '<div class="upd-item">'
+    +'<div class="upd-meta"><span class="upd-ver">'+updEsc(e.version)+'</span>'
+    +(e.date?'<span class="upd-date">'+updEsc(e.date)+'</span>':'')+'</div>'
+    +(e.title?'<div class="upd-title">'+updEsc(e.title)+'</div>':'')
+    +(pts?'<ul>'+pts+'</ul>':'')
+    +'</div>';
+}
+async function loadWhatsNew(auto){
+  if(!authToken)return null;
+  try{
+    const r=await fetch('/api/whatsnew',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return null;
+    updData=await r.json();
+  }catch(e){return null}
+  const hasNew=!!(updData&&updData.should_show);
+  if(updDot)updDot.hidden=!hasNew;
+  if(auto&&hasNew)showWhatsNew('unseen');   // 登录后自动弹
+  return updData;
+}
+function showWhatsNew(mode){
+  if(!updOverlay||!updData)return;
+  const list=(mode==='all')?(updData.entries||[]):(updData.unseen||[]);
+  if(!list.length)return;
+  updHeadTitle.textContent=(mode==='all')?'更新日志':('版本更新 · '+list[0].version);
+  updHeadSub.textContent=(mode==='all')
+    ?('共 '+list.length+' 个版本，最新 '+updData.latest)
+    :'本次更新内容如下';
+  updTip.textContent=(mode==='all')?'':'关闭后不再重复提醒';
+  updBody.innerHTML=list.map(updItemHtml).join('');
+  updOverlay.hidden=false;
+  updBody.scrollTop=0;
+}
+async function closeWhatsNew(){
+  if(updOverlay)updOverlay.hidden=true;
+  const unseen=(updData&&updData.unseen)||[];
+  const latest=(updData&&updData.latest)||'';
+  if(updDot)updDot.hidden=true;
+  if(!unseen.length)return;              // 只是翻看历史，无需上报
+  if(updData){updData.should_show=false;updData.unseen=[]}
+  try{
+    await fetch('/api/whatsnew/seen',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify({version:latest})
+    });
+  }catch(e){/* 上报失败也无所谓，下次登录再弹一次而已 */}
+}
+if(updOkBtn)updOkBtn.onclick=()=>closeWhatsNew();
+if(updOverlay)updOverlay.addEventListener('click',e=>{if(e.target===updOverlay)closeWhatsNew()});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&updOverlay&&!updOverlay.hidden)closeWhatsNew();
+});
+if(updBtn)updBtn.onclick=async()=>{
+  if(!updData)await loadWhatsNew(false);
+  if(!updData||!(updData.entries||[]).length){toast('暂时没有更新内容');return}
+  showWhatsNew((updData.unseen||[]).length?'unseen':'all');   // 有未读先看未读，否则翻全部
+};
+/* =============== 更新说明 end =============== */
+
 (async function initAuth(){
   if(!authToken){showAuth();return}
   try{
@@ -1623,6 +1781,7 @@ geoRender();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
       await loadModels();          // 可选模型清单
       localStatus();wsStart();await restoreLocalHandle();geoRender();
+      loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
       if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
       inputBox.focus();
       return;

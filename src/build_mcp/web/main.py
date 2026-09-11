@@ -57,6 +57,7 @@ from build_mcp.client.conversation import (
 )
 from mcp.client.session import ClientSession
 from build_mcp.web import store
+from build_mcp.web.whatsnew import latest_version, payload_for
 from build_mcp.web.store import (
     init_db,
     get_user_by_id,
@@ -70,6 +71,7 @@ from build_mcp.web.store import (
     recent_llm_messages,
     clear_messages,
     user_filesystem_dir,
+    set_user_seen_version,
     USERNAME_RE,
     verify_password,
 )
@@ -415,6 +417,11 @@ class ChatRequest(BaseModel):
     geo: Optional[GeoFix] = None   # 用户已授权精确定位时的坐标，优先于 IP 定位
 
 
+class SeenRequest(BaseModel):
+    """把某次更新标记为"已看过"。version 留空则用当前最新版本。"""
+    version: str = ""
+
+
 @app.post("/api/auth")
 async def auth(req: AuthRequest, request: Request):
     """
@@ -477,6 +484,27 @@ async def me(user: dict = Depends(require_user)):
 async def models(user: dict = Depends(require_user)):
     """可选回答模型清单（前端下拉用）：默认项 + 每个模型的 key/label/model/thinking。"""
     return list_llm_models()
+
+
+@app.get("/api/whatsnew")
+async def whatsnew(user: dict = Depends(require_user)):
+    """
+    更新说明：返回全部条目 + 该用户尚未看过的新条目。
+
+    是否自动弹窗由 should_show 决定（登录后前端拿它判断），
+    看过与否按用户维度记在 users.last_seen_version（跨设备一致，清缓存也不重复弹）。
+    """
+    row = get_user_by_id(user["id"]) or {}
+    return payload_for(row.get("last_seen_version") or "")
+
+
+@app.post("/api/whatsnew/seen")
+async def whatsnew_seen(req: SeenRequest, user: dict = Depends(require_user)):
+    """把更新标记为已看过（用户关掉弹窗时调用），下次登录不再弹。"""
+    version = (req.version or "").strip() or latest_version()
+    if version:
+        set_user_seen_version(user["id"], version)
+    return {"ok": True, "version": version}
 
 
 @app.get("/api/history")

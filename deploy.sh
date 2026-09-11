@@ -112,7 +112,7 @@ if [ "$code" != "200" ]; then
 fi
 if [ "$code" = "200" ]; then
   printf '   HTTP 200 ✅  页面OK  (%s)\n' "$WEB_URL"
-  grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|geoBtn\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
+  grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|geoBtn\|updOverlay\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
   rm -f /tmp/_hj_deploy.html
   printf '\n\033[1;32m✅ 部署完成\033[0m   （服务端 token 是内存态，浏览器请刷新页面重新登录）\n'
   exit 0

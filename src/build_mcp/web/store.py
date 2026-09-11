@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS users(
   username   TEXT NOT NULL UNIQUE,
   pass_salt  TEXT NOT NULL,
   pass_hash  TEXT NOT NULL,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  last_seen_version TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS invite_codes(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,10 +98,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """轻量迁移：给已有库补上新增列（老库没有 model 列）。"""
+    """轻量迁移：给已有库补上新增列（老库可能缺 model / last_seen_version）。"""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
     if "model" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+
+    ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "last_seen_version" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN last_seen_version TEXT NOT NULL DEFAULT ''")
 
 
 def init_db(import_env_codes: str = ""):
@@ -153,6 +158,19 @@ def get_user_by_id(uid: int) -> dict | None:
     try:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_user_seen_version(uid: int, version: str) -> None:
+    """记录该用户已看过的最新更新版本（用于"下次不再弹窗"）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET last_seen_version=? WHERE id=?",
+                ((version or "").strip(), uid),
+            )
     finally:
         conn.close()
 
