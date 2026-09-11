@@ -284,9 +284,9 @@ cd /home/administrator/build-mcp
 | 浏览器精确定位 | 前端「开启定位」按钮授权后，每轮对话带 `geo{lat,lng,acc}` | GPS/WiFi 级（米级） | ⚠️ **必须 HTTPS**，浏览器才给定位权限 |
 | IP 定位 | 未授权精确定位时，服务端把用户公网 IP 注入上下文 | 城市级 | 高德 `/v3/ip` + 备用免费库 |
 
-⚠️ **`http://47.108.234.194:8000` 是明文 http，浏览器不会开放 Geolocation**（安全上下文限制），
-所以前端按钮会显示「定位需HTTPS」，并在点击时提示；此时自动回落 IP 定位。
-等域名 + ICP 备案 + HTTPS 配好（同一份代码，无需改动）后，按钮即可正常开启精确定位。
+✅ **2026-09-11 起已上 HTTPS**：正式地址 `https://47.108.234.194`（nginx 443 → 127.0.0.1:8000），
+浏览器安全上下文成立，前端「开启定位」按钮可直接授权使用，见 §12。
+原 `http://47.108.234.194:8000` 仍保留为退路（仅建议调试时用：登录密码是明文传输的）。
 
 IP 定位兜底链（`src/build_mcp/services/ip_locate.py`，全部免 key）：
 `pconline`（0.1s，中文名最准）→ `ipinfo.io`（0.4s，阿里云北京可达）→ `ipwho.is`（大陆机房常超时，放最后）。
@@ -304,4 +304,84 @@ s = GdSDK(config={"base_url": "https://restapi.amap.com", "api_key": cfg["api_ke
 print(json.dumps(asyncio.run(s.locate_ip("39.144.137.222")), ensure_ascii=False))
 PY'
 # 期望：source=pconline, province=四川省, city=成都市, location=104.066301,30.572961
+```
+
+---
+
+## 12. HTTPS（纯 IP，2026-09-11 上线）
+
+### 现状
+- 正式地址：**https://47.108.234.194**（nginx 443 → `127.0.0.1:8000`），浏览器绿锁、可用于 Geolocation。
+- 证书：**Let's Encrypt 的 IP 地址证书**（`certbot --ip-address` + `--preferred-profile shortlived`），
+  **有效期只有 160 小时（≈6.7 天）**，由 GitHub Actions 自动续期。
+- 80 端口：只服务 `/.well-known/acme-challenge/`，其余 301 跳 HTTPS。
+- `http://47.108.234.194:8000` 保留为退路（**登录密码是明文传输的**，平时别用）。
+
+### 为什么续期要放在 GitHub Actions 上（关键背景）
+Let's Encrypt 从 2026-01 起对 IP 地址签发证书，但 IP 证书**必须**用 shortlived profile，
+且**只能用 http-01 / tls-alpn-01 验证**（IP 没有 DNS 记录，无法用 dns-01）。
+
+而本服务器访问 `acme-v02.api.letsencrypt.org` 被**定向阻断**：实测 0/10 全部超时，
+换 6 个 Cloudflare IP、IP 直连、staging 全失败；但同在 Cloudflare 的 `get.acme.sh` 是 200 / 0.88s。
+→ **签发和续期必须由一台能连上 LE 的机器完成**，这里选 GitHub 的 runner（不依赖任何人的电脑开机）。
+
+### 整体链路
+```
+GitHub Actions runner（能连 LE）
+  ├─ 1. certbot --manual --preferred-challenges http --ip-address 47.108.234.194
+  ├─ 2. auth hook 经 SSH 把 challenge 文件写进服务器 /var/www/letsencrypt/.well-known/acme-challenge/
+  ├─ 3. LE 从公网访问 http://47.108.234.194/.well-known/... 完成验证
+  └─ 4. 证书推回服务器 /etc/nginx/ssl/hjmcp-ip.{crt,key}，nginx -t 后 reload
+```
+
+### 相关文件
+| 文件 | 作用 |
+|---|---|
+| `.github/workflows/renew-ip-cert.yml` | 每天 02:17 UTC 检查 + 可手动触发；证书剩余 <3 天才真正签发；失败 GitHub 会发邮件 |
+| `.github/scripts/acme-auth.sh` | certbot http-01 验证 hook：把 challenge 写到服务器 webroot |
+| `.github/scripts/acme-cleanup.sh` | 验证完成后清理 challenge 文件 |
+| `.github/scripts/deploy-cert.sh` | 推送证书 + `nginx -t` + reload + curl 自检（本机也能手动跑） |
+| `deploy/nginx-hjmcp.conf` | 80 验证+301 / 443 TLS 反代（WebSocket Upgrade、`XFF=$remote_addr`、`proxy_buffering off`） |
+
+### 仓库 Secret（一次性配置）
+`DEPLOY_SSH_KEY` = 能免密登录服务器的私钥；对应公钥已加进服务器 `~/.ssh/authorized_keys`（备注 `github-actions-ip-cert`）。
+位置：仓库 → Settings → Secrets and variables → Actions → New repository secret。
+
+### 手动操作
+```bash
+# 1) 手动触发续期：仓库 → Actions → renew-ip-cert → Run workflow
+#    勾选 force 可跳过"剩余 >3 天"检查，强制重签（首次验证全链路时用）
+
+# 2) 本机手动签发 + 部署（Actions 出问题时的兜底；签发端需能连 LE）
+cd ~/build-mcp
+export DEPLOY_HOST=47.108.234.194 DEPLOY_USER=admin
+export CERT_FILE=~/https-attempt/certbot-prod/config/live/47.108.234.194/fullchain.pem
+export KEY_FILE=~/https-attempt/certbot-prod/config/live/47.108.234.194/privkey.pem
+./.github/scripts/deploy-cert.sh
+
+# 3) 改完 nginx 配置后
+ssh admin@47.108.234.194 "sudo tee /etc/nginx/sites-available/hjmcp > /dev/null" < deploy/nginx-hjmcp.conf
+ssh admin@47.108.234.194 "sudo nginx -t && sudo systemctl reload nginx"
+```
+
+### 验证
+```bash
+curl -sI http://47.108.234.194/                                                    # 期望 301 → https
+curl -s -o /dev/null -w '%{http_code} tls=%{ssl_verify_result}\n' https://47.108.234.194/   # 期望 200 tls=0
+echo | openssl s_client -connect 47.108.234.194:443 2>/dev/null | openssl x509 -noout -dates -ext subjectAltName
+# 期望 subjectAltName 里有 IP Address:47.108.234.194
+```
+
+### ⚠️ 注意事项
+- **不要开 HSTS**：IP 证书只有 6 天，一旦某次续期失败，HSTS 会让用户连"继续访问"的机会都没有。
+- **GitHub 定时任务有 60 天不活动限制**：仓库若连续 60 天没有任何 push，scheduled workflow 会被自动停用。
+  长期不提交代码时，记得去 Actions 页面确认任务还在跑。
+- 续期失败时 GitHub 会给仓库 owner 发邮件；也可以随时 `curl -sI https://47.108.234.194/` 看证书是否正常。
+- 域名 + ICP 备案下来后换成域名证书（阿里云免费 DV，90 天）：nginx 里只改 `server_name` 和证书路径，
+  还能顺手开 HSTS，那时就不再需要这套"6 天一续"的机制了。
+
+### 回滚（退回纯 8000）
+```bash
+ssh admin@47.108.234.194 "sudo rm -f /etc/nginx/sites-enabled/hjmcp && sudo systemctl disable --now nginx"
+# 8000 完全不受影响；如需彻底清掉 80 端口配置，再删 /etc/nginx/sites-available/hjmcp
 ```

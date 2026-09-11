@@ -92,17 +92,24 @@ jobs:
         if: steps.check.outputs.need == '1'
         run: |
           set -euo pipefail
-          python3 -m venv /tmp/certbot-venv
-          /tmp/certbot-venv/bin/pip install --quiet --upgrade pip
-          /tmp/certbot-venv/bin/pip install --quiet certbot
-          /tmp/certbot-venv/bin/certbot --version
+          # runner 上优先用独立 venv；万一没装 python3-venv 就退回 pip --user
+          if python3 -m venv /tmp/certbot-venv >/dev/null 2>&1; then
+            /tmp/certbot-venv/bin/pip install --quiet --upgrade pip
+            /tmp/certbot-venv/bin/pip install --quiet certbot
+            CB_PATH=/tmp/certbot-venv/bin/certbot
+          else
+            python3 -m pip install --quiet --user --upgrade certbot
+            CB_PATH="$HOME/.local/bin/certbot"
+          fi
+          echo "CB=$CB_PATH" >> "$GITHUB_ENV"
+          "$CB_PATH" --version
 
       - name: 签发新证书
         if: steps.check.outputs.need == '1'
         run: |
           set -euo pipefail
           chmod +x .github/scripts/acme-auth.sh .github/scripts/acme-cleanup.sh
-          /tmp/certbot-venv/bin/certbot certonly \
+          "$CB" certonly \
             --non-interactive --agree-tos --register-unsafely-without-email \
             --manual --preferred-challenges http \
             --preferred-profile shortlived \

@@ -32,7 +32,9 @@ HOST="${HOST:-admin@47.108.234.194}"
 
 RUSER="${HOST%@*}"
 REMOTE_DIR="/home/${RUSER}/build-mcp"
-WEB_URL="${WEB_URL:-http://${HOST#*@}:8000}"
+# 公网自检优先走 HTTPS（nginx 443 → 127.0.0.1:8000），失败再退回裸 8000
+WEB_URL="${WEB_URL:-https://${HOST#*@}}"
+FALLBACK_URL="${FALLBACK_URL:-http://${HOST#*@}:8000}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 step() { printf '\n\033[1;36m▶ %s\033[0m\n' "$1"; }
@@ -100,8 +102,16 @@ ssh -o BatchMode=yes "$HOST" \
 step "公网健康检查  ${WEB_URL}"
 # --noproxy '*'：避免本机 curl 走代理导致误报 000
 code="$(curl -s --noproxy '*' -o /tmp/_hj_deploy.html -w '%{http_code}' -m 10 "$WEB_URL/" || true)"
+if [ "$code" != "200" ]; then
+  printf '   HTTPS 探测返回 %s，退回裸 8000 再试一次…\n' "${code:-失败}"
+  WEB_URL="$FALLBACK_URL"
+  code="$(curl -s --noproxy '*' -o /tmp/_hj_deploy.html -w '%{http_code}' -m 10 "$WEB_URL/" || true)"
+  if [ "$code" = "200" ]; then
+    printf '\033[1;33m   ⚠️  只有 8000 通、443 不通 —— 多半是证书过期（IP 证书 6 天一次，看 GitHub Actions 有没有跑失败）\033[0m\n'
+  fi
+fi
 if [ "$code" = "200" ]; then
-  printf '   HTTP 200 ✅  页面OK\n'
+  printf '   HTTP 200 ✅  页面OK  (%s)\n' "$WEB_URL"
   grep -o 'HJ_MCP Agent\|fileInput\|modelBtn\|geoBtn\|新建工作空间' /tmp/_hj_deploy.html | sort -u | sed 's/^/   命中: /'
   rm -f /tmp/_hj_deploy.html
   printf '\n\033[1;32m✅ 部署完成\033[0m   （服务端 token 是内存态，浏览器请刷新页面重新登录）\n'
@@ -109,6 +119,6 @@ if [ "$code" = "200" ]; then
 fi
 rm -f /tmp/_hj_deploy.html
 printf '\n\033[1;31m❌ 公网探测返回 HTTP %s\033[0m\n' "${code:-失败}"
-echo "   服务本机是通的，公网不通多半是安全组/防火墙拦截 8000，或本机网络问题："
+echo "   服务本机是通的，公网不通多半是安全组/防火墙拦截，或本机网络问题："
 echo "   curl -v --noproxy '*' ${WEB_URL}/"
 exit 1
