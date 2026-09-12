@@ -385,6 +385,8 @@ header{
 }
 .cont-btn:hover{color:#fff;background:#2563eb;border-style:solid;border-color:#2563eb}
 .cont-btn[disabled]{opacity:.55;cursor:default}
+/* 续写活动状态行：模型可能先去调工具，必须让用户看见它在动，而不是「点了没反应」 */
+.cont-act{margin-top:9px;font-size:12.5px;color:var(--accent1);line-height:1.5}
 .cont-hint{font-size:12px;color:var(--text2,#8b949e);margin-left:8px}
 .cont-live{white-space:pre-wrap}
 /* ---------- 流式消息：头部行/停止按钮/工具徽章 ---------- */
@@ -1323,6 +1325,7 @@ async function continueFrom(msg,wrapEl){
     Object.assign(msg,item);
     scrollKeep();
   };
+  let actTimer=null;   // 必须在 try 外声明：finally 里要 clearInterval
   try{
     const resp=await fetch('/api/chat',{
       method:'POST',
@@ -1334,6 +1337,21 @@ async function continueFrom(msg,wrapEl){
     if(!resp.ok||!resp.body)throw new Error('HTTP '+resp.status);
     const reader=resp.body.getReader();const dec=new TextDecoder();
     let bf='',completed=false;
+    // 续写途中模型可能先「去做事」（调工具）——这类事件过去在这里被完全丢掉，
+    // 于是界面长时间一动不动，用户就以为「点了没反应」。
+    // 这里维护一行活动状态，把它在干什么实时显示出来。
+    let actEl=null,actBase='',actAt=0;
+    const setAct=t=>{
+      actBase=t;actAt=Date.now();
+      if(!actEl){actEl=document.createElement('div');actEl.className='cont-act';bubble.appendChild(actEl)}
+      actEl.textContent=t;scrollKeep();
+    };
+    actTimer=setInterval(()=>{
+      if(!actEl||!actAt)return;
+      const s=Math.floor((Date.now()-actAt)/1000);
+      if(s>=8)actEl.textContent=actBase+'（已等待 '+s+' 秒）';
+    },1000);
+    setAct('⏳ 正在续写，请稍候…');
     while(true){
       const{value,done}=await reader.read();if(done)break;
       bf+=dec.decode(value,{stream:true});
@@ -1343,7 +1361,12 @@ async function continueFrom(msg,wrapEl){
         const payload=line.slice(5).trim();if(!payload)continue;
         let ev=null;try{ev=JSON.parse(payload)}catch(e){continue}
         if(ev.type==='answer'&&ev.delta){tail+=ev.delta;tspan.textContent=tail;scrollKeep();}
-        else if(ev.type==='done'){
+        else if(ev.type==='tool'&&ev.name){
+          const nm=TOOL_LABEL[ev.name]||ev.name;
+          if(ev.status==='ok')setAct('✅ '+nm+' 完成');
+          else if(ev.status==='fail')setAct('⚠️ '+nm+' 失败');
+          else setAct('🔧 '+nm+'…');
+        }else if(ev.type==='done'){
           if(ev.answer!==undefined&&!tail)tail=ev.answer;
           if(ev.model_key)answeredModel=modelLabel(ev.model_key);
           if(ev.usage&&(ev.usage.in||ev.usage.out))lastUsage=ev.usage;
@@ -1361,6 +1384,7 @@ async function continueFrom(msg,wrapEl){
     if(err&&err.name==='AbortError')toast('已停止续写');
     else toast('续写中断：'+netErrMsg(err));
   }finally{
+    clearInterval(actTimer);
     busy=false;sendBtn.disabled=false;controller=null;
   }
 }
