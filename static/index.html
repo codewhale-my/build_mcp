@@ -2,7 +2,7 @@
 <html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>HJ_MCP Agent🐋 · 全能助手</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✨</text></svg>">
 <script>
@@ -14,6 +14,11 @@
     document.documentElement.setAttribute('data-theme', t);
   }catch(e){}
 })();
+// 锁缩放兜底：iOS Safari 会忽略 viewport 的 user-scalable=no，用 Safari 专有 gesture 事件再拦一层。
+// 只拦双指缩放手势，不动 touchend，因此点击、滚动、代码块横向滑动都不受影响。
+['gesturestart','gesturechange','gestureend'].forEach(function(n){
+  document.addEventListener(n, function(e){ e.preventDefault(); }, {passive:false});
+});
 </script>
 <style>
 :root{
@@ -59,13 +64,19 @@ html[data-theme="light"]{
   color-scheme:light;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%}
+/* 手机端锁死缩放：
+   touch-action:pan-x pan-y = 允许两方向平移、【不允许】双指缩放和双击缩放
+   （不含 pinch-zoom，因此 iOS/Android 都无法再缩放，也不会把页面拉偏） */
+html,body{
+  height:100%;width:100%;max-width:100%;overflow:hidden;
+  overscroll-behavior:none;
+  touch-action:pan-x pan-y;
+}
 body{
   font-family:var(--font);
   background:var(--bg1);
   color:var(--text);
   -webkit-font-smoothing:antialiased;
-  overflow:hidden;
 }
 /* 背景氛围光斑 */
 body::before{
@@ -76,7 +87,9 @@ body::before{
     radial-gradient(900px 700px at 50% 120%, var(--glow), transparent 60%);
 }
 .app{
-  position:relative;z-index:1;height:100dvh;max-width:880px;margin:0 auto;
+  /* 用 svh（地址栏展开时的最小视口高）而不是 dvh：dvh 会随地址栏显隐实时变高变矮，
+     整个界面跟着上下抽动，就是手机上“晃来晃去”的来源之一 */
+  position:relative;z-index:1;height:100vh;height:100svh;max-width:880px;margin:0 auto;
   display:flex;flex-direction:column;padding:0 18px;
 }
 /* ============ 顶栏 ============ */
@@ -338,8 +351,12 @@ header{
   font-family:var(--mono);font-size:12.8px;background:var(--code-bg);
   border:1px solid var(--border);padding:1.5px 6px;border-radius:6px;
 }
+/* 图片/视频/画布兜底：任何情况下都不许撑破气泡宽度（否则整行超宽，左侧头像会被推出屏幕） */
+.bubble img,.bubble video,.bubble canvas,.bubble iframe{
+  max-width:100%;height:auto;border-radius:10px;
+}
 .bubble pre{
-  margin:10px 0;padding:12px 14px;border-radius:12px;overflow:auto;
+  margin:10px 0;padding:12px 14px;border-radius:12px;overflow:auto;max-width:100%;
   background:var(--code-bg);border:1px solid var(--border);
 }
 .bubble pre code{background:none;border:none;padding:0;font-size:12.8px;line-height:1.6;display:block}
@@ -496,7 +513,8 @@ header{
 /* ============ 移动端 ============ */
 button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 @media (max-width:600px){
-  .app{padding:0 10px}
+  /* 左右留出刘海/挖孔的安全区，横屏时头像一个都不会被遮住 */
+  .app{padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
   header{padding:9px 2px;gap:8px}
   .brand{gap:8px}
   .brand>div{min-width:0}
