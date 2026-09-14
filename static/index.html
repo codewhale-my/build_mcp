@@ -2062,8 +2062,48 @@ function attachAdd(file){
   attachList.push(a);attachRender();
   return a;
 }
+/* 大图先压再传：>1.5MB 的位图用 canvas 缩到长边≤2048 的 JPEG（质量0.85）。
+   否则会出现「上传成功但超过后端单图上限 → 图片没随消息发出去 → 模型看不到画面」。
+   解码失败（如桌面端浏览器不认 HEIC）就原样上传，不做任何处理。 */
+const SHRINK_OVER=1.5*1024*1024, SHRINK_SIDE=2048;
+function shrinkImage(file){
+  return new Promise(res=>{
+    try{
+      if(!file||file.size<=SHRINK_OVER)return res(file);
+      const t=file.type||'';
+      if(t.indexOf('image/')!==0||t==='image/gif'||t==='image/svg+xml')return res(file);
+      const url=URL.createObjectURL(file), img=new Image();
+      let done=false;
+      const fallback=()=>{if(!done){done=true;try{URL.revokeObjectURL(url)}catch(e){}res(file)}};
+      img.onload=()=>{
+        try{
+          const sc=Math.min(1,SHRINK_SIDE/Math.max(img.naturalWidth||1,img.naturalHeight||1));
+          const w=Math.max(1,Math.round((img.naturalWidth||1)*sc)),h=Math.max(1,Math.round((img.naturalHeight||1)*sc));
+          const cv=document.createElement('canvas');cv.width=w;cv.height=h;
+          cv.getContext('2d').drawImage(img,0,0,w,h);
+          cv.toBlob(b=>{
+            if(done)return;
+            done=true;try{URL.revokeObjectURL(url)}catch(e){}
+            try{
+              if(b&&b.size>0&&b.size<file.size){
+                const nm=((file.name||'image').replace(/\.[^.]+$/,'')||'image')+'.jpg';
+                res(new File([b],nm,{type:'image/jpeg',lastModified:Date.now()}));
+              }else res(file);
+            }catch(e){res(file)}
+          },'image/jpeg',0.85);
+          setTimeout(fallback,5000);
+        }catch(e){fallback()}
+      };
+      img.onerror=()=>{try{URL.revokeObjectURL(url)}catch(e){}res(file)};
+      img.src=url;
+    }catch(e){res(file)}
+  });
+}
 /* 单文件上传：用 XHR 以便拿到真实进度 */
-function attachUpload(a,file){
+async function attachUpload(a,file){
+  try{file=await shrinkImage(file)}catch(e){}
+  if(file&&file.name)a.name=file.name;
+  if(file&&file.type)a.type=file.type;
   return new Promise(resolve=>{
     const fd=new FormData();fd.append('file',file,a.name);
     let xhr;

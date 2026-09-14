@@ -1046,99 +1046,24 @@ def _safe_user_file(user: dict, path: str) -> Path:
     return cand
 
 
-# ================== 图片 OCR：让纯文本模型也能"读到"图片里的文字 ==================
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
-OCR_LANGS = "chi_sim+eng"
-OCR_TIMEOUT = 40          # 单张图片识别上限秒数
-OCR_MAX_CHARS = 1200      # 注入提示词的单图文本上限
-
-def _ocr_image(path: Path) -> str:
-    """调用 tesseract 识别图片文字；未安装 / 失败 / 超时一律返回空串。"""
-    if not shutil.which("tesseract"):
-        return ""
-    try:
-        r = subprocess.run(
-            ["tesseract", str(path), "stdout", "-l", OCR_LANGS, "--psm", "6"],
-            capture_output=True, text=True, timeout=OCR_TIMEOUT,
-        )
-        return (r.stdout or "").strip()
-    except Exception:
-        return ""
-
-def _ocr_sidecar(path: Path) -> Path:
-    return path.with_name(path.name + ".ocr.txt")
-
-def _image_ocr_text(path: Path) -> str:
-    """取图片 OCR 文本：优先读缓存 sidecar，没有则现识别并落盘缓存。"""
-    side = _ocr_sidecar(path)
-    try:
-        if side.is_file():
-            return side.read_text(encoding="utf-8", errors="ignore").strip()
-    except Exception:
-        pass
-    text = _ocr_image(path)
-    if text:
-        try:
-            side.write_text(text, encoding="utf-8")
-        except Exception:
-            pass
-    return text
-
-async def _image_note_for_query(user: dict, query: str) -> str:
-    """
-    [降级路径] 扫描用户消息里的 [图片: 路径] 引用，把图片 OCR 文本注入系统提示词，
-    并禁止模型去 read_media_file / 终端读图片二进制（纯文本模型只会拿到乱码）。
-    """
-    refs = re.findall(r"\[图片:\s*([^\]]+?)\s*\]", query or "")
-    if not refs:
-        return ""
-    items = []
-    for raw in refs[:3]:
-        p = raw.strip()
-        try:
-            f = _safe_user_file(user, p)
-        except HTTPException:
-            items.append(f"- {p}：文件不存在或不在你的工作空间")
-            continue
-        if f.suffix.lower() not in IMG_EXTS:
-            items.append(f"- {f.name}：不是常见图片格式")
-            continue
-        text = await asyncio.to_thread(_image_ocr_text, f)
-        if text:
-            ell = "…" if len(text) > OCR_MAX_CHARS else ""
-            items.append(f"- {f.name}，OCR 识别到 {len(text)} 字：\n「{text[:OCR_MAX_CHARS]}{ell}」")
-        else:
-            items.append(f"- {f.name}：没有识别出文字（可能是照片/画面类图片，而非文字截图）")
-    if not items:
-        return ""
-    return (
-        "\n\n[图片内容（系统自动注入）] 用户在消息中引用了图片。当前模型无法直接观看图片画面，"
-        "回答涉及图片时请完全依据下面的 OCR 文本，并严格遵守：\n"
-        "1. 禁止调用 read_media_file / read_file / get_file_info / 终端命令去读取图片本体——"
-        "图片是二进制文件，读出来只会是乱码，浪费工具调用；\n"
-        "2. OCR 文本里有答案就直接回答，不要复述本段系统说明；\n"
-        "3. 若 OCR 文本为空或与问题无关（图片是照片、画面而非文字截图），"
-        "请坦诚告知用户：你目前只能读出图片里的文字，看不到画面内容。\n"
-        + "\n".join(items)
-    )
-
-
-# ================== 图片直传：DeepSeek API 已支持 image_url，原生视觉优先 ==================
+# ================== 图片直传：随用户消息原生看图（DeepSeek image_url） ==================
 IMG_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
     ".tiff": "image/tiff", ".tif": "image/tiff",
 }
-MAX_IMG_BYTES = 4 * 1024 * 1024   # 单图 4MB 上限（base64 后约 5.4MB）
+MAX_IMG_MB = 8                     # 单图 8MB 上限（与前端 MAX_UP 对齐；前端上传前还会把大图压到远小于此）
+MAX_IMG_BYTES = MAX_IMG_MB * 1024 * 1024
 
 async def _build_user_content(user: dict, query: str):
     """
     [主路径] 把消息里的 [图片: 路径] 引用转成 OpenAI 多模态 content（image_url + data URL），
-    随用户消息直接发给模型，实现原生看图。
+    随用户消息直接发给模型，实现原生看图（DeepSeek flash/flash-think/pro 均已实测支持）。
 
     返回 (user_content, fallback_note)：
       - 至少一张图片成功附带 → content 为列表，fallback_note 为空；
-      - 引用了图片但全部失败（不存在/超限/格式不支持）→ content 仍为 str，走 OCR 降级 note；
+      - 引用了图片但全部失败（不存在/超限/格式不支持）→ content 仍为 str，
+        fallback_note 如实告知模型"图没发出去 + 原因"，让它引导用户重发（不臆测内容）；
       - 没有图片引用 → (query, "")。
     """
     refs = re.findall(r"\[图片:\s*([^\]]+?)\s*\]", query or "")
@@ -1154,10 +1079,10 @@ async def _build_user_content(user: dict, query: str):
             continue
         mime = IMG_MIME.get(f.suffix.lower())
         if not mime:
-            skipped.append(f"{f.name}：不是支持的图片格式")
+            skipped.append(f"{f.name}：不是支持的图片格式（仅支持 png/jpg/webp/gif/bmp/tiff）")
             continue
         if f.stat().st_size > MAX_IMG_BYTES:
-            skipped.append(f"{f.name}：超过 4MB，未随消息发送")
+            skipped.append(f"{f.name}：超过 {MAX_IMG_MB}MB，未随消息发送")
             continue
         try:
             b64 = await asyncio.to_thread(lambda: base64.b64encode(f.read_bytes()).decode())
@@ -1174,8 +1099,18 @@ async def _build_user_content(user: dict, query: str):
         if skipped:
             text_part["text"] += "\n另有图片未随消息发送：" + "；".join(skipped) + "。"
         return [text_part] + parts, ""
-    # 一张都没发出去：回退到 OCR 降级
-    return query, await _image_note_for_query(user, query)
+    # 一张都没发出去：如实告知，绝不再做 OCR（模型本就具备原生视觉，
+    # "看不到画面"的唯一原因是图没发出去——臆测或假装读图都是错的）
+    why = "；".join(skipped) if skipped else "未知原因"
+    note = (
+        "\n\n[图片未能随消息发送] 用户在本条消息里引用了图片，但一张都没有发送成功：" + why + "。"
+        "你完全看不到这些图片的画面，也没有任何文字识别结果可用。请：\n"
+        "1. 直接告知用户图片发送失败及上面的原因；\n"
+        "2. 请用户把图片压缩或裁剪后重新上传（jpg/png/webp 均可，单张 "
+        f"{MAX_IMG_MB}MB 以内）；\n"
+        "3. 绝不要臆测图片内容，也不要声称「只能读取图片中的文字」——那不是事实。"
+    )
+    return query, note
 
 
 @app.get("/api/files/download")
@@ -1506,7 +1441,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
             "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
         )
-    # 图片：优先原生直传(DeepSeek 支持 image_url)；发不出去才降级 OCR 注入
+    # 图片：随用户消息原生直传（模型直接看图）；发不出去才如实告知（无 OCR）
     user_content, img_note = await _build_user_content(user, req.query)
 
     # ── 「继续」：上一轮因断网/关页面/手动停止没写完，接着那条回答往下写 ──

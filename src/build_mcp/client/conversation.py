@@ -254,8 +254,9 @@ def _content_block_to_text(block: Any) -> str | None:
         kb = max(1, len(data) * 3 // 4 // 1024)
         return (
             f"[工具返回了一张图片（{mime or '未知格式'}，base64 约 {kb} KB）。"
-            "当前模型无法查看图片画面——不要反复重试读取图片的工具；"
-            "如需图片里的文字，请告知用户系统仅支持图片文字识别（OCR）。]"
+            "工具通道无法把这张图片转给模型查看——不要反复重试读取图片的工具；"
+            "如需查看该图片，请让用户直接在对话中上传这张图片"
+            "（用户上传的图片会随消息直传，模型可以直接观看画面）。]"
         )
     res = getattr(block, "resource", None)
     if res is not None:
