@@ -209,7 +209,8 @@ header{
 }
 .user-badge::before{content:"👤";font-size:12px;flex:none}
 .user-badge[hidden]{display:none}
-@media (max-width:600px){.user-badge{max-width:64px;padding:0 8px;font-size:11px;height:30px;gap:4px}}
+/* 窄屏：隐藏 👤 图标（宽度让给用户名），放宽上限，保证用户名完整显示不被截断 */
+@media (max-width:600px){.user-badge{max-width:128px;flex:0 1 auto;min-width:0;padding:0 9px;font-size:11px;height:30px;gap:0}.user-badge::before{display:none}}
 /* ============ 消息区 ============ */
 /* 隐藏原生滚动条（长度由浏览器控制，无法自定义），改用自绘"米粒"指示条 */
 #chatBox{
@@ -571,7 +572,7 @@ button{touch-action:manipulation} /* 移动端消除双击缩放延迟 */
 @media (max-width:380px){
   .suggests{grid-template-columns:1fr}
   .brand h1{font-size:13.5px}
-  .user-badge{max-width:54px}
+  .user-badge{max-width:96px;padding:0 7px;font-size:10.5px}
   .hbtn{width:29px;height:29px}
   .hbtns{gap:3px}
 }
@@ -799,8 +800,11 @@ const authOverlay=$('#authOverlay'), authUser=$('#authUser'), authPwd=$('#authPw
 const userBadge=$('#userBadge');
 function updateUserBadge(){
   if(!userBadge)return;
-  if(me&&me.name){userBadge.textContent=me.name;userBadge.hidden=false}
-  else userBadge.hidden=true;
+  if(me&&me.name){
+    userBadge.textContent=me.name;
+    userBadge.title=me.name;   /* 极端长名被省略号截断时，仍可查看全名 */
+    userBadge.hidden=false;
+  }else{userBadge.hidden=true;userBadge.removeAttribute('title')}
 }
 
 function esc(s){
