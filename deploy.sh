@@ -55,15 +55,35 @@ if [ "${ONLY_RESTART}" = "0" ]; then
   GUARD_FILES="static/index.html src/build_mcp/web/main.py src/build_mcp/web/store.py src/build_mcp/client/conversation.py src/build_mcp/web/whatsnew.json"
   if [ "${FORCE}" = "0" ]; then
     step "防覆盖检查：服务器上是否有未入库的改动"
+    # 判定口径（比"本机 HEAD vs 服务器"更准）：
+    #   服务器版本 == 本机文件            → 一致，无需处理；
+    #   服务器版本能在本机 git 历史里找到 → 是「已入库的旧版本」，覆盖它就是正常部署；
+    #   两者都不满足                      → 服务器上有别人直接改的、未入库的内容，必须拦下。
+    # 只比对 HEAD 会把「我刚改完、正要发布」的正常部署也误拦，逼人用 --force 绕过保护。
+    _hash_of_rev() { git -C "$SRC" show "$1:$2" 2>/dev/null | tr -d '\r' | sha1sum | cut -c1-12; }
+
+    _version_in_git() {          # $1=文件  $2=服务器哈希；命中返回 0
+      local f="$1" want="$2" c
+      [ -n "$want" ] && [ "$want" != "missing" ] || return 1
+      [ "$(_hash_of_rev HEAD "$f")" = "$want" ] && return 0
+      for c in $(git -C "$SRC" log --format=%H -- "$f" 2>/dev/null); do
+        [ "$(_hash_of_rev "$c" "$f")" = "$want" ] && return 0
+      done
+      return 1
+    }
+
     DIFFS=""
     for f in $GUARD_FILES; do
       [ -f "$SRC/$f" ] || continue
       lh="$(tr -d '\r' < "$SRC/$f" | sha1sum | cut -c1-12)"
       rh="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
               "tr -d '\r' < '${REMOTE_DIR}/$f' 2>/dev/null | sha1sum | cut -c1-12" 2>/dev/null || echo missing)"
-      if [ "$lh" != "$rh" ]; then
+      [ "$lh" = "$rh" ] && continue
+      if _version_in_git "$f" "$rh"; then
+        printf '   \033[1;32m↻ 待更新\033[0m %s（服务器是已入库的旧版本，可安全覆盖）\n' "$f"
+      else
         DIFFS="${DIFFS}${f}"$'\n'
-        printf '   \033[1;33m⚠ 不同\033[0m %s\n' "$f"
+        printf '   \033[1;33m⚠ 不同\033[0m %s（服务器版本不在本机 git 历史里）\n' "$f"
       fi
     done
     if [ -n "$DIFFS" ]; then

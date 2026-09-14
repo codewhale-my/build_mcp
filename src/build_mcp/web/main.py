@@ -724,6 +724,16 @@ async def lifespan(app: FastAPI):
     init_db(INVITE_CODES)
     _migrate_legacy_fs()
     _check_admin_accounts()
+    # 启动清理：上一轮进程如果是被重启/僵死带走的，库里会留下 status='running'
+    # 的孤儿任务。不回收的话前端会挂着僵尸任务无限轮询（页面卡）；顺手裁掉
+    # 过老的 run 及其事件，避免 run_events 无限膨胀。
+    try:
+        n = store.reap_stale_runs()
+        if n:
+            logger.info("🧹 已回收 %s 个上次重启遗留的 running 任务（标记为 interrupted）", n)
+        store.prune_runs()
+    except Exception:
+        logger.exception("⚠️ 启动清理历史任务失败（不影响服务）")
     logger.info("🔄 正在初始化共享MCP服务(amap/websearch/terminal)...")
     try:
         shared_mcp = await init_all_mcp_sessions(_exit_stack, include=SHARED_MCP_INCLUDE)
@@ -1283,6 +1293,64 @@ RUNS: Dict[str, Dict[str, Any]] = {}
 _RUN_MEM_KEEP = 1800.0     # 任务结束后在内存里保留多久（供刚回页面的客户端补拉）
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name, "")
+        return float(v) if str(v).strip() else float(default)
+    except Exception:
+        return float(default)
+
+
+# ── 过程事件落库的性能开关（一次回答可产生上万条事件，落库方式直接决定卡不卡）──
+# 思考/回答是「逐字增量」，按这个窗口合并成一条事件再发；0 = 关闭合并（回到逐条）。
+_EVENT_COALESCE_SEC = max(0.0, _env_float("MCP_WEB_EVENT_COALESCE_MS", 250.0) / 1000.0)
+# 攒批落库间隔（秒）：窗口内的事件一次性写库，而不是每条一次事务一次 fsync。
+_EVENT_FLUSH_SEC = max(0.2, _env_float("MCP_WEB_EVENT_FLUSH_MS", 1000.0) / 1000.0)
+# legacy = 回到旧行为（每条事件单独开连接+事务），出问题可秒回退。
+_EVENT_MODE = (os.environ.get("MCP_WEB_RUN_EVENT_MODE", "") or "batch").strip().lower()
+# 会被合并的高频「逐字增量」事件类型
+_EVENT_DELTA_TYPES = ("thinking", "answer")
+
+
+class _DeltaCoalescer:
+    """把逐字增量按时间窗合并成一条事件（纯逻辑，便于单测）。
+
+    feed() 返回「本次应当立即发出的事件」列表 [(type, delta), ...]；
+    类型切换或窗口到期时才吐出，flush() 用于收尾。这样一次回答的事件数
+    从「每个 token 一条」降到「每 window 秒一条」。
+    """
+
+    def __init__(self, window: float):
+        self.window = max(0.0, float(window))
+        self.buf = ""
+        self.typ = ""
+        self.since = 0.0
+
+    def _take(self):
+        out = (self.typ or "thinking", self.buf)
+        self.buf = ""
+        self.typ = ""
+        self.since = 0.0
+        return out
+
+    def feed(self, typ: str, delta: str, now: float) -> list:
+        out = []
+        if not delta:
+            return out
+        if self.typ and self.typ != typ:      # 类型切换：先把上一段发出去
+            out.append(self._take())
+        self.typ = typ
+        self.buf += delta
+        if not self.since:
+            self.since = now
+        if self.window <= 0 or (now - self.since) >= self.window:
+            out.append(self._take())
+        return out
+
+    def flush(self) -> list:
+        return [self._take()] if self.buf else []
+
+
 def _run_events_for(run_id: str, since: int = 0) -> list:
     """取某次任务的过程事件（只取 seq>since）。
 
@@ -1338,6 +1406,28 @@ def _run_keep_then_forget(run_id: str, keep: float = _RUN_MEM_KEEP) -> None:
         asyncio.create_task(_later())
     except Exception:
         pass
+
+
+async def _flush_run_events(run_id: str, rstate: Dict[str, Any]) -> None:
+    """过程事件攒批落库：一次事务写一批，且丢到线程池里执行。
+
+    ⚠️ 关键：绝不能在事件循环上直接调同步 sqlite。旧实现是「一条事件一次
+    连接 + 一次事务 + 一次 fsync」，一次回答上万条 → 事件循环被反复阻塞，
+    表现就是网页很卡。这里攒 _EVENT_FLUSH_SEC 一批、进线程池写，循环不阻塞。
+    run 结束（flush_alive=False）且队列排空后自行退出。
+    """
+    while True:
+        await asyncio.sleep(_EVENT_FLUSH_SEC)
+        rows = rstate.get("dbq") or []
+        if rows:
+            rstate["dbq"] = []
+            try:
+                await asyncio.to_thread(store.append_run_events, run_id, rows)
+            except Exception:
+                logger.exception("⚠️ 后台任务事件批量落库失败 id=%s n=%s",
+                                 run_id, len(rows))
+        if not rstate.get("flush_alive") and not rstate.get("dbq"):
+            break
 
 
 @app.post("/api/chat")
@@ -1496,24 +1586,54 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         "id": run_id, "user_id": user["id"], "seq": 0, "status": "running",
         "answer": "", "partial": "", "error": "", "msg_id": None,
         "events": [], "waiters": [], "task": None, "finished_at": None,
+        # 落库攒批用：待写队列 / flusher 存活标志
+        "dbq": [], "flush_alive": True, "flusher": None,
     }
     RUNS[run_id] = rstate
 
-    def _publish(ev: Dict[str, Any]) -> None:
-        """写事件到内存+库，并唤醒订阅者。SSE 流与轮询接口共用这一份。"""
+    if _EVENT_MODE != "legacy":
+        rstate["flusher"] = asyncio.create_task(_flush_run_events(run_id, rstate))
+
+    def _emit(item: Dict[str, Any]) -> None:
+        """定稿一条事件：分配 seq → 进内存流 → 排队落库 → 唤醒订阅者。"""
         rstate["seq"] += 1
-        item = dict(ev)
         item["seq"] = rstate["seq"]
         rstate["events"].append(item)
         if len(rstate["events"]) > 4000:     # 长任务防内存膨胀：只丢最老的一半
             del rstate["events"][:2000]
-        try:
-            store.append_run_event(run_id, rstate["seq"], str(item.get("type") or ""),
-                                   json.dumps(item, ensure_ascii=False))
-        except Exception:
-            logger.exception("⚠️ 后台任务事件落库失败 id=%s seq=%s", run_id, rstate["seq"])
+        if _EVENT_MODE == "legacy":
+            try:
+                store.append_run_event(run_id, item["seq"], str(item.get("type") or ""),
+                                       json.dumps(item, ensure_ascii=False))
+            except Exception:
+                logger.exception("⚠️ 后台任务事件落库失败 id=%s seq=%s", run_id, item["seq"])
+        else:
+            rstate["dbq"].append((item["seq"], str(item.get("type") or ""),
+                                  json.dumps(item, ensure_ascii=False), time.time()))
         for w in list(rstate["waiters"]):
             w.set()
+
+    _coalescer = _DeltaCoalescer(_EVENT_COALESCE_SEC)
+
+    def _flush_delta() -> None:
+        """把攒着的思考/回答增量合并成「一条」事件发出去（顺序、时间线不变）。"""
+        for _t, _txt in _coalescer.flush():
+            _emit({"type": _t, "delta": _txt})
+
+    def _publish(ev: Dict[str, Any]) -> None:
+        """写事件到内存（并排队落库），唤醒订阅者。SSE 流与轮询接口共用这一份。
+
+        thinking / answer 是逐字增量，一次回答可达上万条：若逐条当事件落库，
+        每条都要开一次事务 fsync，事件循环会被拖死。所以先在窗口内合并成一条
+        （直播流与落库用的是同一条事件，游标语义完全不变），落库再攒批。
+        """
+        typ = str(ev.get("type") or "")
+        if typ in _EVENT_DELTA_TYPES and ev.get("delta"):
+            for _t, _txt in _coalescer.feed(typ, str(ev["delta"]), time.time()):
+                _emit({"type": _t, "delta": _txt})
+            return
+        _flush_delta()                       # 非增量事件：先清空攒着的增量，保持顺序
+        _emit(dict(ev))
 
     async def _run_worker() -> None:
         """真正的生成过程：与任何 HTTP 连接无关，跑到完成/出错为止。"""
@@ -1603,6 +1723,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             _publish({"type": "end", "status": status, "msg_id": msg_id,
                       "interrupted": 1 if status in ("interrupted", "stopped", "error") else 0,
                       "chars": len(rstate["answer"])})
+            rstate["flush_alive"] = False    # 让 flusher 写完最后一批后自行退出
             _run_keep_then_forget(run_id)
 
     rstate["task"] = asyncio.create_task(_run_worker())
@@ -1642,6 +1763,19 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
     )
 
 
+def _live_run_status(row: dict, mem: dict) -> str:
+    """判定任务真实状态。
+
+    库里标 running、但内存里已经没有这个任务 → 它其实早死了（服务重启过、
+    或进程被回收）。不修的话前端会一直挂着这个僵尸任务无限轮询：既卡页面，
+    又每秒把上万条历史事件从库里重拉一遍。
+    """
+    st = str(mem.get("status") or row.get("status") or "done")
+    if st == "running" and row.get("id") not in RUNS:
+        return "interrupted"
+    return st
+
+
 # 挂载静态网页，static文件夹放在项目根目录，里面放index.html
 @app.get("/api/run/active")
 async def run_active(user: dict = Depends(require_user)):
@@ -1652,7 +1786,7 @@ async def run_active(user: dict = Depends(require_user)):
     rid = row["id"]
     mem = RUNS.get(rid) or {}
     events = _run_events_for(rid, 0)
-    status = mem.get("status") or row["status"]
+    status = _live_run_status(row, mem)
     return {"run": {
         "run_id": rid,
         "status": status,
@@ -1676,7 +1810,7 @@ async def run_poll(run_id: str, since: int = 0, user: dict = Depends(require_use
         raise HTTPException(status_code=404, detail="任务不存在")
     mem = RUNS.get(run_id) or {}
     events = _run_events_for(run_id, since)
-    status = mem.get("status") or row["status"]
+    status = _live_run_status(row, mem)
     return {
         "run_id": run_id,
         "status": status,
