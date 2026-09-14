@@ -896,21 +896,86 @@ async def whatsnew_seen(req: SeenRequest, user: dict = Depends(require_user)):
     return {"ok": True, "version": version}
 
 
+def _summarize_run_events(run_id: str, max_think: int = 6000) -> tuple:
+    """把一个后台任务的过程事件压缩成「思考文本 + 工具行」。
+
+    用于回到页面时回放：断网/关页面期间任务已跑完的情况下，
+    前端靠这份摘要把「它干了什么」重新画到气泡里，而不只是一段最终文本。
+    """
+    think: list = []
+    tools: list = []
+    cur = None
+    try:
+        events = _run_events_for(run_id, 0)
+    except Exception:
+        return "", []
+    for ev in events:
+        t = ev.get("type")
+        if t == "thinking" and ev.get("delta"):
+            think.append(str(ev["delta"]))
+        elif t == "tool" and ev.get("name"):
+            name = str(ev.get("name"))
+            st = ev.get("status")
+            note = str(ev.get("note") or "").strip()
+            if st == "start":
+                if cur and cur["name"] == name:
+                    cur["n"] += 1
+                    if note and note not in cur["notes"]:
+                        cur["notes"].append(note)
+                else:
+                    if cur:
+                        tools.append(cur)
+                    cur = {"name": name, "n": 1, "notes": [note] if note else [], "ok": None}
+            elif cur and cur["name"] == name:
+                cur["ok"] = (st == "ok")
+                if note and note not in cur["notes"]:
+                    cur["notes"].append(note)
+    if cur:
+        tools.append(cur)
+    text = "".join(think).strip()
+    if max_think and len(text) > max_think:
+        # 超长思考只保留尾部（开头的铺垫信息量最低）
+        text = "…（前面略）\n" + text[-max_think:]
+    return text, tools
+
+
 @app.get("/api/history")
 async def history(user: dict = Depends(require_user), limit: int = 200):
     """当前用户的历史消息（只返回自己的）。"""
     limit = max(1, min(limit, 500))
     msgs = list_messages(user["id"], limit=limit)
+    # 把「最近这次任务的处理过程」一并带上：
+    # 断网/关页面期间任务已经跑完时，回到页面也能看到它做了什么，
+    # 而不只是一段最终文本。（只做最近一次，不给整份历史加负担）
+    extra_by_msg: Dict[int, Dict[str, Any]] = {}
+    try:
+        last = store.latest_run(user["id"])
+        if last and last.get("msg_id"):
+            th, tools = _summarize_run_events(last["id"])
+            if th or tools:
+                extra_by_msg[int(last["msg_id"])] = {
+                    "thinking": th, "trace": tools,
+                    "run_id": last["id"], "run_status": last.get("status"),
+                }
+    except Exception:
+        logger.exception("⚠️ 历史消息附加处理过程失败")
+
+    out = []
+    for m in msgs:
+        item = {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"],
+                "model": m.get("model") or "",
+                "interrupted": int(m.get("interrupted") or 0)}
+        _x = extra_by_msg.get(int(m["id"] or 0))
+        if _x:
+            item["thinking"] = _x["thinking"]
+            item["trace"] = _x["trace"]
+            item["run_id"] = _x["run_id"]
+        out.append(item)
     return {
         "username": user["username"],
         "user_root": str(workspace_root(user)),
         "ws_mode": user_ws_mode(user),
-        "messages": [
-            {"id": m["id"], "role": m["role"], "text": m["text"], "ts": m["ts"],
-             "model": m.get("model") or "",
-             "interrupted": int(m.get("interrupted") or 0)}
-            for m in msgs
-        ],
+        "messages": out,
     }
 
 
@@ -1207,6 +1272,70 @@ async def ws_endpoint(websocket: WebSocket):
         logger.info("🔌 用户[%s] 本机文件通道已断开", user["username"])
 
 
+# ── 后台任务注册表 ────────────────────────────────────────────────────
+# 把「生成」从 HTTP 请求里摘出来：连接断了任务继续跑，过程写进 run_events，
+# 用户回到页面（甚至换台设备）依然能看到它做了什么、并拿到完整结果。
+RUNS: Dict[str, Dict[str, Any]] = {}
+_RUN_MEM_KEEP = 1800.0     # 任务结束后在内存里保留多久（供刚回页面的客户端补拉）
+
+
+def _run_events_for(run_id: str, since: int = 0) -> list:
+    """取某次任务的过程事件（只取 seq>since）。
+
+    内存里的 events 只是「最近一段」——超长任务会删掉最老的一半防膨胀，
+    所以这里以「库」为全量基准、以「内存」为最新尾巴：先补库里被裁掉的前缀，
+    再接上内存里更新的事件。否则 since 很小（全量回放）时会整段丢掉开头。
+    """
+    since = int(since or 0)
+    mem_evs = [dict(e) for e in ((RUNS.get(run_id) or {}).get("events") or [])]
+    mem_first = int(mem_evs[0].get("seq", 0) or 0) if mem_evs else None
+
+    def _from_db(after: int, upto: Optional[int]) -> list:
+        """从库里顺序取 seq>after 的事件；upto 不为空时取到该 seq 之前为止。
+        分批拉取，避免单次 limit 截断（长任务事件数可达数千）。"""
+        out: list = []
+        cur = int(after)
+        while True:
+            rows = store.run_events_since(run_id, cur, limit=2000)
+            if not rows:
+                break
+            hit = False
+            for r in rows:
+                seq = int(r["seq"])
+                if upto is not None and seq >= upto:
+                    hit = True
+                    break
+                try:
+                    ev = json.loads(r["data"]) if r.get("data") else {"type": r.get("type") or ""}
+                except Exception:
+                    ev = {"type": r.get("type") or ""}
+                ev["seq"] = seq
+                out.append(ev)
+                cur = seq
+            if hit or len(rows) < 2000:
+                break
+        return out
+
+    if mem_evs:
+        # 库补前缀 + 内存接尾巴（内存里没有的、比它旧的，一律从库拿）
+        out = _from_db(since, mem_first)
+        out.extend(e for e in mem_evs if int(e.get("seq", 0)) > since)
+        return out
+    # 内存已随任务结束被清掉（或服务重启过）→ 全量走库
+    return _from_db(since, None)
+
+
+def _run_keep_then_forget(run_id: str, keep: float = _RUN_MEM_KEEP) -> None:
+    """任务结束后在内存里再留一会儿，到点清掉，避免长期占内存。"""
+    async def _later() -> None:
+        await asyncio.sleep(keep)
+        RUNS.pop(run_id, None)
+    try:
+        asyncio.create_task(_later())
+    except Exception:
+        pass
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_user)):
     global shared_mcp
@@ -1350,48 +1479,59 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                 user["username"], _spec["model"], _spec["key"], _spec["thinking"],
                 max(0, len(history_messages) - 1), _hist_win["mode"], _hist_win["turns"])
 
-    async def event_gen():
+    # ── 后台运行：把生成任务从 HTTP 连接里摘出来 ──────────────────────────
+    # 过去 producer 的 task 挂在这次请求上，客户端一断就被 cancel →
+    # 「断网/关页面 = 任务当场死掉，只留半截」。现在改成独立后台任务，
+    # 过程事件落库(run_events)：客户端只是订阅者，断开只停止推送、不停任务；
+    # 用户回来（甚至换设备）仍能看到它干了什么、并拿到完整结果。
+    run_id = secrets.token_hex(8)
+    store.create_run(run_id, user["id"], req.query,
+                     _spec["label"] or _spec["model"],
+                     cont_msg_id=int(req.continue_msg_id) if req.continue_msg_id else None)
+    rstate: Dict[str, Any] = {
+        "id": run_id, "user_id": user["id"], "seq": 0, "status": "running",
+        "answer": "", "partial": "", "error": "", "msg_id": None,
+        "events": [], "waiters": [], "task": None, "finished_at": None,
+    }
+    RUNS[run_id] = rstate
+
+    def _publish(ev: Dict[str, Any]) -> None:
+        """写事件到内存+库，并唤醒订阅者。SSE 流与轮询接口共用这一份。"""
+        rstate["seq"] += 1
+        item = dict(ev)
+        item["seq"] = rstate["seq"]
+        rstate["events"].append(item)
+        if len(rstate["events"]) > 4000:     # 长任务防内存膨胀：只丢最老的一半
+            del rstate["events"][:2000]
+        try:
+            store.append_run_event(run_id, rstate["seq"], str(item.get("type") or ""),
+                                   json.dumps(item, ensure_ascii=False))
+        except Exception:
+            logger.exception("⚠️ 后台任务事件落库失败 id=%s seq=%s", run_id, rstate["seq"])
+        for w in list(rstate["waiters"]):
+            w.set()
+
+    async def _run_worker() -> None:
+        """真正的生成过程：与任何 HTTP 连接无关，跑到完成/出错为止。"""
         answer: str | None = None
         failed = False
         used_model = ""
-        partial = ""   # 累积已推给前端的正文增量：中途断线时靠它守住半截回答
+        partial = ""
+        status = "done"
+        err_text = ""
         try:
-            # 同一用户串行：锁跨整个流式过程持有，防止上下文竞态。
-            # 生产者/队列 + 心跳：模型长生成期间没有事件，移动网络(运营商 NAT/iOS Safari)
-            # 会掐断静默连接（前端报 Load failed），所以每 15s 发一条 SSE 注释帧保活。
-            queue: asyncio.Queue = asyncio.Queue()
-            _STOP = object()
-
-            async def producer():
-                try:
-                    async with lock:
-                        async for ev in agent_loop_stream(
-                            tool_name_to_session=tool_map,
-                            openai_tools=openai_tools,
-                            user_query=user_content,
-                            history_messages=history_messages,
-                            turn_note=turn_note,
-                            model_key=req.model,
-                        ):
-                            await queue.put(ev)
-                except Exception as e:
-                    logger.exception("❌ /api/chat 流式处理异常")
-                    await queue.put({"type": "error", "message": f"服务内部错误：{e}"})
-                finally:
-                    await queue.put(_STOP)
-
-            task = asyncio.create_task(producer())
-            try:
-                while True:
-                    try:
-                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    except asyncio.TimeoutError:
-                        yield ": ping\n\n"   # SSE 注释帧，前端解析器会忽略
-                        continue
-                    if ev is _STOP:
-                        break
+            async with lock:
+                async for ev in agent_loop_stream(
+                    tool_name_to_session=tool_map,
+                    openai_tools=openai_tools,
+                    user_query=user_content,
+                    history_messages=history_messages,
+                    turn_note=turn_note,
+                    model_key=req.model,
+                ):
                     if ev.get("type") == "answer" and ev.get("delta"):
                         partial += ev["delta"]
+                        rstate["partial"] = partial
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
                         used_model = _spec["label"] or ev.get("model") or _spec["model"]
@@ -1403,39 +1543,89 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                                         _u.get("summary") or _u)
                     elif ev.get("type") == "error":
                         failed = True
-                    yield _sse(ev)
-            except asyncio.CancelledError:
-                # 客户端断开/中止：取消生产者并正常结束生成器，不落库
-                task.cancel()
-                raise
-            finally:
-                if not task.done():
-                    task.cancel()
+                    _publish(ev)
+        except asyncio.CancelledError:
+            # 只有服务整体关闭才会走到这里；客户端断开已不会影响本任务
+            status = "stopped"
+            err_text = "服务重启导致任务中断"
+            rstate["error"] = err_text
+            _publish({"type": "error", "message": err_text})
+            raise
         except Exception as e:
-            logger.exception("❌ /api/chat 流式处理异常")
+            logger.exception("❌ 后台生成异常 id=%s", run_id)
+            status = "error"
             failed = True
-            yield _sse({"type": "error", "message": f"服务内部错误：{e}"})
+            err_text = str(e)
+            _publish({"type": "error", "message": f"服务内部错误：{e}"})
         finally:
             _model_col = used_model or _spec["label"] or _spec["model"]
-            if cont_msg is not None:
-                # 续写：把新写的部分接到原文后面，回写同一条消息（历史不新增条目，保持成对）
-                tail = (answer or "").strip()
-                if tail:
-                    full = (cont_partial + "\n\n" + tail).strip() if cont_partial else tail
-                    update_message(cont_msg["id"], user["id"], full,
-                                   interrupted=0, model=_model_col or None)
-                    logger.info("✅ 续写完成并回写 id=%s（共 %d 字）", cont_msg["id"], len(full))
-                # 一个字都没续上：不动库，interrupted 保持 1，界面上的「继续」按钮还在
-            elif answer is not None and answer.strip() and not failed:
-                add_message(user["id"], "user", req.query)
-                add_message(user["id"], "assistant", answer.strip(), used_model)
-            elif partial.strip():
-                # 中途断线/出错/手动停止：把「提问 + 已生成的部分」成对落库，并标记未完成，
-                # 前端据此在气泡下显示「继续」按钮；重开页面/换设备也能接着写。
-                add_message(user["id"], "user", req.query)
-                add_message(user["id"], "assistant", partial.strip(),
-                            _model_col, interrupted=1)
-                logger.info("✂️ 回答未写完，已保存半截（%d 字）并标记可继续", len(partial.strip()))
+            msg_id = None
+            try:
+                if cont_msg is not None:
+                    # 续写：把新写的部分接到原文后面，回写同一条消息（历史不新增条目，保持成对）
+                    tail = (answer or "").strip()
+                    if tail:
+                        full = (cont_partial + "\n\n" + tail).strip() if cont_partial else tail
+                        update_message(cont_msg["id"], user["id"], full,
+                                       interrupted=0, model=_model_col or None)
+                        msg_id = int(cont_msg["id"])
+                        logger.info("✅ 续写完成并回写 id=%s（共 %d 字）", cont_msg["id"], len(full))
+                    # 一个字都没续上：不动库，interrupted 保持 1，界面上的「继续」按钮还在
+                elif answer is not None and answer.strip() and not failed:
+                    add_message(user["id"], "user", req.query)
+                    msg_id = add_message(user["id"], "assistant", answer.strip(), used_model)
+                elif partial.strip():
+                    # 中途断线/出错/受停：把「提问 + 已生成的部分」成对落库，并标记未完成，
+                    # 前端据此在气泡下显示「继续」按钮；重开页面/换设备也能接着写。
+                    add_message(user["id"], "user", req.query)
+                    msg_id = add_message(user["id"], "assistant", partial.strip(),
+                                         _model_col, interrupted=1)
+                    if status == "done":
+                        status = "interrupted"
+                    logger.info("✂️ 回答未写完，已保存半截（%d 字）并标记可继续", len(partial.strip()))
+            except Exception:
+                logger.exception("❌ 后台任务落库失败 id=%s", run_id)
+
+            rstate["status"] = status
+            rstate["answer"] = (answer or partial or "").strip()
+            rstate["error"] = err_text
+            rstate["msg_id"] = msg_id
+            rstate["finished_at"] = time.time()
+            try:
+                store.finish_run(run_id, status, rstate["answer"], err_text, msg_id)
+            except Exception:
+                logger.exception("⚠️ 后台任务状态落库失败 id=%s", run_id)
+            # 收尾帧：前端据此把「进行中」的气泡定稿
+            _publish({"type": "end", "status": status, "msg_id": msg_id,
+                      "interrupted": 1 if status in ("interrupted", "stopped", "error") else 0,
+                      "chars": len(rstate["answer"])})
+            _run_keep_then_forget(run_id)
+
+    rstate["task"] = asyncio.create_task(_run_worker())
+    logger.info("🚀 后台任务启动 id=%s 用户[%s]（与连接解耦，断网继续跑）", run_id, user["username"])
+
+    async def event_gen():
+        """本次连接只是「订阅者」：把后台任务的事件推给它；断开不取消任务。"""
+        yield _sse({"type": "run", "run_id": run_id})
+        # 用 seq 当游标，而不是列表下标：内存裁剪(del events[:2000])会挪动下标，
+        # 用下标会导致长任务直播时静默漏推事件。
+        sent = 0
+        while True:
+            for _e in list(rstate["events"]):
+                if int(_e.get("seq", 0)) > sent:
+                    sent = int(_e["seq"])
+                    yield _sse(_e)
+            if rstate["status"] != "running":
+                break
+            w = asyncio.Event()
+            rstate["waiters"].append(w)
+            try:
+                await asyncio.wait_for(w.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"   # SSE 注释帧保活，前端解析器忽略
+            finally:
+                if w in rstate["waiters"]:
+                    rstate["waiters"].remove(w)
 
     return StreamingResponse(
         event_gen(),
@@ -1449,4 +1639,49 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
 
 
 # 挂载静态网页，static文件夹放在项目根目录，里面放index.html
+@app.get("/api/run/active")
+async def run_active(user: dict = Depends(require_user)):
+    """页面重载/换设备回来：返回最近一次后台任务（含进行中的）与它的处理过程。"""
+    row = store.latest_run(user["id"])
+    if not row:
+        return {"run": None}
+    rid = row["id"]
+    mem = RUNS.get(rid) or {}
+    events = _run_events_for(rid, 0)
+    status = mem.get("status") or row["status"]
+    return {"run": {
+        "run_id": rid,
+        "status": status,
+        "query": row["query"],
+        "answer": (mem.get("partial") or mem.get("answer") or row["answer"]) or "",
+        "error": row["error"],
+        "msg_id": row["msg_id"],
+        "cont_msg_id": row["cont_msg_id"],
+        "created_at": row["created_at"],
+        "finished_at": mem.get("finished_at"),
+        "seq": events[-1]["seq"] if events else 0,
+        "events": events,
+    }}
+
+
+@app.get("/api/run/{run_id}")
+async def run_poll(run_id: str, since: int = 0, user: dict = Depends(require_user)):
+    """轮询增量事件：断线重连后，前端靠它把「处理过程」补齐。"""
+    row = store.get_run(run_id, user["id"])
+    if not row:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    mem = RUNS.get(run_id) or {}
+    events = _run_events_for(run_id, since)
+    status = mem.get("status") or row["status"]
+    return {
+        "run_id": run_id,
+        "status": status,
+        "answer": (mem.get("partial") or mem.get("answer") or row["answer"]) or "",
+        "msg_id": row["msg_id"],
+        "interrupted": 0 if status == "done" else 1,
+        "seq": events[-1]["seq"] if events else int(since or 0),
+        "events": events,
+    }
+
+
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

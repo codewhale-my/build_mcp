@@ -96,6 +96,32 @@ CREATE TABLE IF NOT EXISTS messages(
   interrupted INTEGER NOT NULL DEFAULT 0   -- 1=这轮回答没生成完（断网/关页面），可继续
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
+
+-- 后台运行(run)：把生成任务从 HTTP 连接里摘出来，断网/关页面也继续跑；
+-- 过程事件(run_events)全部落库，用户回到页面能看到「它干了什么」。
+CREATE TABLE IF NOT EXISTS runs(
+  id          TEXT PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  query       TEXT NOT NULL,
+  model       TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'running',
+  answer      TEXT NOT NULL DEFAULT '',
+  error       TEXT NOT NULL DEFAULT '',
+  cont_msg_id INTEGER,
+  msg_id      INTEGER,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_events(
+  run_id TEXT NOT NULL,
+  seq    INTEGER NOT NULL,
+  type   TEXT NOT NULL DEFAULT '',
+  data   TEXT NOT NULL DEFAULT '',
+  ts     REAL NOT NULL,
+  PRIMARY KEY(run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id, created_at);
+
 """
 
 
@@ -463,6 +489,115 @@ def clear_messages(user_id: int) -> None:
     try:
         with conn:
             conn.execute("DELETE FROM messages WHERE user_id=?", (user_id,))
+    finally:
+        conn.close()
+
+
+# ── 后台运行(run)：生成任务与 HTTP 连接解耦后的落库 ──────────────────
+def create_run(run_id: str, user_id: int, query: str, model: str = "",
+               cont_msg_id: int | None = None) -> None:
+    """新建一次后台运行。断网/关页面都不影响它继续跑。"""
+    conn = _conn()
+    try:
+        with conn:
+            now = time.time()
+            conn.execute(
+                "INSERT INTO runs(id,user_id,query,model,status,answer,error,"
+                "cont_msg_id,msg_id,created_at,updated_at) "
+                "VALUES(?,?,?,?,'running','','',?,NULL,?,?)",
+                (run_id, user_id, query, model or "", cont_msg_id, now, now),
+            )
+    finally:
+        conn.close()
+
+
+def finish_run(run_id: str, status: str, answer: str = "", error: str = "",
+               msg_id: int | None = None) -> None:
+    """任务收尾：写状态 / 最终文本 / 落库后的消息 id。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE runs SET status=?,answer=?,error=?,msg_id=?,updated_at=? WHERE id=?",
+                (status, answer or "", error or "", msg_id, time.time(), run_id),
+            )
+    finally:
+        conn.close()
+
+
+def get_run(run_id: str, user_id: int) -> dict | None:
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM runs WHERE id=? AND user_id=?",
+                           (run_id, user_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def latest_run(user_id: int, fresh_seconds: float = 6 * 3600) -> dict | None:
+    """最近一次运行(默认只看 6 小时内)，供页面重载/换设备后恢复显示。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE user_id=? AND created_at>=? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_id, time.time() - fresh_seconds)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def append_run_event(run_id: str, seq: int, type_: str, data: str = "") -> None:
+    """追加一条过程事件（JSON 文本由调用方序列化，store 层不依赖 json）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO run_events(run_id,seq,type,data,ts) VALUES(?,?,?,?,?)",
+                (run_id, int(seq), type_ or "", data or "", time.time()),
+            )
+    finally:
+        conn.close()
+
+
+def run_events_since(run_id: str, since: int = 0, limit: int = 4000) -> list[dict]:
+    """取 seq>since 的过程事件（升序），data 为 JSON 字符串。"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT seq,type,data FROM run_events WHERE run_id=? AND seq>? "
+            "ORDER BY seq LIMIT ?",
+            (run_id, int(since or 0), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def reap_stale_runs() -> int:
+    """服务重启后：把库里仍标 running 的孤儿任务收成 interrupted（它其实已经死了）。"""
+    conn = _conn()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE runs SET status='interrupted', updated_at=? WHERE status='running'",
+                (time.time(),))
+            return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def prune_runs(keep: int = 50) -> None:
+    """只保留最近 keep 次运行及其事件，避免库无限膨胀。"""
+    conn = _conn()
+    try:
+        with conn:
+            ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM runs ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+                (int(keep),)).fetchall()]
+            for rid in ids:
+                conn.execute("DELETE FROM run_events WHERE run_id=?", (rid,))
+                conn.execute("DELETE FROM runs WHERE id=?", (rid,))
     finally:
         conn.close()
 

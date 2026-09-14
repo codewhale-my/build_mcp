@@ -417,6 +417,13 @@ header{
 .live-act.fail{opacity:.7}
 .live-act.fail .a-ico{background:var(--err-tx)}
 .live-act .a-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 思考过程（thinking 事件）：折叠块，默认收起，点开看模型推理 */
+.think-box{margin:0 0 7px;font-size:12.5px;color:var(--text3);border-left:2px solid rgba(128,128,128,.35);padding-left:8px}
+.think-box summary{cursor:pointer;color:var(--text2);font-size:12px;list-style:none;padding:1px 0;user-select:none}
+.think-box summary::-webkit-details-marker{display:none}
+.think-box summary::before{content:'💭 '}
+.think-box[open] summary{margin-bottom:4px}
+.think-body{white-space:pre-wrap;word-break:break-word;line-height:1.65;max-height:280px;overflow:auto}
 @keyframes a-pulse{0%,100%{opacity:.35}50%{opacity:1}}
 /* ============ 欢迎页 ============ */
 .welcome{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 8px 6vh}
@@ -990,7 +997,8 @@ async function loadServerHistory(doRender=true){
     history=(d&&Array.isArray(d.messages)?d.messages:[])
       .filter(m=>m&&(m.role==='user'||m.role==='assistant'))
       .map(m=>({role:m.role,text:m.text,ts:m.ts,model:m.model||'',
-                id:m.id,interrupted:m.interrupted?1:0}));
+                id:m.id,interrupted:m.interrupted?1:0,
+                thinking:m.thinking||'',trace:m.trace||[]}));
   }catch(e){
     if(doRender)history=[];
   }
@@ -1033,7 +1041,17 @@ function buildMsg(item){
     }else if(item.role==='error'){
       body='<div class="bubble err">'+esc(item.text)+'</div>';
     }else{
-      body='<div class="bubble">'+linkifyUserFiles(renderMarkdown(item.text))+'</div>';
+      // 思考过程（服务端 thinking 事件）——折叠显示，默认收起
+      const th=item.thinking
+        ? '<details class="think-box"><summary>思考过程</summary><div class="think-body">'+
+          esc(item.thinking)+'</div></details>' : '';
+      // 处理过程（工具调用轨迹）：断网/关页面期间任务已跑完，回来也能看到「它干了什么」
+      const tr=(item.trace&&item.trace.length)
+        ? '<details class="think-box trace-box"><summary>处理过程（'+item.trace.length+' 步）</summary>'+
+          '<div class="think-body">'+item.trace.map(t=>(t.ok===false?'❌ ':(t.ok?'✅ ':'🔧 '))+t.name+
+            (t.n>1?' ×'+t.n:'')+(t.notes&&t.notes.length?' · '+t.notes[t.notes.length-1]:'')).join('<br>')+
+          '</div></details>' : '';
+      body=th+tr+'<div class="bubble">'+linkifyUserFiles(renderMarkdown(item.text))+'</div>';
     }
     const mchip=(item.role==='assistant'&&item.model)
       ? '<div class="msg-model"><span class="mm-dot"></span>'+esc(item.model)+'</div>' : '';
@@ -1052,6 +1070,136 @@ function buildMsg(item){
   return wrap;
 }
 function push(item){history.push(item);chatBox.appendChild(buildMsg(item));scrollBottom()}
+
+/* ================= 后台任务：断线自动续跑 + 处理过程回放 =================
+   服务端已把「生成」从 HTTP 连接里摘出来做成后台任务：/api/chat 先发一条
+   {type:'run',run_id}，此后所有过程事件（thinking/answer/tool）都会落库。
+   连接断开只是「停止订阅」，任务照跑。这里负责两件事：
+   ① 断线后凭 run_id 轮询 /api/run/{id}?since=N，把过程接回【同一个气泡】；
+   ② 页面重载/换设备回来，查 /api/run/active，发现还在跑就自动接上并回放。 */
+let activeRunId=null,lastRunSeq=0;
+
+function setLiveStatus(t){
+  const el=document.getElementById('liveStatus');
+  if(el)el.innerHTML='<i class="ls-dot"></i>'+esc(t||'正在回答');
+}
+
+/* 思考过程：直播期间在气泡顶部维护一个可折叠块（默认收起） */
+let liveThinkEl=null,liveThinkBody=null;
+function liveThinking(delta){
+  if(!delta)return;
+  if(!liveThinkEl||!liveThinkEl.parentNode){
+    liveThinkEl=document.createElement('details');
+    liveThinkEl.className='think-box';
+    liveThinkEl.innerHTML='<summary>思考过程</summary><div class="think-body"></div>';
+    liveThinkBody=liveThinkEl.querySelector('.think-body');
+    if(liveBubbleEl&&liveBubbleEl.firstChild)liveBubbleEl.insertBefore(liveThinkEl,liveBubbleEl.firstChild);
+    else if(liveBubbleEl)liveBubbleEl.appendChild(liveThinkEl);
+  }
+  liveThinkBody.textContent+=delta;
+  liveThinkBody.scrollTop=liveThinkBody.scrollHeight;
+  scrollKeep();
+}
+
+/* 工具事件 → 工具行（连续同名合并成「搜索 ×4」）。send 的实时流与断线重连的
+   回放共用这一份，保证两条路径渲染完全一致，不各写一套。 */
+function applyToolEvent(ev){
+  const name=ev.name;
+  if(ev.status==='start'){
+    if(curRun&&curRun.name===name){
+      bumpToolRun(curRun,ev.note||'');
+    }else{
+      sealToolRun(curRun,'done');   // 上一组先收尾
+      liveBreakSegment();           // 结束当前文本段，把工具行插在这段文字正下方
+      curRun={name:name,el:addLiveToolLine(name),count:0,notes:[],closed:false};
+      liveActLines[name]=curRun.el;
+      bumpToolRun(curRun,ev.note||'');
+    }
+  }else if(curRun&&curRun.name===name){
+    sealToolRun(curRun,ev.status==='ok'?'done':'fail');
+  }else{
+    settleLiveToolLine(liveActLines[name],ev.status==='ok',ev.note||'');
+  }
+}
+
+/* 把一条后台事件渲染到当前直播气泡上（重连/回放路径） */
+function applyRunEvent(ev){
+  if(!ev||typeof ev!=='object')return;
+  if(ev.seq)lastRunSeq=ev.seq;
+  if(ev.type==='run'){
+    if(ev.run_id)activeRunId=ev.run_id;
+  }else if(ev.type==='answer'&&ev.delta){
+    if(liveBubbleEl)liveAppend(ev.delta);
+    scrollKeep();
+  }else if(ev.type==='thinking'&&ev.delta){
+    liveThinking(ev.delta);
+  }else if(ev.type==='tool'&&ev.name){
+    applyToolEvent(ev);
+    scrollKeep();
+  }
+}
+
+/* 断线/回到页面后：按 run_id 把后台任务的后续过程接回直播气泡，直到任务结束。
+   网络还没好就指数退避重试——任务在服务端照跑，不回退、不放弃。 */
+async function resumeJob(runId){
+  if(!runId)return null;
+  activeRunId=runId;
+  if(!liveMsgEl)ensureLiveMsg();
+  setLiveStatus('连接中断 · 正在自动接回…');
+  let fails=0;
+  while(true){
+    let d=null;
+    try{
+      const r=await fetch('/api/run/'+encodeURIComponent(runId)+'?since='+lastRunSeq,
+                          {headers:{'Authorization':'Bearer '+authToken}});
+      if(r.status===401){setLiveStatus('登录已过期，请刷新页面');return null}
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      d=await r.json();
+      fails=0;
+    }catch(e){
+      fails++;
+      const wait=Math.min(8000,500*Math.pow(2,Math.min(5,fails)));
+      setLiveStatus('网络中断 · '+Math.round(wait/1000)+' 秒后自动重试（第 '+fails+' 次）');
+      await sleep(wait);
+      continue;
+    }
+    (d.events||[]).forEach(applyRunEvent);
+    if(d.status!=='running'){
+      const text=(d.answer&&d.answer.trim())?d.answer:'（无回答）';
+      setLiveStatus(d.status==='done'?'已完成':'已结束');
+      finishLiveStream({role:'assistant',text:text,model:modelLabel(modelKey),
+                        interrupted:d.interrupted?1:0,id:d.msg_id||undefined});
+      if(d.status==='done')toast('✅ 后台任务已完成（断线期间也在继续跑）');
+      else toast('⚠️ 后台任务已结束：'+d.status);
+      activeRunId=null;
+      return d;
+    }
+    setLiveStatus('已接回后台任务 · 正在执行');
+    await sleep(1000);
+  }
+}
+
+/* 页面加载/登录后：服务端若还有在跑的任务，自动接上（过程靠 run_events 回放） */
+async function restoreActiveJob(){
+  if(busy||activeRunId)return false;
+  let d=null;
+  try{
+    const r=await fetch('/api/run/active',{headers:{'Authorization':'Bearer '+authToken}});
+    if(!r.ok)return false;
+    d=await r.json();
+  }catch(e){return false}
+  const run=d&&d.run;
+  if(!run||run.status!=='running')return false;
+  busy=true;sendBtn.disabled=true;controller=new AbortController();
+  lastRunSeq=0;activeRunId=run.run_id;
+  ensureLiveMsg();
+  (run.events||[]).forEach(applyRunEvent);
+  setLiveStatus('已接回后台任务 · 正在执行');
+  try{ await resumeJob(run.run_id); }
+  catch(e){ const el=liveMsgEl;el&&el.remove();liveCleanup(); }
+  finally{ busy=false;sendBtn.disabled=false;controller=null; }
+  return true;
+}
 function removeLoading(){
   // loading 仅是视觉态，不入 history；只删 DOM
   const el=document.getElementById('loadingMsg');
@@ -1364,8 +1512,10 @@ async function continueFrom(msg,wrapEl){
         else if(ev.type==='tool'&&ev.name){
           const nm=TOOL_LABEL[ev.name]||ev.name;
           if(ev.status==='ok')setAct('✅ '+nm+' 完成');
-          else if(ev.status==='fail')setAct('⚠️ '+nm+' 失败');
+          else if(ev.status==='error')setAct('⚠️ '+nm+' 失败'); // 服务端实际取值是 error
           else setAct('🔧 '+nm+'…');
+        }else if(ev.type==='thinking'&&ev.delta){
+          setAct('💭 正在思考…');
         }else if(ev.type==='done'){
           if(ev.answer!==undefined&&!tail)tail=ev.answer;
           if(ev.model_key)answeredModel=modelLabel(ev.model_key);
@@ -1415,6 +1565,7 @@ async function send(){
   push({role:'user',text:q});
   busy=true;sendBtn.disabled=true;
   controller=new AbortController();
+  activeRunId=null;lastRunSeq=0;      // 新的一轮：清掉上一次的任务追踪
   ensureLiveMsg();
   const wantGeo=needsGeoLocation(q);
   let geoLine=null;
@@ -1475,28 +1626,17 @@ async function send(){
         const payload=raw.slice(5).trim();
         if(!payload||payload==='[DONE]')continue;
         let ev=null;try{ev=JSON.parse(payload)}catch(e){continue}
-        if(ev.type==='answer'&&ev.delta){
+        if(ev.type==='run'){
+          // 服务端告知本次后台任务 id：连接若断，凭它接回去继续看过程
+          activeRunId=ev.run_id||null;lastRunSeq=ev.seq||0;
+        }else if(ev.type==='answer'&&ev.delta){
           answer+=ev.delta;
           if(liveBubbleEl)liveAppend(ev.delta);
           scrollKeep();
+        }else if(ev.type==='thinking'&&ev.delta){
+          liveThinking(ev.delta);
         }else if(ev.type==='tool'&&ev.name){
-          const name=ev.name;
-          if(ev.status==='start'){
-            // 连续的**同名**调用合并成一行（「搜索 ×4」）；换了工具名就另起一行
-            if(curRun&&curRun.name===name){
-              bumpToolRun(curRun,ev.note||'');
-            }else{
-              sealToolRun(curRun,'done');   // 上一组先收尾
-              liveBreakSegment();           // 结束当前文本段，把工具行插在这段文字正下方
-              curRun={name:name,el:addLiveToolLine(name),count:0,notes:[],closed:false};
-              liveActLines[name]=curRun.el;
-              bumpToolRun(curRun,ev.note||'');
-            }
-          }else if(curRun&&curRun.name===name){
-            sealToolRun(curRun,ev.status==='ok'?'done':'fail');
-          }else{
-            settleLiveToolLine(liveActLines[name],ev.status==='ok',ev.note||'');
-          }
+          applyToolEvent(ev);   // 与断线重连的回放共用同一份渲染
           scrollKeep();
         }else if(ev.type==='done'){
           if(ev.answer!==undefined)answer=ev.answer;
@@ -1514,8 +1654,19 @@ async function send(){
               model:answeredModel||modelLabel(modelKey),usage:lastUsage};
     finishLiveStream(it);
   }catch(err){
+    const isAbort=err&&err.name==='AbortError';
+    // 连接断了、但服务端后台任务还在跑（已收到 run 事件）→ 不丢气泡、不报错，
+    // 自动凭 run_id 接回去继续显示处理过程，直到它自己跑完。
+    if(activeRunId&&!isAbort){
+      try{ await resumeJob(activeRunId); }
+      catch(e){
+        const le=liveMsgEl;le&&le.remove();liveCleanup();
+        push({role:'error',text:'接回后台任务失败：'+netErrMsg(e)});
+      }
+      return;
+    }
     const el=liveMsgEl;el&&el.remove();liveCleanup();
-    if(err&&err.name==='AbortError'){
+    if(isAbort){
       push({role:'assistant',text:'⚠️ 已停止生成。'});
     }else if(answer&&answer.trim()){
       // 生成中途断线：先保留已生成的部分，再向服务端确认——它已把半截存下并标记「未完成」
@@ -1597,6 +1748,7 @@ async function doAuth(){
       await refreshMe();           // 【必须】/api/auth 不返回 is_admin，补齐后才能显示云服务器入口
       await loadServerHistory();   // 拉取该用户自己的历史
       await loadModels();          // 拉取可选模型清单
+      restoreActiveJob();          // 服务端还有没跑完的后台任务 → 自动接上（不阻塞首屏）
       localStatus();wsStart();await restoreLocalHandle();geoRender();
       loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
       if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
@@ -2351,6 +2503,7 @@ if(updBtn)updBtn.onclick=async()=>{
       hideAuth();
       await loadServerHistory();   // 历史按登录用户加载，互不可见
       await loadModels();          // 可选模型清单
+      restoreActiveJob();          // 服务端还有没跑完的后台任务 → 自动接上（不阻塞首屏）
       localStatus();wsStart();await restoreLocalHandle();geoRender();
       loadWhatsNew(true);               // 有未读更新 → 登录后自动弹一次
       if(geoEnabled)requestGeo(true);   // 上次开过 → 静默刷新一次坐标
