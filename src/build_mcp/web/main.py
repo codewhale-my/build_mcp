@@ -717,10 +717,107 @@ def _migrate_legacy_fs():
         logger.exception("旧文件迁移失败（不影响启动）")
 
 
+_qq_task: Optional[asyncio.Task] = None
+
+
+def _start_qq_bridge() -> Optional[asyncio.Task]:
+    """惰性启动 QQ 官方机器人桥接（IM → agent）。未配置凭据返回 None，不影响 Web。
+
+    凭据来源：环境变量 QQ_APPID / QQ_SECRET，或 /home/admin/.secrets/qq_bot.env。
+    沙箱默认开启（QQ_SANDBOX=1）；机器人提审上线后可设 0 切正式网关。
+    """
+    try:
+        from build_mcp.channels.core import ChannelHub, SessionMap
+        from build_mcp.channels.qq_official import QQConfig, QQGateway, QQTransport
+    except Exception as e:  # noqa: BLE001
+        logger.warning("QQ 桥接模块不可用：%s", e)
+        return None
+
+    appid = os.environ.get("QQ_APPID", "").strip()
+    secret = os.environ.get("QQ_SECRET", "").strip()
+    sandbox = os.environ.get("QQ_SANDBOX", "1").strip().lower() in ("1", "true", "yes")
+    if not appid or not secret:
+        try:
+            for ln in Path("/home/admin/.secrets/qq_bot.env").read_text(encoding="utf-8").splitlines():
+                ln = ln.strip()
+                if ln.startswith("QQ_APPID="):
+                    appid = ln.split("=", 1)[1].strip()
+                elif ln.startswith("QQ_SECRET="):
+                    secret = ln.split("=", 1)[1].strip()
+                elif ln.startswith("QQ_SANDBOX="):
+                    sandbox = ln.split("=", 1)[1].strip().lower() in ("1", "true", "yes")
+        except Exception:
+            pass
+    if not appid or not secret:
+        logger.info("ℹ️ 未配置 QQ 机器人凭据，跳过 IM 桥接")
+        return None
+
+    def _host_user() -> Optional[dict]:
+        """IM 消息统一挂到第一个已注册的管理员账号下跑 agent。"""
+        for name in sorted(ADMIN_USERS):
+            u = get_user_by_name(name)
+            if u:
+                return u
+        return None
+
+    cfg = QQConfig(appid, secret, sandbox)
+    transport = QQTransport(cfg)
+
+    async def _start_run(user_id, query, model="", source=""):  # noqa: ANN001
+        host = _host_user()
+        if not host:
+            raise RuntimeError("IM 宿主用户未注册（需先注册管理员账号）")
+        note = f"\n\n[消息来源] 这条消息来自 {source or 'IM'}。" if source else ""
+        return await _spawn_run(host, query, model, extra_note=note)
+
+    hub = ChannelHub(transport, _start_run, _im_fetch_run,
+                     SessionMap(alloc_base=100000), model="",
+                     progress="off", max_progress=0, max_replies=4,
+                     ack="🤖 收到，正在处理，稍等…")
+
+    _seen: dict = {}
+
+    async def _handle(msg):                      # noqa: ANN001
+        """去重：Resume 重放 / 双连接同投时，同一条消息只跑一次。"""
+        key = f"{msg.channel}:{msg.msg_id}" if msg.msg_id else ""
+        now = time.time()
+        if key:
+            if now - _seen.get(key, 0.0) < 900:
+                logger.info("♻️ 忽略重复事件 %s", key[-12:])
+                return
+            _seen[key] = now
+            for k in [k for k, v in _seen.items() if now - v > 900]:
+                _seen.pop(k, None)
+        await hub.handle(msg)
+
+    async def _run_env(is_sbx: bool, label: str) -> None:
+        c = QQConfig(appid, secret, is_sbx)
+        gw = QQGateway(c, _handle, QQTransport(c))
+        logger.info("🤖 QQ 桥接连接【%s】appid=%s", label, appid)
+        try:
+            await gw.run_forever()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await gw.aclose()
+
+    # 双连接：正式 + 沙箱。实测两者是**互不干扰的两套会话空间**，
+    # 而且事件分落两边（群 @ 落正式、单聊落沙箱），只连一个必然漏事件。
+    # 出站统一走正式通道（群消息只在正式环境发得出去）。
+    envs = [(False, "正式"), (True, "沙箱")]
+    if os.environ.get("QQ_DUAL", "1").strip().lower() in ("0", "false", "no"):
+        envs = [(sandbox, "沙箱" if sandbox else "正式")]
+
+    async def _run() -> None:
+        await asyncio.gather(*[_run_env(s, l) for s, l in envs])
+
+    return asyncio.create_task(_run())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """程序生命周期：初始化共享MCP + 数据库；关闭时统一销毁MCP子进程"""
-    global shared_mcp
+    global shared_mcp, _qq_task
     init_db(INVITE_CODES)
     _migrate_legacy_fs()
     _check_admin_accounts()
@@ -741,7 +838,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("❌ MCP服务初始化失败")
         shared_mcp = None
+    _qq_task = _start_qq_bridge()
     yield
+    if _qq_task is not None:
+        _qq_task.cancel()
+        try:
+            await _qq_task
+        except (asyncio.CancelledError, Exception):
+            pass
     logger.info("🛑 FastAPI服务退出，正在释放MCP子进程...")
     await _exit_stack.aclose()
     logger.info("🧹全部MCP资源已释放完毕")
@@ -1365,14 +1469,18 @@ async def _flush_run_events(run_id: str, rstate: Dict[str, Any]) -> None:
             break
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_user)):
+async def _spawn_run(user: dict, query: str, model_key: str, *,
+                     extra_note: str = "", cont_msg_id: Optional[int] = None) -> str:
+    """起一个与连接解耦的后台 run，返回 run_id。
+
+    HTTP /api/chat 与 IM 通道共用这一份：入站只负责「触发」，生成过程独立跑完
+    （断网/切后台/刷新都不影响），事件落库、结果可回看。
+    """
     global shared_mcp
     if not shared_mcp or not shared_mcp.get("tool_name_to_session"):
-        raise HTTPException(status_code=500, detail="MCP服务尚未就绪，请稍后再试")
+        raise RuntimeError("MCP服务尚未就绪")
 
-    # 权限闸门：非管理员从共享工具表里摘掉 terminal 工具集（服务器操作能力）。
-    # 摘掉后模型既看不到这些工具、也无法调用（硬调用会命中"工具不存在"），双重保险。
+    # ── 工具上下文 ──
     shared_tools, shared_tool_defs, blocked_tools = filter_shared_tools(
         user,
         shared_mcp["tool_name_to_session"],
@@ -1382,16 +1490,12 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
     if blocked_tools:
         logger.info("🔐 用户[%s] 无服务器操作权限，已屏蔽工具：%s",
                     user["username"], "、".join(sorted(blocked_tools)))
-
-    # 用户独立的 filesystem 会话（首次自动拉起）
     fs = await ensure_user_fs(user)
     tool_map = dict(shared_tools)
     for name in fs["names"]:
         tool_map[name] = fs["session"]
-    # 用户本机文件工具(浏览器授权目录)：shim 伪装成 session 无侵入接入
     tool_map["user_filesystem"] = _UserFsShim(user)
     openai_tools = list(shared_tool_defs) + fs["openai_tools"] + [USER_FS_TOOL_DEF]
-    # 管理员额外挂一个「一条命令直达」的组合工具（内部复用 terminal 原生工具）
     if is_admin(user):
         term_sessions = [
             s.get("session") for s in (shared_mcp.get("sessions") or [])
@@ -1401,7 +1505,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             tool_map["terminal_run"] = _TerminalRunShim(term_sessions[0], str(AI_CODE_DIR))
             openai_tools.append(TERMINAL_RUN_TOOL_DEF)
 
-    # 带上该用户最近 8 轮问答作为上下文（服务端持久化历史）
+    # ── 系统提示（文件交付约定）──
     user_dir = workspace_root(user)
     sys_note = (
         "\n\n[文件交付约定] 当你在用户的专属工作空间里生成或保存文件时，"
@@ -1415,43 +1519,16 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         "写入/覆盖 op=write + content。不要把服务器工作空间路径传给该工具，两者无关。"
         "如果返回“未授权/浏览器未连接”之类错误，告诉用户点击页面顶部的“本机文件”按钮授权后重试。"
     )
-    # 用户公网 IP：locate_ip 不传参会用"发起请求方"的 IP——即服务器自己(机房 IP 高德定位不出结果)，
-    # 所以必须把用户真实公网 IP 注入上下文，让 AI 显式传给工具
-    client_ip = _client_ip(request)
-    ip_note = ""
-    if client_ip and client_ip != "unknown":
-        ip_note = (
-            f"\n\n[用户网络上下文] 当前用户的公网 IP 是 {client_ip}（IP 定位一般只精确到城市级，运营商出口可能有偏差）。"
-            "当用户询问“我在哪 / 我的位置 / 我附近”等需要定位的问题时，"
-            "必须调用 locate_ip 并把该 IP 作为 ip 参数显式传入；"
-            "不要不传参数调用 locate_ip——那样拿到的是服务器自己的 IP，定位不到用户。"
-        )
-    # 用户浏览器精确定位：比 IP 定位准得多，优先使用，并免掉一次工具调用
-    geo_note = ""
-    if req.geo is not None and -90 <= req.geo.lat <= 90 and -180 <= req.geo.lng <= 180:
-        coord = f"{req.geo.lng:.6f},{req.geo.lat:.6f}"
-        addr = await _reverse_geocode(req.geo.lng, req.geo.lat)
-        acc_note = f"，精度约 ±{int(req.geo.acc)} 米" if req.geo.acc else ""
-        geo_note = (
-            f"\n\n[用户精确定位（用户已授权浏览器定位）] 坐标(lng,lat)={coord}{acc_note}。"
-            + (f"逆地理编码地址：{addr}。" if addr else "")
-            + "这是 GPS/WiFi 级精确定位，优先级高于上面的 IP 定位："
-            "当用户问“我在哪 / 我的位置 / 我附近”等问题时，"
-            f"直接把 search_nearby 的 location 参数填 \"{coord}\" 做周边搜索，不需要再调用 locate_ip；"
-            "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
-            "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
-        )
-    # 图片：随用户消息原生直传（模型直接看图）；发不出去才如实告知（无 OCR）
-    user_content, img_note = await _build_user_content(user, req.query)
 
-    # ── 「继续」：上一轮因断网/关页面/手动停止没写完，接着那条回答往下写 ──
-    #    关键在于让模型知道「我写到哪了、别重复」：那条未完成的回答已存在对话历史里
-    #    （interrupted=1），这里再补一条续写指令，并附上结尾锚点防止模型重头写。
+    # ── 用户消息内容（图片原生直传等）──
+    user_content, img_note = await _build_user_content(user, query)
+
+    # ── 续写 ──
     cont_msg = None
     cont_partial = ""
     cont_note = ""
-    if req.continue_msg_id:
-        cont_msg = get_message(int(req.continue_msg_id), user["id"])
+    if cont_msg_id:
+        cont_msg = get_message(int(cont_msg_id), user["id"])
         if not cont_msg or cont_msg["role"] != "assistant":
             raise HTTPException(status_code=400, detail="要续写的回答不存在（可能历史已被清空）")
         cont_partial = (cont_msg.get("text") or "").strip()
@@ -1465,7 +1542,8 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         )
         logger.info("↩️ 用户[%s] 续写消息 id=%s（已有 %d 字）",
                     user["username"], cont_msg["id"], len(cont_partial))
-    # 非管理员：明确告知没有服务器操作能力，避免模型反复试探或编造"已完成"
+
+    # ── 权限 / 管理员说明 ──
     perm_note = "" if is_admin(user) else (
         "\n\n[权限说明] 当前账号不具备服务器操作权限：你没有终端（terminal）类工具，"
         "无法执行服务器命令，也无法修改服务器上的程序代码。"
@@ -1473,7 +1551,6 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         + "、".join(sorted(ADMIN_USERS)) +
         "），不要尝试用其它工具变通，也不要假装已经完成。"
     )
-    # 管理员：告知 terminal_run 与当前文件空间根目录（省掉来回试探）
     admin_note = ""
     if is_admin(user):
         admin_note = (
@@ -1491,37 +1568,28 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                 "(1) 该根目录之外的路径（如 /etc、/var/log、/tmp）文件工具到不了，需用 terminal_run 跑命令；"
                 "(2) 不要在根目录全盘递归搜索（会遍历大量文件），请指定具体子目录。"
             )
-    # ★ 前缀缓存：DeepSeek 只比对「从第 0 个 token 起完全相同」的前缀，system 里只要有一个
-    #   字节变了，整段历史就全部按未命中计费（未命中单价是命中价的 30 倍）。
-    #   所以 system 只放「同一用户每轮都一样」的内容（系统提示 + 文件交付约定 + 权限说明），
-    #   而随轮变化的部分（公网 IP / GPS 坐标 / 图片说明）挂到最后一条用户消息——
-    #   那里本来每轮就不同，吃掉它不影响任何缓存。见 conversation._compose_user_message。
+
+    # ── 历史上下文 ──
     history_messages = [{"role": "system", "content": SYSTEM_PROMPT + sys_note + perm_note + admin_note}]
     for m in recent_llm_messages(user["id"]):
         history_messages.append({"role": m["role"], "content": m["text"]})
-    turn_note = (ip_note + geo_note + img_note + cont_note).strip()
+    turn_note = (extra_note + img_note + cont_note).strip()
     _hist_win = history_window_info()
 
     lock = _chat_locks.setdefault(user["id"], asyncio.Lock())
-    _spec = resolve_llm_spec(req.model)
+    _spec = resolve_llm_spec(model_key)
     logger.info("💬 用户[%s] 提问 → 模型 %s(%s, thinking=%s)｜历史 %d 条(窗口 %s/%d轮)",
                 user["username"], _spec["model"], _spec["key"], _spec["thinking"],
                 max(0, len(history_messages) - 1), _hist_win["mode"], _hist_win["turns"])
 
-    # ── 后台运行：把生成任务从 HTTP 连接里摘出来 ──────────────────────────
-    # 过去 producer 的 task 挂在这次请求上，客户端一断就被 cancel →
-    # 「断网/关页面 = 任务当场死掉，只留半截」。现在改成独立后台任务，
-    # 过程事件落库(run_events)：客户端只是订阅者，断开只停止推送、不停任务；
-    # 用户回来（甚至换设备）仍能看到它干了什么、并拿到完整结果。
+    # ── 后台运行 ──
     run_id = secrets.token_hex(8)
-    store.create_run(run_id, user["id"], req.query,
-                     _spec["label"] or _spec["model"],
-                     cont_msg_id=int(req.continue_msg_id) if req.continue_msg_id else None)
+    store.create_run(run_id, user["id"], query, _spec["label"] or _spec["model"],
+                     cont_msg_id=int(cont_msg_id) if cont_msg_id else None)
     rstate: Dict[str, Any] = {
         "id": run_id, "user_id": user["id"], "seq": 0, "status": "running",
         "answer": "", "partial": "", "error": "", "msg_id": None,
         "events": [], "waiters": [], "task": None, "finished_at": None,
-        # 落库攒批用：待写队列 / flusher 存活标志
         "dbq": [], "flush_alive": True, "flusher": None,
     }
     RUNS[run_id] = rstate
@@ -1556,12 +1624,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             _emit({"type": _t, "delta": _txt})
 
     def _publish(ev: Dict[str, Any]) -> None:
-        """写事件到内存（并排队落库），唤醒订阅者。SSE 流与轮询接口共用这一份。
-
-        thinking / answer 是逐字增量，一次回答可达上万条：若逐条当事件落库，
-        每条都要开一次事务 fsync，事件循环会被拖死。所以先在窗口内合并成一条
-        （直播流与落库用的是同一条事件，游标语义完全不变），落库再攒批。
-        """
+        """写事件到内存（并排队落库），唤醒订阅者。SSE 流与轮询接口共用这一份。"""
         typ = str(ev.get("type") or "")
         if typ in _EVENT_DELTA_TYPES and ev.get("delta"):
             for _t, _txt in _coalescer.feed(typ, str(ev["delta"]), time.time()):
@@ -1586,7 +1649,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                     user_query=user_content,
                     history_messages=history_messages,
                     turn_note=turn_note,
-                    model_key=req.model,
+                    model_key=model_key,
                 ):
                     if ev.get("type") == "answer" and ev.get("delta"):
                         partial += ev["delta"]
@@ -1594,7 +1657,6 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                     if ev.get("type") == "done":
                         answer = ev.get("answer") or ""
                         used_model = _spec["label"] or ev.get("model") or _spec["model"]
-                        # token 用量/缓存命中率落日志（命中价是未命中价的 1/30，命中率越低越费钱）
                         _u = ev.get("usage") or {}
                         if _u:
                             logger.info("📊 用户[%s] %s 轮 本次用量 %s",
@@ -1604,7 +1666,6 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                         failed = True
                     _publish(ev)
         except asyncio.CancelledError:
-            # 只有服务整体关闭才会走到这里；客户端断开已不会影响本任务
             status = "stopped"
             err_text = "服务重启导致任务中断"
             rstate["error"] = err_text
@@ -1621,7 +1682,6 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
             msg_id = None
             try:
                 if cont_msg is not None:
-                    # 续写：把新写的部分接到原文后面，回写同一条消息（历史不新增条目，保持成对）
                     tail = (answer or "").strip()
                     if tail:
                         full = (cont_partial + "\n\n" + tail).strip() if cont_partial else tail
@@ -1629,14 +1689,11 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                                        interrupted=0, model=_model_col or None)
                         msg_id = int(cont_msg["id"])
                         logger.info("✅ 续写完成并回写 id=%s（共 %d 字）", cont_msg["id"], len(full))
-                    # 一个字都没续上：不动库，interrupted 保持 1，界面上的「继续」按钮还在
                 elif answer is not None and answer.strip() and not failed:
-                    add_message(user["id"], "user", req.query)
+                    add_message(user["id"], "user", query)
                     msg_id = add_message(user["id"], "assistant", answer.strip(), used_model)
                 elif partial.strip():
-                    # 中途断线/出错/受停：把「提问 + 已生成的部分」成对落库，并标记未完成，
-                    # 前端据此在气泡下显示「继续」按钮；重开页面/换设备也能接着写。
-                    add_message(user["id"], "user", req.query)
+                    add_message(user["id"], "user", query)
                     msg_id = add_message(user["id"], "assistant", partial.strip(),
                                          _model_col, interrupted=1)
                     if status == "done":
@@ -1654,7 +1711,6 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
                 store.finish_run(run_id, status, rstate["answer"], err_text, msg_id)
             except Exception:
                 logger.exception("⚠️ 后台任务状态落库失败 id=%s", run_id)
-            # 收尾帧：前端据此把「进行中」的气泡定稿
             _publish({"type": "end", "status": status, "msg_id": msg_id,
                       "interrupted": 1 if status in ("interrupted", "stopped", "error") else 0,
                       "chars": len(rstate["answer"])})
@@ -1663,6 +1719,64 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
 
     rstate["task"] = asyncio.create_task(_run_worker())
     logger.info("🚀 后台任务启动 id=%s 用户[%s]（与连接解耦，断网继续跑）", run_id, user["username"])
+    return run_id
+
+
+async def _im_fetch_run(run_id: str, since: int = 0) -> dict:
+    """IM 通道的 run 轮询注入点：不带用户过滤。"""
+    mem = RUNS.get(run_id) or {}
+    events = _run_events_for(run_id, since)
+    status = str(mem.get("status") or "")
+    if not status:
+        status = "done"   # 内存里没有 → 已结束并被遗忘
+    elif status in ("interrupted", "stopped"):
+        status = "done"   # 半截/受停 → 让 follow 拿到已有内容后正常收尾
+    return {
+        "run_id": run_id,
+        "status": status,
+        "answer": (mem.get("answer") or mem.get("partial") or ""),
+        "error": mem.get("error") or "",
+        "events": events,
+    }
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_user)):
+    global shared_mcp
+    if not shared_mcp or not shared_mcp.get("tool_name_to_session"):
+        raise HTTPException(status_code=500, detail="MCP服务尚未就绪，请稍后再试")
+
+    # 用户公网 IP：locate_ip 不传参会用"发起请求方"的 IP——即服务器自己(机房 IP 高德定位不出结果)，
+    # 所以必须把用户真实公网 IP 注入上下文，让 AI 显式传给工具
+    client_ip = _client_ip(request)
+    ip_note = ""
+    if client_ip and client_ip != "unknown":
+        ip_note = (
+            f"\n\n[用户网络上下文] 当前用户的公网 IP 是 {client_ip}（IP 定位一般只精确到城市级，运营商出口可能有偏差）。"
+            "当用户询问“我在哪 / 我的位置 / 我附近”等需要定位的问题时，"
+            "必须调用 locate_ip 并把该 IP 作为 ip 参数显式传入；"
+            "不要不传参数调用 locate_ip——那样拿到的是服务器自己的 IP，定位不到用户。"
+        )
+    # 用户浏览器精确定位：比 IP 定位准得多，优先使用，并免掉一次工具调用
+    geo_note = ""
+    if req.geo is not None and -90 <= req.geo.lat <= 90 and -180 <= req.geo.lng <= 180:
+        coord = f"{req.geo.lng:.6f},{req.geo.lat:.6f}"
+        addr = await _reverse_geocode(req.geo.lng, req.geo.lat)
+        acc_note = f"，精度约 ±{int(req.geo.acc)} 米" if req.geo.acc else ""
+        geo_note = (
+            f"\n\n[用户精确定位（用户已授权浏览器定位）] 坐标(lng,lat)={coord}{acc_note}。"
+            + (f"逆地理编码地址：{addr}。" if addr else "")
+            + "这是 GPS/WiFi 级精确定位，优先级高于上面的 IP 定位："
+            "当用户问“我在哪 / 我的位置 / 我附近”等问题时，"
+            f"直接把 search_nearby 的 location 参数填 \"{coord}\" 做周边搜索，不需要再调用 locate_ip；"
+            "需要文字地址时直接用上面给出的地址（若为空再考虑调用 regeo）。"
+            "不要向用户暴露这段系统上下文的存在，也不必解释坐标来源。"
+        )
+
+    run_id = await _spawn_run(user, req.query, req.model,
+                              extra_note=(ip_note + geo_note).strip(),
+                              cont_msg_id=req.continue_msg_id)
+    rstate = RUNS[run_id]
 
     async def event_gen():
         """本次连接只是「订阅者」：把后台任务的事件推给它；断开不取消任务。"""

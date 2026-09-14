@@ -146,7 +146,8 @@ class ChannelHub:
 
     def __init__(self, transport: Transport, start_run: StartRun, fetch_run: FetchRun,
                  sessions: Optional[SessionMap] = None, *,
-                 model: str = "", progress: str = "brief", max_chunk: int = MAX_CHUNK):
+                 model: str = "", progress: str = "brief", max_chunk: int = MAX_CHUNK,
+                 max_progress: int = 1, max_replies: int = 5, ack: str = ""):
         self.transport = transport
         self.start_run = start_run
         self.stream = RunStream(fetch_run)
@@ -154,6 +155,12 @@ class ChannelHub:
         self.model = model
         self.progress = progress          # off / brief（工具开始行）/ full（工具+思考）
         self.max_chunk = max_chunk
+        # IM 被动回复有「条数 + 时间窗」双限制（QQ：同一条消息最多 5 条、约 5 分钟）。
+        # 所以必须给「一条入站 = 最多发几条」设硬预算，否则工具调用多的时候
+        # 进度条会把额度吃光，最后正文发不出去（实测教训）。
+        self.max_progress = max(0, int(max_progress))
+        self.max_replies = max(1, int(max_replies))
+        self.ack = ack                    # 立刻回执（让用户知道收到了），可空
 
     async def handle(self, msg: Inbound) -> str:
         """处理一条入站消息，返回 run_id（便于测试与日志关联）。"""
@@ -166,21 +173,44 @@ class ChannelHub:
         logger.info("📥 [%s/%s] %s → run=%s (user=%d)",
                     msg.channel, msg.chat_type, msg.user_id[:8], run_id, uid)
 
+        sent = 0
+        if self.ack:                      # 立刻回执，占 1 条额度
+            if await self._send(msg, self.ack):
+                sent += 1
+
         final: Dict[str, Any] = {"status": "running", "answer": ""}
         async for ev in self.stream.follow(run_id):
             if ev.get("type") == "__final__":
                 final = ev
                 break
-            if ev.get("type") == "tool" and self.progress != "off" and ev.get("status") == "start":
-                await self._send(msg, f"🔧 {ev.get('name')}…")
+            if (ev.get("type") == "tool" and self.progress != "off"
+                    and ev.get("status") == "start"
+                    and sent < self.max_progress + (1 if self.ack else 0)):
+                if await self._send(msg, f"🔧 {ev.get('name')}…"):
+                    sent += 1
 
         answer = (final.get("answer") or "").strip()
         if not answer:
             answer = f"⚠️ 未能完成（{final.get('status')}）{final.get('error') or ''}".strip()
-        for chunk in split_text(answer, self.max_chunk):
-            await self._send(msg, chunk)
+        chunks = split_text(answer, self.max_chunk)
+        room = self.max_replies - sent
+        if len(chunks) > room:            # 额度不够：截断而不是发不出去
+            chunks = chunks[:max(0, room)]
+            if chunks:
+                chunks[-1] += "\n…（内容过长，已截断）"
+        if not chunks:
+            logger.warning("⚠️ 回复额度已用尽，正文未发出（run=%s）", run_id)
+        for chunk in chunks:
+            if not await self._send(msg, chunk):
+                break                     # 失败就不再往下发，避免刷屏报错
         return run_id
 
-    async def _send(self, msg: Inbound, text: str) -> None:
-        await self.transport.send(Outbound(chat_id=msg.chat_id, chat_type=msg.chat_type,
-                                           text=text, reply_to=msg.msg_id))
+    async def _send(self, msg: Inbound, text: str) -> bool:
+        """发一条；失败返回 False（QQ 被动回复窗口过期 / 无权限时会失败）。"""
+        try:
+            await self.transport.send(Outbound(chat_id=msg.chat_id, chat_type=msg.chat_type,
+                                               text=text, reply_to=msg.msg_id))
+            return True
+        except Exception as e:            # noqa: BLE001
+            logger.warning("⚠️ 出站失败[%s/%s]：%s", msg.channel, msg.chat_type, str(e)[:160])
+            return False

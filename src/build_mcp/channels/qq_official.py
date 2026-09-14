@@ -89,6 +89,7 @@ class QQTransport:
         self._client = client or httpx.AsyncClient(timeout=15)
         self._token = ""
         self._exp = 0.0
+        self._msg_seq: Dict[str, int] = {}   # msg_id → 已发送条数（防去重拒收）
 
     async def token(self) -> str:
         """access_token 有有效期，提前 60 秒续期。"""
@@ -112,6 +113,13 @@ class QQTransport:
         body: Dict[str, Any] = {"content": msg.text, "msg_type": 0}
         if msg.reply_to:
             body["msg_id"] = msg.reply_to       # 被动回复
+            # 同一条入站消息要回多条（ack + 分片正文）：第 2 条起必须递增 msg_seq，
+            # 否则腾讯按「重复消息」拒收（400 code=40054005 消息被去重，请检查请求msgseq）。
+            seq = self._msg_seq.get(msg.reply_to, 0) + 1
+            if len(self._msg_seq) > 512:        # 锚点 map 防无界增长
+                self._msg_seq.clear()
+            self._msg_seq[msg.reply_to] = seq
+            body["msg_seq"] = seq
         r = await self._client.post(self._url(msg), json=body,
                                     headers={"Authorization": f"QQBot {tok}"})
         if r.status_code >= 300:
