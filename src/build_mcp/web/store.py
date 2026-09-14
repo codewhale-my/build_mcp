@@ -548,17 +548,30 @@ def latest_run(user_id: int, fresh_seconds: float = 6 * 3600) -> dict | None:
         conn.close()
 
 
-def append_run_event(run_id: str, seq: int, type_: str, data: str = "") -> None:
-    """追加一条过程事件（JSON 文本由调用方序列化，store 层不依赖 json）。"""
+def append_run_events(run_id: str, rows: list) -> None:
+    """批量追加过程事件：一次连接 + 一次事务，避免每条事件单独 fsync。
+
+    rows 为 [(seq, type, data_json, ts), ...]。一次回答会产生上万条过程事件，
+    若逐条各开一次连接与事务，每次 commit 都要 fsync 落盘，会直接把 asyncio
+    事件循环拖死（表现就是网页很卡）。这里用 executemany 一次写完一批。
+    """
+    if not rows:
+        return
     conn = _conn()
     try:
         with conn:
-            conn.execute(
+            conn.executemany(
                 "INSERT OR REPLACE INTO run_events(run_id,seq,type,data,ts) VALUES(?,?,?,?,?)",
-                (run_id, int(seq), type_ or "", data or "", time.time()),
+                [(run_id, int(s), str(t or ""), str(d or ""), float(ts))
+                 for (s, t, d, ts) in rows],
             )
     finally:
         conn.close()
+
+
+def append_run_event(run_id: str, seq: int, type_: str, data: str = "") -> None:
+    """追加一条过程事件（旧接口，保留兼容；高频场景请用 append_run_events 批量写）。"""
+    append_run_events(run_id, [(seq, type_, data, time.time())])
 
 
 def run_events_since(run_id: str, since: int = 0, limit: int = 4000) -> list[dict]:
