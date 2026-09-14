@@ -451,14 +451,19 @@ curl -s https://47.108.234.194/api/whatsnew -H "Authorization: Bearer <token>"
   （`"YANGHJ"`、`"yanghj "` 这类仿冒名不会被误判为管理员，否则等于提权）。
   启动时 `_check_admin_accounts()` 会核对名单里每个账号是否已注册，未注册打 WARNING。
 - **权限差异**（`is_admin()`）：
-  - 管理员：共享工具保留 terminal 全套，另挂一个组合工具 `terminal_run`；可把文件空间切到「云服务器·整机」。
+  - 管理员：共享工具保留 terminal 全套，另挂一个组合工具 `terminal_run`；可把文件空间切到「云服务器·SERVER_WS_ROOT」（默认 `/home/admin`）。
   - 非管理员：按「工具归属哪个 MCP 会话」剔除 terminal 工具集（不靠名字前缀猜，terminal 换实现也不会漏），
     并在提示词里明确告知无权操作服务器，避免模型反复试探或假装已完成。
 - **云服务器工作空间**：`POST /api/workspace {"mode":"local"|"server"}`，状态存 `users.ws_mode`（自动迁移补列）。
-  切到 `server` 后 filesystem MCP 的根变成 `MCP_WEB_SERVER_ROOT`（默认 `/`），AI 可直接读改整机文件。
-  - 护栏 `_FsGuardShim` 只挡 `/proc`、`/sys`、`/dev`、`/run` 与「从 `/` 全盘递归」——不是收权限
-    （管理员本就该有整机权限），是防止一次 `list_directory("/")` / `search_files("/")` 把服务拖死。
-  - HTTP 侧 `_safe_user_file()` 改为多根白名单：个人工作空间恒可访问（上传文件落点），server 模式下追加整机根。
+  切到 `server` 后 filesystem MCP 的根变成 `MCP_WEB_SERVER_ROOT`（**默认 `~/`，即 `/home/admin`**），
+  AI 直接在该目录下读写文件。**默认不再暴露整台服务器**：一次 `list_directory("/")` 就要遍历整块磁盘，
+  是拖垮 1.6G 小内存机的头号来源。
+  需要恢复整机范围时，在 unit 里显式加 `Environment=MCP_WEB_SERVER_ROOT=/` 再 `daemon-reload && restart`。
+  根目录之外的路径（`/etc`、`/var/log`、`/tmp` 等）文件工具到不了，AI 需改用 `terminal_run` 跑命令。
+  - 护栏 `_FsGuardShim` 只挡 `/proc`、`/sys`、`/dev`、`/run` 与「从根全盘递归」——只有根为 `/` 时才拦得到东西
+    （默认根 `/home/admin` 下 filesystem 本就到不了这些路径，等价直通），是防止一次
+    `list_directory("/")` / `search_files("/")` 把服务拖死。
+  - HTTP 侧 `_safe_user_file()` 改为多根白名单：个人工作空间恒可访问（上传文件落点），server 模式下追加 `SERVER_WS_ROOT`。
 - **`terminal_run`**：一次调用完成「建/复用会话 → 发送 → 等待结束 → 读输出」并带回退出码，
   `session_id` 可复用（保留 cwd / 环境变量 / 已激活 venv）。交互式程序（vim/htop、需要确认的提示）仍走原生 `terminal_*`。
 - **工具输出截断**：`conversation.truncate_tool_output()`，上限 `MCP_WEB_TOOL_OUTPUT_LIMIT`（默认 4000 字符，

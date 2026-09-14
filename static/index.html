@@ -1845,6 +1845,14 @@ async function forgetWs(name){
   await saveWsList(list.filter(x=>x&&x.name!==name));
 }
 
+/* 云服务器工作空间的显示名：根为 / 时叫“整机”，否则取末段目录名（/home/admin → admin） */
+function wsRootLabel(){
+  const r=me.serverRoot||'';
+  if(!r||r==='/')return '云服务器 · 整机';
+  const seg=r.split('/').filter(Boolean);
+  return '云服务器 · '+(seg.length?seg[seg.length-1]:'整机');
+}
+
 function localStatus(){
   const bar=$('#wsBar');
   if(!bar)return;
@@ -1854,8 +1862,8 @@ function localStatus(){
   if(!localBtn)return;
   if(wsMode==='server'){
     localBtn.className='lbtn on';
-    localBtn.querySelector('.txt').textContent='云服务器 · 整机';
-    localBtn.title='当前工作空间：整台云服务器（'+(me.serverRoot||myUserRoot)+'）。点击可切换';
+    localBtn.querySelector('.txt').textContent=wsRootLabel();
+    localBtn.title='当前工作空间：云服务器 '+(me.serverRoot||myUserRoot)+'。点击可切换';
     return;
   }
   if(localHandle){
@@ -1881,7 +1889,7 @@ async function restoreLocalHandle(){
   }catch(e){}
   localHandle=null;localStatus();
 }
-/* 切换服务器端文件空间模式: local=个人工作空间 / server=整台云服务器(仅管理员) */
+/* 切换服务器端文件空间模式: local=个人工作空间 / server=服务器目录 SERVER_WS_ROOT(仅管理员，默认 ~/ 即 /home/admin) */
 async function postWsMode(mode){
   try{
     const r=await fetch('/api/workspace',{
@@ -2165,7 +2173,7 @@ async function openWsMenu(){
     html+='<div class="ws-hd"><span>云服务器（管理员）</span></div>';
     html+='<button class="ws-item" id="wsServerItem">'+
       '<span class="wi-ico">☁️</span>'+
-      '<span class="wi-name">云服务器 · 整台服务器</span>'+
+      '<span class="wi-name">云服务器 · '+(me.serverRoot==='/'?'整台服务器':esc(me.serverRoot||'/'))+'</span>'+
       (wsMode==='server'?'<span class="wi-now">当前</span>':'<span class="wi-tag">'+esc(srvName)+'</span>')+
     '</button>';
   }

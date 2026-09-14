@@ -146,12 +146,15 @@ def filter_shared_tools(user: dict, tool_map: dict, tool_defs: list, sessions) -
 # ====================== 云服务器工作空间（仅管理员） ======================
 # 管理员的文件空间有两种根目录可选：
 #   local  = 自己的个人工作空间（默认，与所有用户一致）
-#   server = 整台云服务器（根目录 /），也就是 AI 自己所在的这台机器
-# 切到 server 后，filesystem 工具直接读写整机文件，不必再靠 terminal 一条条 cat/sed。
+#   server = 服务器上的 SERVER_WS_ROOT（默认 ~/，即 /home/admin；可用环境变量覆盖为 /）
+# 切到 server 后，filesystem 工具直接读写该根目录下的文件，不必再靠 terminal 一条条 cat/sed。
+# 默认根 = admin 家目录（/home/admin），不再把整台服务器 / 直接暴露给文件工具：
+# 一次 list_directory("/") / search_files("/") 就能遍历整块磁盘，是拖垮服务的头号来源。
+# 确实需要整机范围时，显式设环境变量 MCP_WEB_SERVER_ROOT=/（不设 = /home/admin）。
 # /proc、/sys、/dev、/run 是虚拟文件系统（不是真实磁盘内容，遍历会拖垮服务），单独排除。
 # AI 自己那份代码目录见 AI_CODE_DIR，只用作 terminal_run 的默认 cwd。
 # 非管理员永远只能是 local（在 /api/workspace 与 user_ws_mode 两处强制）。
-SERVER_WS_ROOT = Path(os.environ.get("MCP_WEB_SERVER_ROOT", "/")).resolve()
+SERVER_WS_ROOT = Path(os.environ.get("MCP_WEB_SERVER_ROOT", str(Path.home()))).resolve()
 # AI 自己那份代码目录：terminal_run 的默认工作目录（省得每条命令都 cd）。
 AI_CODE_DIR = Path(
     os.environ.get("MCP_WEB_AI_CODE_DIR", str(Path.home() / "build-mcp"))
@@ -185,7 +188,7 @@ def allowed_roots(user: dict) -> list:
     """HTTP 接口（上传/下载/图片）允许访问的服务器目录白名单。
 
     个人工作空间恒在列——上传的文件都落在那里，切到云服务器后仍要能取用；
-    整台服务器（/）只在管理员切到 server 模式时加入。
+    SERVER_WS_ROOT（默认 /home/admin）只在管理员切到 server 模式时加入。
     """
     roots = [user_filesystem_dir(user["username"], user["id"]).resolve()]
     if user_ws_mode(user) == WS_MODE_SERVER:
@@ -611,9 +614,10 @@ shared_mcp: Dict[str, Any] | None = None
 
 
 class _FsGuardShim:
-    """整机文件空间的护栏：只挡「虚拟文件系统」和「从 / 全盘递归」。
+    """文件空间的护栏：只挡「虚拟文件系统」和「从根全盘递归」。
 
-    仅在 SERVER_WS_ROOT 覆盖到整机（/）时才有实际拦截；其它情况是直通代理。
+    只在 SERVER_WS_ROOT 覆盖到整机（/）时才真正拦得到东西；默认根 /home/admin 下
+    filesystem 子进程本来就访问不到 /proc、/sys，此时等价于直通代理。
     目的**不是**缩小管理员的权限（管理员本就该有整机权限），而是防止一次
     list_directory("/") 或 search_files("/") 把服务拖死：/proc、/sys 不是真实
     磁盘内容（/proc 下还有读一下就会阻塞的伪文件），从 / 递归则要遍历整块磁盘。
@@ -652,7 +656,7 @@ class _FsGuardShim:
 
 async def ensure_user_fs(user: dict) -> dict:
     """
-    为该用户懒启动独立的 filesystem MCP 子进程（local=用户专属目录 / server=整机 /）。
+    为该用户懒启动独立的 filesystem MCP 子进程（local=用户专属目录 / server=SERVER_WS_ROOT）。
     结果缓存，同一用户复用；生命周期挂在全局 exit_stack 上随服务退出。
     """
     uid = user["id"]
@@ -1455,12 +1459,12 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(require_
         )
         if user_ws_mode(user) == WS_MODE_SERVER:
             admin_note += (
-                f"\n[云服务器工作空间] 当前文件空间根目录是 {SERVER_WS_ROOT}（整台服务器，"
-                "也就是你自己所在的这台机器）：read_file / write_file / edit_file / list_directory / "
-                f"search_files 可作用于整机任意真实路径；你自己的代码在 {AI_CODE_DIR}。"
+                f"\n[云服务器工作空间] 当前文件空间根目录是 {SERVER_WS_ROOT}："
+                "read_file / write_file / edit_file / list_directory / "
+                f"search_files 可作用于该目录下的任意真实路径；你自己的代码在 {AI_CODE_DIR}。"
                 "优先用它们读写文件，不要再用终端里的 cat/sed/echo 改代码。两点注意："
-                "(1) /proc、/sys、/dev、/run 属虚拟文件系统，已被护栏挡住，不要反复尝试；"
-                "(2) 搜索/列目录不要从 / 全盘递归（会遍历整块磁盘），请指定具体子目录。"
+                "(1) 该根目录之外的路径（如 /etc、/var/log、/tmp）文件工具到不了，需用 terminal_run 跑命令；"
+                "(2) 不要在根目录全盘递归搜索（会遍历大量文件），请指定具体子目录。"
             )
     # ★ 前缀缓存：DeepSeek 只比对「从第 0 个 token 起完全相同」的前缀，system 里只要有一个
     #   字节变了，整段历史就全部按未命中计费（未命中单价是命中价的 30 倍）。
