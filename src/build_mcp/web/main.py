@@ -64,6 +64,7 @@ from mcp.client.session import ClientSession
 from build_mcp.web import store
 from build_mcp.web.whatsnew import latest_version, payload_for
 from build_mcp.web import riot_token
+from build_mcp.web import im_summary
 from build_mcp.web.store import (
     init_db,
     save_riot_binding,        # 瓦洛兰特：浏览器登录后回填令牌
@@ -724,6 +725,7 @@ def _migrate_legacy_fs():
 
 
 _qq_task: Optional[asyncio.Task] = None
+_summary_task: Optional[asyncio.Task] = None
 
 _QQ_OWNERS_CACHE: Dict[str, Any] = {"mtime": None, "ids": set()}
 _QQ_GUEST_USERS: Dict[str, dict] = {}
@@ -866,6 +868,28 @@ def _qq_guest_user(sender: str) -> Optional[dict]:
     return u
 
 
+def _light_trim(lines, per_line: int = 100, total: int = 1500) -> str:
+    """窗口内（最近 ≤10 条）的「轻压缩」：纯字符串裁剪，**不调模型**。
+
+    用户要求「10 条以内也要压，只是不用压太狠」。这里刻意不用模型：
+    10 条群消息才 200~400 token（约 ¥0.0003），而为了压它跑一次模型要
+    1000+ 输入 + 200 输出（≈ ¥0.001~0.002）外加 1~3 秒 —— 压比不压更贵更慢。
+    所以窗口内只做不改变语义的截断：单条过长掐尾部，总量超限从最旧的丢起。
+    真正需要「压缩」的是被窗口挤出去的旧消息 → 交给 im_summary 后台异步压。
+    """
+    out = []
+    for ln in lines:
+        ln = (ln or "").strip()
+        if not ln:
+            continue
+        out.append(ln if len(ln) <= per_line else ln[:per_line] + "…")
+    s = "\n".join(out)
+    while out and len(s) > total:
+        out.pop(0)
+        s = "\n".join(out)
+    return s
+
+
 def _start_qq_bridge() -> Optional[asyncio.Task]:
     """惰性启动 QQ 官方机器人桥接（IM → agent）。未配置凭据返回 None，不影响 Web。
 
@@ -1004,15 +1028,26 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     def _prepare(msg):                   # noqa: ANN001
         """返回 None = 这条不响应；返回字符串 = 用它当 query 起 run。"""
         if getattr(msg, "event", "") != "GROUP_MESSAGE_CREATE":
-            return msg.text              # @ 消息 / 单聊：老行为，永远响应
+            # @ 消息 / 单聊：老行为，永远响应。这里只补「更早的对话摘要」
+            # （超窗口的旧内容，由后台任务异步压好，读缓存不花钱不耗时）。
+            if msg.chat_type == "group":
+                im_summary.note(msg.chat_id, f"{msg.user_name or '群友'}: {(msg.text or '').strip()}")
+            else:
+                im_summary.note(msg.chat_id, f"用户: {(msg.text or '').strip()}")
+            s = im_summary.get(msg.chat_id)
+            if s:
+                return f"[更早的对话摘要]\n{s}\n\n[最新一条] {msg.text}"
+            return msg.text
         cfg = qq_allmsg_cfg()
         mode = str(cfg.get("mode") or "observe").strip().lower()
         if mode == "off":
             return None
         who = msg.user_name or (msg.user_id or "")[:8]
         buf = _recent.setdefault(msg.chat_id, [])
-        buf.append(f"{who}: {(msg.text or '').strip()}")
+        line = f"{who}: {(msg.text or '').strip()}"
+        buf.append(line)
         del buf[:-30]                    # 只留最近 30 条，内存里不无限涨
+        im_summary.note(msg.chat_id, line)     # 攒给后台压缩（O(1)，不调模型）
         logger.info("📨 [qq/group-all] group=%s sender=%s(%s) text=%s",
                     msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
         # ⚠️ 群主开了「获取群内全部消息」后，@ 机器人的消息【不再】单独走
@@ -1026,15 +1061,19 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
                 return None                      # 纯 @ 无内容，没得回答
             msg.event = "GROUP_AT_MESSAGE_CREATE"
             # 带上群上文 —— 否则被 @ 时它不知道你们刚在聊什么，答非所问。
-            n = int(cfg.get("at_context_lines") or cfg.get("context_lines") or 6)
+            # 结构：更早的摘要（后台压好的）+ 最近 N 条原文（默认 10，控 token）。
+            n = int(cfg.get("at_context_lines") or cfg.get("context_lines") or 10)
+            s = im_summary.get(msg.chat_id)
+            head = (f"[群里更早的对话摘要]\n{s}\n" if s else "")
             if n > 0 and len(buf) > 1:
-                head = "[群里最近的对话]\n" + "\n".join(buf[:-1][-n:]) + "\n[最新一条] "
-                logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理（附上文 %d 行）",
-                            min(n, len(buf) - 1))
+                head += "[群里最近的对话]\n" + _light_trim(buf[:-1][-n:]) + "\n[最新一条] "
+                logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理"
+                            "（附上文 %d 行%s）", min(n, len(buf) - 1),
+                            "＋摘要" if s else "")
                 return (head + f"{who}：{_cleaned}\n\n"
                         "（上面是群里的上文，最新那条 @ 了你，直接回答它。）")
             logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理")
-            return _cleaned
+            return (head + _cleaned) if head else _cleaned
         if mode != "reply":
             return None                  # observe：只记录，先把群 openid 拿到手
         groups = [str(g).strip() for g in (cfg.get("groups") or []) if str(g).strip()]
@@ -1057,9 +1096,10 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             return None
         _last_speak[msg.chat_id] = now
         n = int(cfg.get("context_lines") or 0)
-        head = ""
+        _summ = im_summary.get(msg.chat_id)
+        head = (f"[群里更早的对话摘要]\n{_summ}\n" if _summ else "")
         if n > 0 and len(buf) > 1:
-            head = "[群里最近的对话]\n" + "\n".join(buf[:-1][-n:]) + "\n"
+            head += "[群里最近的对话]\n" + "\n".join(buf[:-1][-n:]) + "\n"
         logger.info("🗣 [qq/group-all] 触发插话 group=%s sender=%s(%s) text=%s",
                     msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
         return (f"{head}[最新一条] {who}：{(msg.text or '').strip()}\n\n"
@@ -1130,7 +1170,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """程序生命周期：初始化共享MCP + 数据库；关闭时统一销毁MCP子进程"""
-    global shared_mcp, _qq_task
+    global shared_mcp, _qq_task, _summary_task
     init_db(INVITE_CODES)
     _migrate_legacy_fs()
     _check_admin_accounts()
@@ -1152,7 +1192,16 @@ async def lifespan(app: FastAPI):
         logger.exception("❌ MCP服务初始化失败")
         shared_mcp = None
     _qq_task = _start_qq_bridge()
+    # IM 滚动摘要：后台把「被 10 条窗口挤出去」的旧聊天压成摘要。
+    # 放后台是有意的 —— 回复路径只读摘要缓存，绝不在回答前跑压缩（否则 +1~3s 且打碎前缀缓存）。
+    _summary_task = asyncio.create_task(im_summary.run_forever(60.0))
     yield
+    if _summary_task is not None:
+        _summary_task.cancel()
+        try:
+            await _summary_task
+        except (asyncio.CancelledError, Exception):
+            pass
     if _qq_task is not None:
         _qq_task.cancel()
         try:

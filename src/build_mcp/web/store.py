@@ -137,6 +137,15 @@ CREATE TABLE IF NOT EXISTS riot_bindings(
   updated_at   REAL NOT NULL DEFAULT 0
 );
 
+-- IM（QQ 群/单聊）滚动摘要：超出「最近 10 条原文」窗口的旧消息，由后台任务
+-- 异步压成一段摘要存在这里（不占回复路径，见 web/im_summary.py）。
+CREATE TABLE IF NOT EXISTS im_summaries(
+  chat_id    TEXT PRIMARY KEY,
+  summary    TEXT NOT NULL DEFAULT '',
+  lines      INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL DEFAULT 0
+);
+
 """
 
 
@@ -765,6 +774,32 @@ def latest_riot_binding() -> Optional[dict]:
             "SELECT * FROM riot_bindings WHERE access_token<>'' ORDER BY updated_at DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_im_summary(chat_id: str) -> dict:
+    """取某会话（群 openid / 用户 openid）的滚动摘要；没有则返回空摘要。"""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM im_summaries WHERE chat_id=?", (str(chat_id),)).fetchone()
+        return dict(row) if row else {"chat_id": str(chat_id), "summary": "", "lines": 0,
+                                      "updated_at": 0.0}
+    finally:
+        conn.close()
+
+
+def put_im_summary(chat_id: str, summary: str, lines: int = 0) -> None:
+    """写入/更新某会话的滚动摘要（后台任务调用，回复路径只读不写）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO im_summaries(chat_id,summary,lines,updated_at) VALUES(?,?,?,?)"
+                " ON CONFLICT(chat_id) DO UPDATE SET summary=excluded.summary,"
+                " lines=excluded.lines, updated_at=excluded.updated_at",
+                (str(chat_id), summary or "", int(lines), time.time()),
+            )
     finally:
         conn.close()
 

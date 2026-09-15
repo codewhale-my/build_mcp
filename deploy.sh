@@ -52,7 +52,7 @@ if [ "${ONLY_RESTART}" = "0" ]; then
   # ---- 防覆盖闸门：服务器上有未入库改动时先备份并中止，避免互相覆盖 ----
   # 只检查真正会被整体覆盖的源码文件；比对前统一去掉 \r（本机/服务器行尾习惯不同，
   # 不归一化会把纯行尾差异误报成"有改动"，那会让闸门形同虚设）。
-  GUARD_FILES="static/index.html src/build_mcp/channels/core.py src/build_mcp/channels/qq_official.py src/build_mcp/web/main.py src/build_mcp/web/store.py src/build_mcp/client/conversation.py src/build_mcp/web/whatsnew.json src/build_mcp/services/server.py src/build_mcp/services/valorant_sdk.py src/build_mcp/services/quote_sdk.py"
+  GUARD_FILES="static/index.html src/build_mcp/channels/core.py src/build_mcp/channels/qq_official.py src/build_mcp/web/main.py src/build_mcp/web/store.py src/build_mcp/client/conversation.py src/build_mcp/web/whatsnew.json src/build_mcp/services/server.py src/build_mcp/services/valorant_sdk.py src/build_mcp/services/quote_sdk.py src/build_mcp/web/im_summary.py"
   if [ "${FORCE}" = "0" ]; then
     step "防覆盖检查：服务器上是否有未入库的改动"
     # 判定口径（比"本机 HEAD vs 服务器"更准）：
