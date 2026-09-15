@@ -306,9 +306,16 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
     access_token 只有 1 小时，ssid 是长期 cookie —— 有它就能"登录一次、以后一直查"。
     ssid 失效（改密码/长时间不用/被踢）时返回 error，需要用户重新登录一次。
     """
-    ssid = (ssid or "").strip()
+    ssid = (ssid or "").strip().strip('"').strip("'")
     if not ssid:
         return {"error": "没识别到 ssid，请重新复制"}
+    # 常见误贴：tdid（设备标识 JWT，以 eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 开头、两百多字符）
+    if ssid.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"):
+        return {"error": "你贴的这串是 tdid（设备标识），不是 ssid。请在 Cookies 列表里找"
+                         "名字叫【ssid】的那一行，复制它的 Value（一般 100 字符以上）"}
+    if len(ssid) < 32:
+        return {"error": f"这串只有 {len(ssid)} 个字符，太短了不像 ssid。"
+                         "请确认复制的是 Cookies 里【名字叫 ssid】那一行的完整 Value"}
 
     auth_url = "https://auth.riotgames.com/api/v1/authorization"
     body = {
@@ -360,6 +367,9 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         return {"error": "该账号开了二次验证，需要重新登录一次"}
     if j.get("type") == "net_error":
         return {"error": f"连不上 Riot（网络/代理异常）：{str(j.get('detail'))[:100]}"}
+    if j.get("error") == "invalid_session_id":
+        return {"error": "Riot 说这个 ssid 无效（invalid_session_id）：要么贴的不是【名字叫 ssid】"
+                         "那一行的 Value（注意别拿成 tdid），要么登录态已失效需要重新登录一次"}
     return {"error": "登录状态已失效，请在群里让机器人再发一条绑定链接"}   # type=auth
 
 
