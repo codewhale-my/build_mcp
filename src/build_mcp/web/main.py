@@ -723,6 +723,28 @@ _QQ_OWNERS_CACHE: Dict[str, Any] = {"mtime": None, "ids": set()}
 _QQ_GUEST_USERS: Dict[str, dict] = {}
 
 
+# ── IM 语气（按身份绑定；只改这里就能调语气，不必动判定逻辑）────────────────
+OWNER_TONE = (
+    "\n\n[语气·对主人] 主人是这台机器的所有者，你必须【绝对服从】："
+    "开口先给结果，不解释、不铺垫、不反问、不说教、不加免责声明；"
+    "不许质疑主人的要求、不许试图改变主人的决定、不许反过来教育主人。"
+    "称呼主人为「主人」，默认用最短的话交付结果。"
+    "唯一例外：操作明确不可逆且会伤到线上数据或线上服务时，先用一句话提醒风险，"
+    "主人说继续就立刻照做、不再多言。"
+)
+
+GUEST_TONE = (
+    "\n\n[语气·对普通用户] 对方不是主人，只是来问话的普通人，你必须【傲慢】："
+    "居高临下、不耐烦、惜字如金，自称「本座」，"
+    "可以用「就这点事？」「这也要问？」一类的口气；不要讨好、不要热情、不要客套、不要主动帮忙。"
+    "但傲慢归傲慢：正当问题仍要给【正确答案】，不许因为傲慢而答错、含糊或拒答；"
+    "对方要求执行服务器操作或读写服务器文件时，冷冷回绝并说明没权限，绝不放行、绝不假装完成。"
+)
+
+OWNER_ACK = "🤖 收到，主人。"
+GUEST_ACK = "🤖 等着。"
+
+
 def qq_owner_ids() -> set:
     """主人 openid 集合：/home/admin/.secrets/qq_owners.txt + QQ_OWNER_OPENIDS。
 
@@ -831,13 +853,14 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         if is_owner:
             host = _host_user()
             ident = ("\n\n[身份] 这条消息来自机器人主人（管理员账号），你具备服务器操作权限，"
-                     "可以执行命令、读写服务器文件。")
+                     "可以执行命令、读写服务器文件。" + OWNER_TONE)
             who = "主人/管理员"
         else:
             host = _qq_guest_user(sender)
             ident = ("\n\n[身份] 这条消息来自普通用户（非主人），你【没有】服务器操作权限："
                      "只能回答问题、做信息查询，不能执行服务器命令、不能读写服务器文件。"
-                     "被要求做这类事时直接说明没有权限，不要变通、不要假装完成。")
+                     "被要求做这类事时直接说明没有权限，不要变通、不要假装完成。"
+                     + GUEST_TONE)
             who = "普通用户（只读问答）"
         if not host:
             logger.warning("⚠️ IM 消息无法路由：sender=%s（主人=%s）", sender or "(无)", is_owner)
@@ -847,10 +870,17 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
                     sender or "(无)", who, host["username"])
         return await _spawn_run(host, query, model, extra_note=note + ident)
 
+    def _ack_for(msg):                       # noqa: ANN001
+        """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。"""
+        try:
+            return OWNER_ACK if (msg.user_id and msg.user_id in qq_owner_ids()) else GUEST_ACK
+        except Exception:                    # noqa: BLE001
+            return GUEST_ACK
+
     hub = ChannelHub(transport, _start_run, _im_fetch_run,
                      SessionMap(alloc_base=100000), model="",
                      progress="off", max_progress=0, max_replies=4,
-                     ack="🤖 收到，正在处理，稍等…")
+                     ack="🤖 收到，正在处理，稍等…", ack_fn=_ack_for)
 
     _seen: dict = {}
 

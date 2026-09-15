@@ -147,7 +147,8 @@ class ChannelHub:
     def __init__(self, transport: Transport, start_run: StartRun, fetch_run: FetchRun,
                  sessions: Optional[SessionMap] = None, *,
                  model: str = "", progress: str = "brief", max_chunk: int = MAX_CHUNK,
-                 max_progress: int = 1, max_replies: int = 5, ack: str = ""):
+                 max_progress: int = 1, max_replies: int = 5, ack: str = "",
+                 ack_fn=None):        # noqa: ANN001  可选 (Inbound) -> str
         self.transport = transport
         self.start_run = start_run
         self.stream = RunStream(fetch_run)
@@ -161,6 +162,9 @@ class ChannelHub:
         self.max_progress = max(0, int(max_progress))
         self.max_replies = max(1, int(max_replies))
         self.ack = ack                    # 立刻回执（让用户知道收到了），可空
+        # 可选：(Inbound) -> str。按发送者身份定制回执文案（主人/访客语气不同）。
+        # 传了它就用它的返回值取代固定文案；「占 1 条回复额度」的行为完全一致。
+        self.ack_fn = ack_fn
 
     async def handle(self, msg: Inbound) -> str:
         """处理一条入站消息，返回 run_id（便于测试与日志关联）。"""
@@ -176,9 +180,16 @@ class ChannelHub:
         logger.info("📥 [%s/%s] sender=%s chat=%s → run=%s (user=%d)",
                     msg.channel, msg.chat_type, msg.user_id, msg.chat_id, run_id, uid)
 
+        ack_text = self.ack
+        if self.ack_fn is not None:
+            try:
+                ack_text = self.ack_fn(msg) or ""
+            except Exception as e:        # noqa: BLE001
+                logger.warning("⚠️ ack_fn 调用失败，回退固定回执：%s", e)
+                ack_text = self.ack
         sent = 0
-        if self.ack:                      # 立刻回执，占 1 条额度
-            if await self._send(msg, self.ack):
+        if ack_text:                      # 立刻回执，占 1 条额度
+            if await self._send(msg, ack_text):
                 sent += 1
 
         final: Dict[str, Any] = {"status": "running", "answer": ""}
@@ -188,7 +199,7 @@ class ChannelHub:
                 break
             if (ev.get("type") == "tool" and self.progress != "off"
                     and ev.get("status") == "start"
-                    and sent < self.max_progress + (1 if self.ack else 0)):
+                    and sent < self.max_progress + (1 if ack_text else 0)):
                 if await self._send(msg, f"🔧 {ev.get('name')}…"):
                     sent += 1
 

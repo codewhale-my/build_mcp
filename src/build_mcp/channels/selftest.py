@@ -264,6 +264,43 @@ async def test_wecom_payload():
 
 # ── 跑 ─────────────────────────────────────────────────────────────────────
 
+@case
+async def test_hub_ack_fn_by_identity():
+    """立刻回执必须按发送者身份走 ack_fn（主人/访客文案不同），且失败要能回退。"""
+    async def fake_fetch(run_id: str, since: int) -> dict:
+        return {"status": "done", "answer": "正文", "events": []}
+
+    async def fake_start(**kw) -> str:
+        return "run-t"
+
+    pick = lambda m: "主人版" if m.user_id == "OWNER1" else "访客版"   # noqa: E731
+
+    tr = FakeTransport()
+    hub = ChannelHub(tr, fake_start, fake_fetch, ack="固定文案", progress="off",
+                     max_progress=0, ack_fn=pick)
+    hub.stream.interval = 0.01
+    await hub.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                             user_id="OWNER1", text="hi", msg_id="M1"))
+    assert tr.sent[0].text == "主人版", tr.sent[0].text
+
+    tr2 = FakeTransport()
+    hub2 = ChannelHub(tr2, fake_start, fake_fetch, ack="固定文案", progress="off",
+                      max_progress=0, ack_fn=pick)
+    hub2.stream.interval = 0.01
+    await hub2.handle(Inbound(channel="qq", chat_type="c2c", chat_id="U9",
+                              user_id="U9", text="hi", msg_id="M2"))
+    assert tr2.sent[0].text == "访客版", tr2.sent[0].text
+
+    # ack_fn 抛异常必须回退固定文案，绝不能把整条消息搞挂
+    tr3 = FakeTransport()
+    hub3 = ChannelHub(tr3, fake_start, fake_fetch, ack="固定文案", progress="off",
+                      max_progress=0, ack_fn=lambda m: 1 / 0)
+    hub3.stream.interval = 0.01
+    await hub3.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                              user_id="U1", text="hi", msg_id="M3"))
+    assert tr3.sent[0].text == "固定文案", tr3.sent[0].text
+
+
 def run_all() -> int:
     # 自测跑在仓库里，会顺带初始化 build_mcp 的日志（往 ./log/ 写文件）。
     # 把第三方 INFO 压掉，免得断言输出被 httpx 请求日志淹了。
