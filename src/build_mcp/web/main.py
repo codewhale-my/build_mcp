@@ -844,6 +844,36 @@ def qq_allmsg_cfg() -> dict:
     return cfg
 
 
+def _allmsg_opts(cfg: dict, chat_id: str) -> dict:
+    """把 qq_allmsg 的「群级配置」与「顶层默认」合并成一份生效配置。
+
+    ⚠️ 这里踩过坑（2026-09-15）：config.yaml 里 `rules/chance/cooldown/context_lines`
+    是写在 `groups: { <群openid>: {...} }` **群下面**的，而代码以前只读顶层 →
+    读到的全是 None → rules 回落默认值 `["keyword"]`（关键词为空）→ **永不插话**，
+    表现就是「只见过它被 @，从没见它主动说话」。所以必须在这里做合并。
+
+    两种写法都支持（历史包袱，别删）：
+      A) groups 是**列表** + 选项写在顶层：groups: [id1, id2] / rules: ... / chance: ...
+      B) groups 是**字典** + 选项写在群下面（推荐，可按群分别调）：
+         groups: { id1: {rules: [...], chance: 0.1} }
+    字典写法下群级选项覆盖顶层，顶层再兜底。
+    """
+    out = {k: v for k, v in cfg.items() if k != "groups"}
+    g = cfg.get("groups")
+    if isinstance(g, dict):
+        opts = g.get(str(chat_id))
+        if isinstance(opts, dict):
+            out.update(opts)
+    return out
+
+
+def _allmsg_groups(cfg: dict) -> list:
+    """qq_allmsg 里配置到的群 openid 列表（groups 兼容列表/字典两种写法）。"""
+    g = cfg.get("groups") or []
+    keys = g.keys() if isinstance(g, dict) else g
+    return [str(x).strip() for x in keys if str(x).strip()]
+
+
 def _qq_guest_user(sender: str) -> Optional[dict]:
     """非主人的 IM 发送者 → 独立的【非管理员】账号。
 
@@ -1038,7 +1068,11 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             if s:
                 return f"[更早的对话摘要]\n{s}\n\n[最新一条] {msg.text}"
             return msg.text
-        cfg = qq_allmsg_cfg()
+        raw = qq_allmsg_cfg()
+        # ★ 必须做一次「群级选项覆盖顶层」的合并，否则 groups 是字典写法时
+        #   rules/chance/cooldown/context_lines 全读成 None → 默认规则 keywords 为空
+        #   → 永不插话（这就是之前「只见过 @、没见过主动回复」的根因）。
+        cfg = _allmsg_opts(raw, msg.chat_id)
         mode = str(cfg.get("mode") or "observe").strip().lower()
         if mode == "off":
             return None
@@ -1076,7 +1110,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             return (head + _cleaned) if head else _cleaned
         if mode != "reply":
             return None                  # observe：只记录，先把群 openid 拿到手
-        groups = [str(g).strip() for g in (cfg.get("groups") or []) if str(g).strip()]
+        groups = _allmsg_groups(raw)
         if groups and msg.chat_id not in groups:
             return None
         owners = qq_owner_ids()
