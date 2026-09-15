@@ -19,7 +19,7 @@ import httpx
 
 from .core import ChannelHub, Inbound, Outbound, SessionMap, split_text
 from .qq_official import (API_BASE, SANDBOX_API_BASE, TOKEN_URL, QQConfig,
-                          QQTransport, parse_dispatch)
+                          QQTransport, parse_dispatch, read_owner_ids)
 from .wecom import WeComWebhookTransport
 
 CASES: List[Any] = []
@@ -212,6 +212,17 @@ async def test_qq_transport_token_and_send():
     await tr.send(Outbound(chat_id="G1", chat_type="group", text="另一条", reply_to="M2"))
     assert json.loads(calls[3].content)["msg_seq"] == 1
     await tr.aclose()
+
+
+@case
+async def test_owner_allowlist_parse():
+    """主人白名单解析：文件 + 环境变量合并，注释/空行/重复/多列都要容错。"""
+    txt = "# 主人列表\nOPENID_A  # 群里的主人\n\nOPENID_B\nOPENID_A\n"
+    assert read_owner_ids(txt) == ["OPENID_A", "OPENID_B"]
+    assert read_owner_ids(txt, "X1, X2") == ["OPENID_A", "OPENID_B", "X1", "X2"]
+    assert read_owner_ids("", "") == []
+    assert read_owner_ids("A A\nB", "B,C") == ["A", "B", "C"]
+    assert read_owner_ids("   \n# 全是注释\n", "  ") == []
 
 
 @case

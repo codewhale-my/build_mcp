@@ -719,6 +719,60 @@ def _migrate_legacy_fs():
 
 _qq_task: Optional[asyncio.Task] = None
 
+_QQ_OWNERS_CACHE: Dict[str, Any] = {"mtime": None, "ids": set()}
+_QQ_GUEST_USERS: Dict[str, dict] = {}
+
+
+def qq_owner_ids() -> set:
+    """主人 openid 集合：/home/admin/.secrets/qq_owners.txt + QQ_OWNER_OPENIDS。
+
+    按文件 mtime 缓存 → **改完白名单不用重启**，下一条消息即生效。
+    """
+    try:
+        from build_mcp.channels.qq_official import OWNER_FILE, read_owner_ids
+    except Exception:                                  # noqa: BLE001
+        return set()
+    p = Path(OWNER_FILE)
+    try:
+        mt = p.stat().st_mtime if p.exists() else 0.0
+    except OSError:
+        mt = 0.0
+    if _QQ_OWNERS_CACHE["ids"] and _QQ_OWNERS_CACHE["mtime"] == mt:
+        return _QQ_OWNERS_CACHE["ids"]
+    text = ""
+    try:
+        if p.exists():
+            text = p.read_text(encoding="utf-8")
+    except Exception:                                  # noqa: BLE001
+        logger.warning("读取主人白名单失败：%s", p)
+    ids = set(read_owner_ids(text, os.environ.get("QQ_OWNER_OPENIDS", "")))
+    _QQ_OWNERS_CACHE.update(mtime=mt, ids=ids)
+    return ids
+
+
+def _qq_guest_user(sender: str) -> Optional[dict]:
+    """非主人的 IM 发送者 → 独立的【非管理员】账号。
+
+    为什么要一人一号而不是共用一个访客号：会话历史与文件空间都按 user_id 隔离，
+    共号会让群里的 A 看到 B 的对话。用户名以 `qq_` 开头，绝不会命中 ADMIN_USERS
+    （管理员名单是精确匹配），所以天然拿不到 terminal 工具集。
+    """
+    key = re.sub(r"[^0-9A-Za-z]", "", sender or "")[:20]
+    uname = f"qq_{key}" if key else "im_anon"
+    if uname in _QQ_GUEST_USERS:
+        return _QQ_GUEST_USERS[uname]
+    u = get_user_by_name(uname)
+    if not u:
+        try:
+            store.create_user(uname, secrets.token_urlsafe(24))   # 随机口令，无人可登录
+        except Exception:                              # noqa: BLE001
+            logger.exception("创建 IM 访客账号 %s 失败", uname)
+            return None
+        u = get_user_by_name(uname)
+    if u:
+        _QQ_GUEST_USERS[uname] = u
+    return u
+
 
 def _start_qq_bridge() -> Optional[asyncio.Task]:
     """惰性启动 QQ 官方机器人桥接（IM → agent）。未配置凭据返回 None，不影响 Web。
@@ -766,12 +820,32 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     cfg = QQConfig(appid, secret, sandbox)
     transport = QQTransport(cfg)
 
-    async def _start_run(user_id, query, model="", source=""):  # noqa: ANN001
-        host = _host_user()
+    async def _start_run(user_id, query, model="", source="",  # noqa: ANN001
+                         sender="", chat_id=""):
+        """主人 → 管理员账号（可操作服务器）；其他人 → 非管理员账号（只能问答）。
+
+        主人判定唯一依据 = 发送者 openid 在 `qq_owners.txt` 白名单里（QQ 不返回 QQ 号）。
+        """
+        owners = qq_owner_ids()
+        is_owner = bool(sender) and sender in owners
+        if is_owner:
+            host = _host_user()
+            ident = ("\n\n[身份] 这条消息来自机器人主人（管理员账号），你具备服务器操作权限，"
+                     "可以执行命令、读写服务器文件。")
+            who = "主人/管理员"
+        else:
+            host = _qq_guest_user(sender)
+            ident = ("\n\n[身份] 这条消息来自普通用户（非主人），你【没有】服务器操作权限："
+                     "只能回答问题、做信息查询，不能执行服务器命令、不能读写服务器文件。"
+                     "被要求做这类事时直接说明没有权限，不要变通、不要假装完成。")
+            who = "普通用户（只读问答）"
         if not host:
-            raise RuntimeError("IM 宿主用户未注册（需先注册管理员账号）")
+            logger.warning("⚠️ IM 消息无法路由：sender=%s（主人=%s）", sender or "(无)", is_owner)
+            raise RuntimeError("IM 宿主账号不可用（主人需管理员账号已注册 / 访客账号创建失败）")
         note = f"\n\n[消息来源] 这条消息来自 {source or 'IM'}。" if source else ""
-        return await _spawn_run(host, query, model, extra_note=note)
+        logger.info("👤 IM 身份判定 sender=%s → %s（host=%s）",
+                    sender or "(无)", who, host["username"])
+        return await _spawn_run(host, query, model, extra_note=note + ident)
 
     hub = ChannelHub(transport, _start_run, _im_fetch_run,
                      SessionMap(alloc_base=100000), model="",
@@ -791,6 +865,14 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             _seen[key] = now
             for k in [k for k, v in _seen.items() if now - v > 900]:
                 _seen.pop(k, None)
+        try:
+            # 取证用：把平台给的 author 原样打一行。openid 是登记主人的唯一依据，
+            # 这一行是「拿到自己 openid」的入口。
+            logger.info("👤 [%s] author=%s", msg.channel,
+                        json.dumps((msg.raw or {}).get("author") or {},
+                                   ensure_ascii=False, default=str))
+        except Exception:                              # noqa: BLE001
+            pass
         await hub.handle(msg)
 
     async def _run_env(is_sbx: bool, label: str) -> None:

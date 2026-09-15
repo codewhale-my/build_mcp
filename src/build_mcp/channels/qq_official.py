@@ -29,7 +29,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 import websockets
@@ -42,6 +42,29 @@ INTENT_GROUP_AND_C2C = 1 << 25
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 API_BASE = "https://api.sgroup.qq.com"
 SANDBOX_API_BASE = "https://sandbox.api.sgroup.qq.com"
+
+# 主人白名单文件：一行一个 openid（`#` 后可写说明，空格分列）。
+# ⚠️ QQ 官方接口出于隐私【不返回 QQ 号】，只给 openid —— 所以「谁是主人」只能按
+# openid 登记。openid 在「同一机器人 + 同一场景」下稳定不变，但**跨场景不同**：
+# 同一人的「某群 member_openid」和「单聊 user_openid」是两个值，需要分别登记。
+OWNER_FILE = "/home/admin/.secrets/qq_owners.txt"
+
+
+def read_owner_ids(text: str, extra: str = "") -> List[str]:
+    """解析主人 openid：文件内容 + 环境变量（逗号分隔）。纯函数，可离线测。"""
+    out: List[str] = []
+    for ln in (text or "").splitlines():
+        ln = ln.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        oid = ln.split()[0].strip()
+        if oid and oid not in out:
+            out.append(oid)
+    for oid in (extra or "").replace(" ", "").split(","):
+        oid = oid.strip()
+        if oid and oid not in out:
+            out.append(oid)
+    return out
 
 
 @dataclass

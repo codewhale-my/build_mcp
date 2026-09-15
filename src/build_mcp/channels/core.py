@@ -169,9 +169,12 @@ class ChannelHub:
             return ""
         uid = self.sessions.resolve(msg.channel, msg.chat_id, msg.user_id)
         run_id = await self.start_run(user_id=uid, query=text, model=self.model,
-                                      source=f"{msg.channel}:{msg.chat_type}")
-        logger.info("📥 [%s/%s] %s → run=%s (user=%d)",
-                    msg.channel, msg.chat_type, msg.user_id[:8], run_id, uid)
+                                      source=f"{msg.channel}:{msg.chat_type}",
+                                      sender=msg.user_id, chat_id=msg.chat_id)
+        # 这里必须打【完整】发送者 id：主人白名单是按 openid 登记的，
+        # 截断了就没法从日志里取证到底是哪个 openid 在说话。
+        logger.info("📥 [%s/%s] sender=%s chat=%s → run=%s (user=%d)",
+                    msg.channel, msg.chat_type, msg.user_id, msg.chat_id, run_id, uid)
 
         sent = 0
         if self.ack:                      # 立刻回执，占 1 条额度
