@@ -346,7 +346,9 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
         "X-Riot-ClientVersion": client_version,
         "X-Riot-ClientPlatform": _CLIENT_PLATFORM,
     }
-    st, raw = await _http(f"https://pd.{shard}.a.pvp.net/store/v2/storefront/{puuid}", headers=hdrs)
+    # v3 storefront：必须 POST + 空 body {}（GET v2 已下线→404，GET v3→405，参照 SkinPeek 实现）
+    st, raw = await _http(f"https://pd.{shard}.a.pvp.net/store/v3/storefront/{puuid}",
+                          method="POST", body={}, headers=hdrs)
     if st == 0:
         return {"error": f"连不上 Riot 商店服务（网络/代理异常，稍后重试）：{raw[:120]}"}
     if st != 200:
@@ -356,20 +358,28 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
     except Exception:
         return {"error": "商店接口返回无法解析"}
 
-    price_map: Dict[str, int] = {}
-    st2, raw2 = await _http(f"https://pd.{shard}.a.pvp.net/store/v3/offers", headers=hdrs)
-    if st2 == 200:
-        try:
-            for o in (json.loads(raw2).get("Offers") or []):
-                if o.get("IsDirectPurchase") is False:
-                    for cost in (o.get("Cost") or {}).values():
-                        price_map[o.get("OfferID")] = cost
-        except Exception:
-            pass
-
     panel = storefront.get("SkinsPanelLayout", {}) or {}
     uuids = panel.get("SingleItemOffers") or []
     remain = panel.get("SingleItemOffersRemainingDurationSeconds", 0)
+
+    # 价格直接在 storefront 响应里：SingleItemStoreOffers[*].{OfferID,Cost}
+    price_map: Dict[str, int] = {}
+    for o in (panel.get("SingleItemStoreOffers") or []):
+        for cost in (o.get("Cost") or {}).values():
+            try:
+                price_map[o.get("OfferID")] = int(cost)
+            except Exception:                             # noqa: BLE001
+                pass
+    if not price_map:                                     # 兜底：独立价格表端点
+        st2, raw2 = await _http(f"https://pd.{shard}.a.pvp.net/store/v3/offers", headers=hdrs)
+        if st2 == 200:
+            try:
+                for o in (json.loads(raw2).get("Offers") or []):
+                    if o.get("IsDirectPurchase") is False:
+                        for cost in (o.get("Cost") or {}).values():
+                            price_map[o.get("OfferID")] = int(cost)
+            except Exception:                             # noqa: BLE001
+                pass
     skinmap = await _skin_map()
     items = [{"name": skinmap.get(u, u), "uuid": u, "price_vp": price_map.get(u)} for u in uuids]
     return {
