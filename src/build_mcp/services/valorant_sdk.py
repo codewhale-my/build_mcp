@@ -362,6 +362,8 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         loc = j.get("location") or ""
         # 失效时 Riot 303 到 https://authenticate.riotgames.com/login?...（实测）
         if loc.startswith("/login") or "riotgames.com/login" in loc:
+            logger.warning("🔐 ssid 被 Riot 拒绝：长度=%d 开头=%s…（完整 ssid 通常 150~500 字符，"
+                           "过短=复制不全）", len(ssid), ssid[:8])
             return {"error": "Riot 没认出这个 ssid：常见原因是【复制不完整】（要整条 Value，"
                              "通常几百字符，首尾都不能少），其次是它真失效了。请重新完整复制再贴一次；"
                              "还不行就在本页用「③ 登录地址绑定」重新登录一次拳头账号即可，不用回群里要链接"}
