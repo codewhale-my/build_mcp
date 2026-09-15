@@ -2098,14 +2098,20 @@ async def riot_pub_bind(req: RiotPubBindRequest):
         raise HTTPException(status_code=400, detail="没识别到登录令牌：请把浏览器地址栏里 "
                                                    "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
     region = (req.region or "ap").strip().lower()
-    info = await valorant_sdk.account_info(token)
-    if info.get("error"):
-        raise HTTPException(status_code=400, detail=info["error"])
-    save_riot_binding(uid, region, token, info.get("puuid", ""),
-                      info.get("game_name", ""), info.get("tag_line", ""))
-    player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
-    logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s）", uid, player or "(未知)", region)
-    store = await valorant_sdk.store_with_token(token, region)
+    try:
+        info = await valorant_sdk.account_info(token)
+        if info.get("error"):
+            raise HTTPException(status_code=400, detail=info["error"])
+        save_riot_binding(uid, region, token, info.get("puuid", ""),
+                          info.get("game_name", ""), info.get("tag_line", ""))
+        player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
+        logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s）", uid, player or "(未知)", region)
+        store = await valorant_sdk.store_with_token(token, region)
+    except HTTPException:
+        raise
+    except Exception as e:                    # noqa: BLE001  网络类异常也给人话
+        logger.warning("⚠️ [IM] 绑定失败 uid=%s：%s", uid, str(e)[:200])
+        raise HTTPException(status_code=400, detail=f"绑定失败：{str(e)[:160]}")
     return {"ok": True, "player": player, "region": region, "store": store}
 
 
@@ -2119,7 +2125,11 @@ async def riot_pub_store(t: str = ""):
     b = get_riot_binding(uid) or {}
     if not b.get("access_token"):
         raise HTTPException(status_code=404, detail="这个链接还没绑定过账号")
-    res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
+    try:
+        res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
+    except Exception as e:                    # noqa: BLE001
+        logger.warning("⚠️ [IM] 查商店失败 uid=%s：%s", uid, str(e)[:200])
+        raise HTTPException(status_code=400, detail=f"查询失败：{str(e)[:160]}")
     if res.get("error") and "401" in str(res.get("error")):
         return {"need_rebind": True, "error": "登录已过期，请让机器人再发一条绑定链接"}
     return res

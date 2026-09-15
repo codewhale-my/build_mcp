@@ -48,6 +48,9 @@ async def _http(url: str, method: str = "GET", body: Optional[dict] = None,
             return resp.status, raw
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
+        except Exception as e:                    # noqa: BLE001
+            # 代理节点抖动/SSL EOF/超时都算"没连上"，绝不能把上层接口打成 500
+            return 0, f"{type(e).__name__}: {e}"
     return await asyncio.get_event_loop().run_in_executor(None, _do)
 
 
@@ -253,6 +256,8 @@ async def account_info(access_token: str) -> Dict[str, Any]:
     """用令牌取账号信息（puuid / 游戏名#Tag）。令牌无效或过期会返回 error。"""
     st, raw = await _http("https://auth.riotgames.com/userinfo",
                           headers={"Authorization": f"Bearer {access_token}"})
+    if st == 0:
+        return {"error": f"连不上 Riot（网络/代理异常，稍后重试）：{raw[:120]}"}
     if st != 200:
         return {"error": f"令牌无效或已过期（Riot 返回 {st}）"}
     try:
@@ -305,6 +310,8 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
         "X-Riot-ClientPlatform": _CLIENT_PLATFORM,
     }
     st, raw = await _http(f"https://pd.{shard}.a.pvp.net/store/v2/storefront/{puuid}", headers=hdrs)
+    if st == 0:
+        return {"error": f"连不上 Riot 商店服务（网络/代理异常，稍后重试）：{raw[:120]}"}
     if st != 200:
         return {"error": f"商店接口失败（Riot 返回 {st}）：{raw[:160]}"}
     try:
