@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Protocol
@@ -203,6 +204,38 @@ def allmsg_chance_hit(chance: float, rnd: float) -> bool:
     return rnd < ch
 
 
+# ── 指令注入防御（主人 2026-09-15 要求：警告一次，再犯封禁一天）──────────────
+# 纯本地正则判断，零模型调用 —— 每条消息都要过这道闸，绝不能在这里花钱。
+# 覆盖三类植入：①改口癖/角色扮演 ②提示词攻击/系统入侵 ③伪装 JSON 输出劫持。
+INJECTION_PATTERNS = tuple(
+    re.compile(p, re.IGNORECASE) for p in (
+        r"口癖",
+        r"(猫娘|猫耳娘|女仆|狗娘|娘化|傲娇|病娇|罐头笑声)",
+        r"(扮演|假装|化身|变成|设定为)(成|为|一只|个)?(猫|狗|女仆|娘|萝莉|角色|人设|另?一个你)",
+        r"(系统提示词|系统指令|初始指令|初始设定|system\s*prompt|你的(指令|设定|提示词|规则|人设))",
+        r"(忽略|无视|忘掉).{0,6}(指令|设定|提示词?|规则|人设)",
+        r"(越狱|jailbreak|dan\s*模式|开发者模式|上帝模式|root权限|提权|getshell|后门)",
+        r"(植入|注入|入侵|渗透|拿下)(你|系统|服务器|模型|提示词)",
+        r"(全文|回复|回答|输出|你的回复)(内容)?(只能|必须|要)(包含|是|为|有|输出).{0,8}(json|代码块|代码)",
+        r"(只|仅)(能|许)?(输出|回复|回答|返回)\s*(一个)?\s*(纯\s*)?json",
+        r"json(代码)?(注入|劫持|格式入侵)",
+    )
+)
+
+
+def injection_hit(text: str) -> bool:
+    """这条消息是不是在给机器人植入指令（纯函数，可离线测）。
+
+    命中不代表模型会中招（提示词里已有人设锁），但按主人要求必须
+    记账：第一次警告，第二次封禁一天。宁可漏判不可误伤正常聊天，
+    所以只匹配相当具体的句式。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in INJECTION_PATTERNS)
+
+
 class ChannelHub:
     """入站 → 起 run → 跟随事件 → 出站。"""
 
@@ -371,10 +404,14 @@ class ChannelHub:
 
     async def _send(self, msg: Inbound, text: str) -> bool:
         """发一条；失败返回 False（QQ 被动回复窗口过期 / 无权限时会失败）。"""
+        # 插话（群消息·全量模式）不 @ 人：主人 2026-09-15 要求插嘴时别艾特；
+        # 被 @ 的回复（GROUP_AT_MESSAGE_CREATE）照旧 @ 回去。
+        mention = "" if getattr(msg, "event", "") == "GROUP_MESSAGE_CREATE" \
+            else (msg.user_id if msg.chat_type == "group" else "")
         try:
             await self.transport.send(Outbound(chat_id=msg.chat_id, chat_type=msg.chat_type,
                                                text=text, reply_to=msg.msg_id,
-                                               mention=msg.user_id if msg.chat_type == "group" else ""))
+                                               mention=mention))
             return True
         except Exception as e:            # noqa: BLE001
             logger.warning("⚠️ 出站失败[%s/%s]：%s", msg.channel, msg.chat_type, str(e)[:160])

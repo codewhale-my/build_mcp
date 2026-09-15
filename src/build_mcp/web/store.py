@@ -146,6 +146,15 @@ CREATE TABLE IF NOT EXISTS im_summaries(
   updated_at REAL NOT NULL DEFAULT 0
 );
 
+-- IM 指令注入防御记账：谁试图给机器人植入指令（改口癖/系统攻击/JSON 劫持）。
+-- 第一次 = 警告；第二次起 = 封禁 banned_until 之前的所有消息（不回复不调模型）。
+CREATE TABLE IF NOT EXISTS im_abuses(
+  sender_id    TEXT PRIMARY KEY,
+  warnings     INTEGER NOT NULL DEFAULT 0,
+  banned_until REAL NOT NULL DEFAULT 0,
+  updated_at   REAL NOT NULL DEFAULT 0
+);
+
 """
 
 
@@ -817,6 +826,48 @@ def put_im_summary(chat_id: str, summary: str, lines: int = 0) -> None:
             )
     finally:
         conn.close()
+
+
+# ---------------- IM 指令注入防御记账 ----------------
+
+def get_im_abuse(sender_id: str) -> Optional[dict]:
+    """取某发送者的注入违规记录；没有返回 None。"""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM im_abuses WHERE sender_id=?",
+                           (str(sender_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def record_im_abuse(sender_id: str, ban_seconds: float = 0.0) -> dict:
+    """违规次数 +1（ban_seconds>0 时同时写入封禁截止时间），返回最新记录。"""
+    sid = str(sender_id)
+    ban_until = time.time() + float(ban_seconds) if ban_seconds > 0 else 0.0
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO im_abuses(sender_id,warnings,banned_until,updated_at) "
+                "VALUES(?,1,?,?)"
+                " ON CONFLICT(sender_id) DO UPDATE SET"
+                " warnings=im_abuses.warnings+1,"
+                " banned_until=CASE WHEN ?>0 THEN excluded.banned_until"
+                " ELSE im_abuses.banned_until END,"
+                " updated_at=excluded.updated_at",
+                (sid, ban_until, time.time(), ban_seconds),
+            )
+        row = conn.execute("SELECT * FROM im_abuses WHERE sender_id=?", (sid,)).fetchone()
+        return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def is_im_banned(sender_id: str) -> bool:
+    """该发送者当前是否处于封禁期（封禁截止时间未到）。"""
+    rec = get_im_abuse(sender_id)
+    return bool(rec) and float(rec.get("banned_until") or 0) > time.time()
 
 
 if __name__ == "__main__":

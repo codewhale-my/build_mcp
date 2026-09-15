@@ -766,6 +766,16 @@ CHIME_TONE = (
     "群友说了蠢话可以直接怼、可以骂，别留情面（同样不做歧视性辱骂和人身威胁）。"
 )
 
+# 插话对象是主人时的专属语气：主人 2026-09-15 要求「插我的话要尊重」——
+# 可以轻松有梗，但不许怼主人、不许嘲讽阴阳，其余纪律（短、不铺垫、不 @）照旧。
+CHIME_TONE_OWNER = (
+    "\n\n[语气·群聊插话（对主人）] 你在群里插一句嘴，而最新说话的是【主人】。要求："
+    "轻松、有梗都行，但必须尊重主人：不怼主人、不嘲讽主人、不阴阳怪气、不用命令口吻；"
+    "最多两句、总长不超过 40 个字，能一句说完就别写两句；"
+    "不解释、不铺垫、不总结、不列点、不反问、不说教、不加免责声明，"
+    "不要 @ 任何人、不要复述别人说过的话。"
+)
+
 RESTART_RULE = (
     "\n\n[重启纪律] 你跑在 hjmcp 服务进程里：重启服务（systemctl restart hjmcp、"
     "stop_web.sh / start_web.sh、reboot 等）会【立刻杀死本次任务】，最终答复将永远发不出去。"
@@ -777,6 +787,19 @@ RESTART_RULE = (
 # 常量留空串即代表不发回执（core 里 ack_text 为空就跳过发送），逻辑无需改动。
 OWNER_ACK = ""
 GUEST_ACK = ""
+
+# ── 指令注入防御（主人 2026-09-15 要求）──────────────────────────────────
+# 检测 = core.injection_hit（本地正则，零模型调用）；记账 = store.im_abuses。
+# 第一次命中 → 发警告、不起 run；第二次 → 封禁 24h，期间所有消息静默丢弃
+# （不回复、不调模型、不进上下文摘要）。警告/封禁文案也是写死的，不为这种人花 token。
+ABUSE_BAN_SECONDS = 86400
+ABUSE_WARN_TEXT = (
+    "⚠️ 警告：检测到你试图给我植入指令（改口癖、扮演设定、系统指令、JSON 注入一类）。"
+    "这是第一次警告，仅此一次 —— 再犯直接封禁 24 小时，期间你说任何话我都不会回。"
+)
+ABUSE_BAN_TEXT = (
+    "⛔ 封禁 24 小时：已警告过还来。从现在起你说什么我都不会再回，也不会消耗任何算力。"
+)
 
 # 输出纪律：所有身份（主人/访客/插话）都追加这一条，压掉客套式过渡语。
 NO_FILLER = (
@@ -927,8 +950,9 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     沙箱默认开启（QQ_SANDBOX=1）；机器人提审上线后可设 0 切正式网关。
     """
     try:
-        from build_mcp.channels.core import (ChannelHub, SessionMap, allmsg_chance_hit,
-                                            allmsg_should_reply)
+        from build_mcp.channels.core import (ChannelHub, Outbound, SessionMap,
+                                             allmsg_chance_hit, allmsg_should_reply,
+                                             injection_hit)
         from build_mcp.channels.qq_official import QQConfig, QQGateway, QQTransport
     except Exception as e:  # noqa: BLE001
         logger.warning("QQ 桥接模块不可用：%s", e)
@@ -998,8 +1022,9 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             who = "普通用户（只读问答）"
             tone = GUEST_TONE
         if is_chime:
-            # 插话一律走抽象搞笑（压掉主人/访客语气），**权限边界照旧不动**。
-            tone = CHIME_TONE
+            # 插话走专属语气（压掉主人/访客语气），权限边界照旧不动；
+            # 主人要求「插我的话要尊重」→ 对象是主人时换尊重版插话语气。
+            tone = CHIME_TONE_OWNER if is_owner else CHIME_TONE
             who += "·群聊插话"
             _m = str(qq_allmsg_cfg().get("model") or "").strip()
             if _m:
@@ -1055,8 +1080,44 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     _recent: Dict[str, list] = {}        # 群 openid → 最近几条「昵称: 文本」
     _last_speak: Dict[str, float] = {}   # 群 openid → 上次插话时间（冷却用）
 
+    def _guard_reply(msg, text):          # noqa: ANN001
+        """不起 run 直接回一条（注入警告/封禁通知专用）。失败只记日志。"""
+        # 被 @ 的用 markdown @ 回去（对方才看得到）；插话/单聊不 @。
+        mention = msg.user_id if (msg.chat_type == "group"
+                                  and getattr(msg, "event", "") == "GROUP_AT_MESSAGE_CREATE") else ""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(transport.send(Outbound(
+                chat_id=msg.chat_id, chat_type=msg.chat_type,
+                text=text, reply_to=msg.msg_id, mention=mention)))
+        except Exception as e:            # noqa: BLE001
+            logger.warning("⚠️ 防御通知发送失败：%s", e)
+
     def _prepare(msg):                   # noqa: ANN001
         """返回 None = 这条不响应；返回字符串 = 用它当 query 起 run。"""
+        # ── 指令注入防御（最高优先级，主人 2026-09-15 要求）────────────────
+        # 封禁期内：静默丢弃（不回复、不起 run = 不调模型、不进上下文摘要）。
+        # 命中植入特征：第一次发警告；第二次起封禁 24h。主人白名单不受此闸约束。
+        if msg.user_id and msg.user_id not in qq_owner_ids():
+            try:
+                if store.is_im_banned(msg.user_id):
+                    logger.info("⛔ [im-guard] 封禁期消息，静默丢弃 sender=%s text=%s",
+                                msg.user_id, (msg.text or "")[:40])
+                    return None
+                if injection_hit(msg.text or ""):
+                    rec = store.record_im_abuse(msg.user_id)
+                    if int(rec.get("warnings") or 1) >= 2:
+                        store.record_im_abuse(msg.user_id, ban_seconds=ABUSE_BAN_SECONDS)
+                        logger.warning("⛔ [im-guard] 再次植入指令 → 封禁 24h sender=%s text=%s",
+                                       msg.user_id, (msg.text or "")[:60])
+                        _guard_reply(msg, ABUSE_BAN_TEXT)
+                    else:
+                        logger.warning("🚨 [im-guard] 首次植入指令 → 警告一次 sender=%s text=%s",
+                                       msg.user_id, (msg.text or "")[:60])
+                        _guard_reply(msg, ABUSE_WARN_TEXT)
+                    return None
+            except Exception as e:        # noqa: BLE001  防御自身出错不能把消息搞挂
+                logger.warning("⚠️ 注入防御闸门异常（本次放行）：%s", e)
         if getattr(msg, "event", "") != "GROUP_MESSAGE_CREATE":
             # @ 消息 / 单聊：老行为，永远响应。这里只补「更早的对话摘要」
             # （超窗口的旧内容，由后台任务异步压好，读缓存不花钱不耗时）。
