@@ -9,6 +9,7 @@ from pydantic import Field
 from build_mcp.common.config import load_config
 from build_mcp.common.logger import get_logger
 from build_mcp.services.gd_sdk import GdSDK
+from build_mcp.services import quote_sdk
 
 # 优先从环境变量里读取API_KEY，如果没有则从配置文件读取
 env_api_key = os.getenv("API_KEY")
@@ -146,4 +147,31 @@ async def search_nearby(
     })
   except Exception as e:
     logger.error(f"Error searching nearby: {e}")
+    return ApiResponse.fail(str(e))
+
+
+@mcp.tool(name="market_quote", description="实时行情查询：A股指数/个股、美股指数、日元/美元等汇率、BTC/ETH 价格。market 取值：a= A股（codes 如 sh000001 上证指数、sz399001 深证成指、sh600519 贵州茅台）；us= 美股指数（codes 如 usIXIC 纳斯达克、usDJI 道琼斯、usSPX 标普500）；fx= 汇率（base 默认 USD，symbols 如 JPY,CNY，返回兑各货币汇率）；crypto= 加密货币（codes 如 BTC_USDT、ETH_USDT）。返回最新价、涨跌幅、更新时间。")
+async def market_quote(
+    market: Annotated[str, Field(description="市场类型：a / us / fx / crypto")],
+    codes: Annotated[Optional[str], Field(description="代码，逗号分隔：a/us 用 sh000001,usIXIC 等；crypto 用 BTC_USDT,ETH_USDT")],
+    base: Annotated[str, Field(description="fx 用：基准货币，默认 USD")] = "USD",
+    symbols: Annotated[Optional[str], Field(description="fx 用：目标货币列表，如 JPY,CNY")] = None,
+) -> ApiResponse:
+  """实时行情查询：A股、美股指数、汇率、加密货币。"""
+  logger.info(f"market_quote market={market} codes={codes} base={base} symbols={symbols}")
+  try:
+    m = (market or "").strip().lower()
+    if m in ("a", "us"):
+      if not codes:
+        codes = "sh000001,sz399001" if m == "a" else "usIXIC,usDJI,usSPX"
+      return ApiResponse.ok(data=await quote_sdk.quote_tencent(codes), meta={"market": m})
+    if m == "fx":
+      return ApiResponse.ok(data=await quote_sdk.fx_rates(base=base or "USD", symbols=symbols), meta={"market": "fx"})
+    if m == "crypto":
+      pairs = [c.strip() for c in (codes or "BTC_USDT,ETH_USDT").split(",") if c.strip()]
+      data = {p: await quote_sdk.crypto(p) for p in pairs}
+      return ApiResponse.ok(data=data, meta={"market": "crypto"})
+    return ApiResponse.fail(f"未知 market: {market}，支持 a / us / fx / crypto")
+  except Exception as e:
+    logger.error(f"Error market_quote: {e}")
     return ApiResponse.fail(str(e))
