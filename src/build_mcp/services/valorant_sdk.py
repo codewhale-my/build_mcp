@@ -362,8 +362,9 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         loc = j.get("location") or ""
         # 失效时 Riot 303 到 https://authenticate.riotgames.com/login?...（实测）
         if loc.startswith("/login") or "riotgames.com/login" in loc:
-            return {"error": "这个 ssid 已经失效（Riot 要它重新登录）：可能改过密码或太久没用，"
-                             "请在群里让机器人再发一条绑定链接"}
+            return {"error": "Riot 没认出这个 ssid：常见原因是【复制不完整】（要整条 Value，"
+                             "通常几百字符，首尾都不能少），其次是它真失效了。请重新完整复制再贴一次；"
+                             "还不行就在本页用「③ 登录地址绑定」重新登录一次拳头账号即可，不用回群里要链接"}
         tok = parse_access_token(loc)
         if tok:
             out = {"access_token": tok}
@@ -530,6 +531,6 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
         return {"error": "还没绑定 Riot 账号：请打开绑定链接登录一次"}
     res = await store_with_token(token, region)
     if res.get("error") and ("401" in str(res.get("error")) or "403" in str(res.get("error"))):
-        res["error"] += ("（登录状态已失效，请在群里让机器人再发一条绑定链接）" if ssid
+        res["error"] += ("（登录已彻底失效：请打开绑定页，点「换账号 / 重新绑定」重新登录一次拳头账号即可）" if ssid
                          else "（如想长期免登录，请在绑定页粘贴一次 ssid）")
     return res
