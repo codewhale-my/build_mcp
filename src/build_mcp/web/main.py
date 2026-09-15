@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 from build_mcp.client.conversation import (
     agent_loop_stream,
+    im_model_key,
     init_all_mcp_sessions,
     list_llm_models,
     resolve_llm_spec,
@@ -877,8 +878,11 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         except Exception:                    # noqa: BLE001
             return GUEST_ACK
 
+    _im_model = im_model_key()
+    logger.info("🧠 IM(QQ) 默认模型 key：%s", _im_model or "(未设置，跟随全局默认)")
+
     hub = ChannelHub(transport, _start_run, _im_fetch_run,
-                     SessionMap(alloc_base=100000), model="",
+                     SessionMap(alloc_base=100000), model=_im_model,
                      progress="off", max_progress=0, max_replies=4,
                      ack="🤖 收到，正在处理，稍等…", ack_fn=_ack_for)
 

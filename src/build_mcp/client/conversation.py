@@ -44,6 +44,13 @@ def _load_model_catalog() -> tuple[List[dict], str]:
                 "model": model,
                 "thinking": bool(item.get("thinking", False)),
                 "reasoning_effort": str(item.get("reasoning_effort") or "low").strip() or "low",
+                # 可选：本模型自带服务商（智谱 / DeepSeek / … 混用），留空则用全局那套
+                "base_url": str(item.get("base_url") or "").strip(),
+                "api_key": str(item.get("api_key") or "").strip(),
+                # 可选：本模型单价（元/百万 token），留空则用全局 _PRICE_*
+                "price_hit": item.get("price_hit"),
+                "price_miss": item.get("price_miss"),
+                "price_out": item.get("price_out"),
             })
 
     default_key = str(config.get("llm_model") or "").strip()
@@ -56,6 +63,8 @@ def _load_model_catalog() -> tuple[List[dict], str]:
             "model": model,
             "thinking": bool(config.get("llm_thinking", False)),
             "reasoning_effort": str(config.get("llm_reasoning_effort", "low")).strip() or "low",
+            "base_url": "", "api_key": "",
+            "price_hit": None, "price_miss": None, "price_out": None,
         }]
         default_key = model
     elif default_key not in {s["key"] for s in specs}:
@@ -89,6 +98,16 @@ def resolve_llm_spec(model_key: str | None = None) -> Dict[str, Any]:
         if spec["key"] == LLM_DEFAULT_KEY:
             return spec
     return LLM_SPECS[0]
+
+def im_model_key() -> str:
+    """IM（QQ / 企业微信）通道默认使用的模型 key。
+
+    优先级：环境变量 `MCP_QQ_MODEL` > config.yaml 的 `im_model` > ""（跟随默认模型）。
+    单独留这一项，是因为 IM 与 Web 的成本/速度取舍不同：群里人多、频次高，
+    适合挂便宜快的模型，Web 端仍可自己在下拉里换。
+    """
+    return (os.environ.get("MCP_QQ_MODEL") or str(config.get("im_model") or "")).strip()
+
 
 # ========== 对话 System Prompt（CLI 与 Web 共用） ==========
 SYSTEM_PROMPT = (
@@ -459,15 +478,45 @@ def _usage_numbers(u) -> dict:
     hit = g("prompt_cache_hit_tokens")
     miss = g("prompt_cache_miss_tokens")
     pin = g("prompt_tokens") or (hit + miss)
+    if not hit and not miss and pin:
+        # 非 DeepSeek 供应商（如智谱）把缓存命中放在 prompt_tokens_details.cached_tokens；
+        # 不兼容这一层就会把命中当 0，成本口径跟着错。
+        try:
+            det = (u.get("prompt_tokens_details") if isinstance(u, dict)
+                   else getattr(u, "prompt_tokens_details", None))
+        except Exception:                                     # noqa: BLE001
+            det = None
+        hit = int((det.get("cached_tokens") if isinstance(det, dict)
+                   else getattr(det, "cached_tokens", 0)) or 0)
+        miss = max(0, pin - hit)
     return {"hit": hit, "miss": miss, "in": pin, "out": g("completion_tokens")}
 
 
-def _fmt_usage(u: dict) -> str:
-    """一行可读的用量摘要：输入(命中/未命中/命中率) + 输出 + 估算花费。"""
+def _spec_price(spec: dict | None, key: str, dflt: float) -> float:
+    """取本模型单价（元/百万 token）；模型没写就用全局默认价。"""
+    if spec:
+        v = spec.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return dflt
+
+
+def _fmt_usage(u: dict, spec: dict | None = None) -> str:
+    """一行可读的用量摘要：输入(命中/未命中/命中率) + 输出 + 估算花费。
+
+    单价按【所选模型】取（spec 的 price_hit/price_miss/price_out），没写回落全局价——
+    混用不同供应商时不能都按 DeepSeek 的价钱算，否则金额会明显失真。
+    """
     hit, miss, out = int(u.get("hit") or 0), int(u.get("miss") or 0), int(u.get("out") or 0)
     pin = int(u.get("in") or 0) or (hit + miss)
     rate = (hit / pin) if pin else 0.0
-    cost = (hit * _PRICE_HIT + miss * _PRICE_MISS + out * _PRICE_OUT) / 1_000_000
+    ph = _spec_price(spec, "price_hit", _PRICE_HIT)
+    pm = _spec_price(spec, "price_miss", _PRICE_MISS)
+    po = _spec_price(spec, "price_out", _PRICE_OUT)
+    cost = (hit * ph + miss * pm + out * po) / 1_000_000
     return (f"输入 {pin} tok（缓存命中 {hit} / 未命中 {miss}，命中率 {rate:.0%}）"
             f" 输出 {out} tok ≈ ¥{cost:.4f}")
 
@@ -556,9 +605,10 @@ async def agent_loop_stream(
     work_messages = history_messages.copy()
     work_messages.append({"role": "user", "content": _compose_user_message(user_query, turn_note)})
 
+    # 每个模型可以自带服务商；没写就用全局的 llm_base_url / llm_api_key
     client = AsyncOpenAI(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL
+        api_key=spec.get("api_key") or LLM_API_KEY,
+        base_url=spec.get("base_url") or LLM_BASE_URL,
     )
 
     thinking_parts: List[str] = []   # 各轮思考文本，done 时合并
@@ -629,7 +679,7 @@ async def agent_loop_stream(
             totals["rounds"] += 1
             for k in ("hit", "miss", "in", "out"):
                 totals[k] += int(round_usage.get(k) or 0)
-            print(f"📊 第{totals['rounds']}次请求 {_fmt_usage(round_usage)}")
+            print(f"📊 第{totals['rounds']}次请求 {_fmt_usage(round_usage, spec)}")
 
         if thinking_acc:
             thinking_parts.append(thinking_acc)
@@ -644,7 +694,7 @@ async def agent_loop_stream(
                 "thinking": "\n\n".join(p for p in thinking_parts if p),
                 "model": spec["model"],
                 "model_key": spec["key"],
-                "usage": {**totals, "summary": _fmt_usage(totals)},
+                "usage": {**totals, "summary": _fmt_usage(totals, spec)},
             }
             return
 
@@ -722,7 +772,7 @@ async def agent_loop_stream(
         "thinking": "\n\n".join(p for p in thinking_parts if p),
         "model": spec["model"],
         "model_key": spec["key"],
-        "usage": {**totals, "summary": _fmt_usage(totals)},
+        "usage": {**totals, "summary": _fmt_usage(totals, spec)},
     }
 
 
