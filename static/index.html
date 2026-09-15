@@ -2363,7 +2363,7 @@ function setModel(key){
    所以：用户在浏览器登录（人机验证在浏览器完成）→ 把结果地址粘回 → 后台用令牌查商店。 */
 const riotBtn=$('#riotBtn'), riotMenu=$('#riotMenu');
 const RIOT_REGIONS=[['ap','亚太 AP'],['na','北美 NA'],['eu','欧服 EU'],['kr','韩服 KR'],['latam','拉美'],['br','巴西']];
-let riotState={bound:false,player:'',region:'ap',updated_at:0,login_url:''};
+let riotState={bound:false,player:'',region:'ap',persistent:false,updated_at:0,login_url:''};
 let riotBusy=false;
 
 function riotEsc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -2377,21 +2377,28 @@ function riotBody(){
   const s=riotState;
   let h='<div class="riot-sec">';
   if(s.bound){
-    h+='<div class="riot-acct">🎮 '+riotEsc(s.player||'已绑定')+'</div>';
+    h+='<div class="riot-acct">🎮 '+riotEsc(s.player||'已绑定')+
+       (s.persistent?' <span style="font-size:11px;color:var(--ok,#1a9e6a);border:1px solid currentColor;border-radius:20px;padding:1px 7px">长期有效</span>'
+                    :' <span style="font-size:11px;color:var(--text3);border:1px solid var(--border);border-radius:20px;padding:1px 7px">仅 1 小时</span>')+'</div>';
     h+='<div class="riot-tip">区服 <b>'+riotEsc((s.region||'ap').toUpperCase())+'</b>　绑定于 '+riotEsc(riotTime(s.updated_at))+
-       '<br>登录令牌约 1 小时有效，过期后点「重新登录绑定」再来一次即可。</div>';
+       '<br>'+(s.persistent?'已存长期登录（ssid），过期自动续，<b>不用再登录</b>。'
+                          :'登录令牌约 1 小时有效，过期后点「重新登录绑定」；想长期免登录，绑定时粘贴 ssid。')+'</div>';
     h+='<div class="riot-row"><button class="riot-btn primary" id="riotQuery">查我的每日商店</button></div>';
     h+='<div class="riot-row"><button class="riot-btn" id="riotRebind">重新登录绑定</button><button class="riot-btn" id="riotUnbind">解绑</button></div>';
   }else{
-    h+='<div class="riot-tip">Riot 对服务器 IP 强制人机验证，后台直接登录必然失败。改成：<b>你在自己浏览器里登录</b>（人机验证在浏览器完成），再把结果交给后台。</div>';
-    h+='<div class="riot-tip">① 点下面按钮打开 Riot 官方登录页（你这台机器要能访问 Riot，一般需要开代理），登录你的拳头账号；<br>'+
-       '② 登录成功后地址栏会停在 <b>playvalorant.com/opt_in#access_token=…</b>，把<b>整条地址</b>复制，粘进下面输入框，点「绑定」。</div>';
+    h+='<div class="riot-tip">Riot 对服务器 IP 强制人机验证，后台直接登录必然失败。改成：<b>你在自己浏览器里登录</b>（人机验证在浏览器完成），再把凭证交给后台。</div>';
+    h+='<div class="riot-tip">① 点下面按钮打开 Riot 官方登录页（你这台机器要能访问 Riot，一般需要开代理），登录你的拳头账号。</div>';
     h+='<div class="riot-row"><button class="riot-btn primary" id="riotOpen">① 打开 Riot 登录页</button></div>';
     h+='<div class="riot-row"><select class="riot-input" id="riotRegion" style="flex:0 0 116px">'+
        RIOT_REGIONS.map(r=>'<option value="'+r[0]+'"'+(r[0]===(s.region||'ap')?' selected':'')+'>'+r[1]+'</option>').join('')+
        '</select><span class="riot-tip" style="flex:1">区服（国服不支持）</span></div>';
-    h+='<textarea class="riot-input" id="riotRaw" rows="3" placeholder="粘贴 https://playvalorant.com/opt_in#access_token=... 整条地址"></textarea>';
-    h+='<div class="riot-row"><button class="riot-btn primary" id="riotBind">② 绑定</button></div>';
+    h+='<div class="riot-tip">② <b>推荐：粘贴 ssid</b>（长期有效，以后不用再登）—— 浏览器按 F12 → Application/应用 → Cookies → https://auth.riotgames.com → 复制 <b>ssid</b> 的 Value；'+
+       '或在 Network/网络 里对任一 auth.riotgames.com 请求右键 <b>Copy as cURL</b>，整段粘进来也行。</div>';
+    h+='<textarea class="riot-input" id="riotSsid" rows="3" placeholder="粘贴 ssid 的值，或整段 Cookie / Copy as cURL 文本"></textarea>';
+    h+='<div class="riot-row"><button class="riot-btn primary" id="riotBind">② 绑定（长期免登录）</button></div>';
+    h+='<div class="riot-tip" style="margin-top:6px">③ 只有手机 / 拿不到 ssid？登录后地址栏停在 <b>playvalorant.com/opt_in#access_token=…</b>，把整条地址粘到下面（仅 1 小时有效）：</div>';
+    h+='<textarea class="riot-input" id="riotRaw" rows="2" placeholder="粘贴 https://playvalorant.com/opt_in#access_token=... 整条地址"></textarea>';
+    h+='<div class="riot-row"><button class="riot-btn" id="riotBindRaw">③ 用登录地址绑定</button></div>';
   }
   h+='<div class="riot-msg" id="riotNote"></div><div class="riot-list" id="riotList"></div></div>';
   return h;
@@ -2422,24 +2429,35 @@ function riotRender(){
   const g=id=>document.getElementById(id);
   const open=g('riotOpen');
   if(open) open.onclick=()=>{ if(riotState.login_url) window.open(riotState.login_url,'_blank'); };
-  const bind=g('riotBind');
-  if(bind) bind.onclick=async ()=>{
-    const raw=(g('riotRaw')&&g('riotRaw').value||'').trim();
-    const region=(g('riotRegion')&&g('riotRegion').value)||'ap';
-    if(!raw){ riotNote('请先粘贴登录后的整条地址','err'); return; }
-    if(riotBusy) return; riotBusy=true; bind.disabled=true;
-    riotNote('正在验证令牌并查询商店…');
+  const doRiotBind=async (payload,btn)=>{
+    if(riotBusy) return; riotBusy=true; if(btn) btn.disabled=true;
+    riotNote('正在验证凭证并查询商店…');
     try{
       const d=await riotApi('/api/riot/bind',{method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({raw:raw,region:region})});
-      riotState.bound=true; riotState.player=d.player||''; riotState.region=d.region||region;
+        body:JSON.stringify(payload)});
+      riotState.bound=true; riotState.player=d.player||''; riotState.region=d.region||riotState.region;
+      riotState.persistent=!!d.persistent;
       riotState.updated_at=Date.now()/1000;
       riotRender();
-      riotNote('✅ 绑定成功',''); 
+      riotNote(d.persistent?'✅ 绑定成功，以后不用再登录了':'✅ 绑定成功（1 小时内有效）','');
       const list=document.getElementById('riotList'); if(list) list.innerHTML=riotStoreHtml(d.store);
     }catch(e){ riotNote('⚠️ '+riotEsc(e.message),'err'); }
     finally{ riotBusy=false; }
+  };
+  const bind=g('riotBind');
+  if(bind) bind.onclick=()=>{
+    const ssid=(g('riotSsid')&&g('riotSsid').value||'').trim();
+    const region=(g('riotRegion')&&g('riotRegion').value)||'ap';
+    if(!ssid){ riotNote('请先粘贴 ssid（或整段 Cookie / cURL 文本）','err'); return; }
+    doRiotBind({ssid:ssid,region:region},bind);
+  };
+  const bindRaw=g('riotBindRaw');
+  if(bindRaw) bindRaw.onclick=()=>{
+    const raw=(g('riotRaw')&&g('riotRaw').value||'').trim();
+    const region=(g('riotRegion')&&g('riotRegion').value)||'ap';
+    if(!raw){ riotNote('请先粘贴登录后的整条地址','err'); return; }
+    doRiotBind({raw:raw,region:region},bindRaw);
   };
   const q=g('riotQuery');
   if(q) q.onclick=async ()=>{
@@ -2469,6 +2487,7 @@ async function riotOpenMenu(){
     const d=await riotApi('/api/riot');
     riotState.bound=!!d.bound; riotState.player=d.player||''; riotState.region=d.region||'ap';
     riotState.updated_at=d.updated_at||0; riotState.login_url=d.login_url||'';
+    riotState.persistent=!!d.persistent;
     riotRender();
   }catch(e){
     riotMenu.innerHTML='<div class="ws-hd"><span>🎮 拳头账号</span></div><div class="riot-sec"><div class="riot-msg err">加载失败：'+riotEsc(e.message)+'</div></div>';

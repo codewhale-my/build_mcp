@@ -276,6 +276,93 @@ def parse_access_token(raw: str) -> str:
     return ""
 
 
+_SSID_RE = re.compile(r"ssid\s*[=:]\s*[\"']?([^;'\"\s\\]+)")
+
+
+def extract_ssid(raw: str) -> str:
+    """从用户粘贴的内容里取出 ssid cookie；取不到返回 ""。
+
+    三种贴法都认：① 纯 ssid 值（eyJ… 长串）；② `ssid=xxx; 其它cookie=…` 整段 Cookie；
+    ③ 开发者工具 Network 里的「Copy as cURL」整段文本。
+    """
+    s = (raw or "").strip().strip('"').strip("'")
+    for _ in range(2):                             # 容错：整串可能是 URL 编码过的
+        if not s:
+            return ""
+        m = _SSID_RE.search(s)
+        if m:
+            return urllib.parse.unquote(m.group(1)).strip()
+        if len(s) >= 40 and not re.search(r"[\s;'\"]", s) and re.fullmatch(r"[A-Za-z0-9_\-\.]+", s):
+            return s                               # 裸 ssid 值
+        if "%" not in s:
+            return ""
+        s = urllib.parse.unquote(s)
+    return ""
+
+
+async def cookie_login(ssid: str) -> Dict[str, Any]:
+    """用 ssid cookie 在后台换一个新的 access_token（不触发人机验证）。
+
+    access_token 只有 1 小时，ssid 是长期 cookie —— 有它就能"登录一次、以后一直查"。
+    ssid 失效（改密码/长时间不用/被踢）时返回 error，需要用户重新登录一次。
+    """
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return {"error": "没识别到 ssid，请重新复制"}
+
+    auth_url = "https://auth.riotgames.com/api/v1/authorization"
+    body = {
+        "client_id": "play-valorant-web-prod",
+        "nonce": "1",
+        "redirect_uri": "https://playvalorant.com/opt_in",
+        "response_type": "token id_token",
+        "scope": "account openid",
+    }
+
+    def _sync():
+        import http.cookiejar
+        cj = http.cookiejar.CookieJar()
+        cj.set_cookie(http.cookiejar.Cookie(
+            0, "ssid", ssid, None, False, ".riotgames.com", False, False,
+            "/", True, False, None, True, None, None, {}))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.ProxyHandler(dict(_PROXY)))
+        req = urllib.request.Request(auth_url, data=json.dumps(body).encode(),
+                                     headers={**_UA, "Content-Type": "application/json"})
+        last = ""
+        for attempt in (1, 2):
+            try:
+                resp = opener.open(req, timeout=15)
+                return json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as e:
+                try:
+                    return json.loads(e.read().decode("utf-8", "replace"))
+                except Exception:                 # noqa: BLE001
+                    return {"type": "http", "status": e.code}
+            except Exception as e:                # noqa: BLE001
+                last = f"{type(e).__name__}: {e}"
+                if attempt == 1:                  # 网络/代理抖动 → 自愈重试一次
+                    _proxy_reset()
+                    time.sleep(1.0)
+        return {"type": "net_error", "detail": last}
+
+    try:
+        j = await asyncio.get_event_loop().run_in_executor(None, _sync)
+    except Exception as e:                        # noqa: BLE001
+        return {"error": f"续期失败（网络异常）：{e}"}
+
+    if j.get("type") == "response":
+        uri = ((j.get("response") or {}).get("parameters") or {}).get("uri", "")
+        tok = parse_access_token(uri)
+        return {"access_token": tok} if tok else {"error": "Riot 返回里没有令牌，请重新登录一次"}
+    if j.get("type") == "multifactor":
+        return {"error": "该账号开了二次验证，需要重新登录一次"}
+    if j.get("type") == "net_error":
+        return {"error": f"连不上 Riot（网络/代理异常）：{str(j.get('detail'))[:100]}"}
+    return {"error": "登录状态已失效，请在群里让机器人再发一条绑定链接"}   # type=auth
+
+
 async def account_info(access_token: str) -> Dict[str, Any]:
     """用令牌取账号信息（puuid / 游戏名#Tag）。令牌无效或过期会返回 error。"""
     st, raw = await _http("https://auth.riotgames.com/userinfo",
@@ -404,8 +491,29 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
             or _webstore.latest_riot_binding()
     except Exception as e:                                    # noqa: BLE001
         return {"error": f"读取绑定信息失败：{e}"}
-    if not row or not row.get("access_token"):
+    if not row:
         return {"error": "还没绑定 Riot 账号：请打开绑定链接登录一次"
                          "（Riot 对服务器 IP 强制人机验证，只能在浏览器里登录）"}
-    return await store_with_token(row["access_token"],
-                                  (region or row.get("region") or "ap").lower())
+    region = (region or row.get("region") or "ap").lower()
+    token = row.get("access_token") or ""
+    ssid = row.get("ssid") or ""
+
+    # 长期绑定：有 ssid 就每次换一张新令牌（access_token 只有 1 小时，不换必过期）
+    if ssid:
+        got = await cookie_login(ssid)
+        if got.get("access_token"):
+            token = got["access_token"]
+            try:
+                _webstore.update_riot_access_token(int(row["user_id"]), token)
+            except Exception as e:                        # noqa: BLE001  刷新不影响本次查询
+                logger.warning("刷新 Riot 令牌入库失败：%s", e)
+        elif not token:
+            return {"error": got.get("error") or "登录状态已失效，请重新绑定"}
+
+    if not token:
+        return {"error": "还没绑定 Riot 账号：请打开绑定链接登录一次"}
+    res = await store_with_token(token, region)
+    if res.get("error") and ("401" in str(res.get("error")) or "403" in str(res.get("error"))):
+        res["error"] += ("（登录状态已失效，请在群里让机器人再发一条绑定链接）" if ssid
+                         else "（如想长期免登录，请在绑定页粘贴一次 ssid）")
+    return res

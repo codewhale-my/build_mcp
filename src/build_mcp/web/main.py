@@ -961,15 +961,20 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         try:
             b = get_riot_binding(host["id"]) or {}
             key = f"qq:{host['id']}"
-            if b.get("access_token"):
+            if b.get("access_token") or b.get("ssid"):
                 who = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#") or "已绑定账号"
-                return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}）。"
+                life = "长期有效（已存长期登录，过期会自动续）" if b.get("ssid") else "只有 1 小时有效，随时可能过期"
+                return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}，"
+                        f"授权状态：{life}）。"
                         f"他问每日商店时直接调用 valorant_daily_store(bind_key=\"{key}\")，"
-                        "不要向他要账号密码，也不要说没有权限。")
+                        "不要向他要账号密码，也不要说没有权限。"
+                        + ("" if b.get("ssid") else
+                           "如果查询报「登录已失效」，把绑定链接再发他一条，"
+                           "并说明这次建议按页面提示粘贴 ssid，之后就长期不用再登了。"))
             url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
             return ("\n\n[拳头账号] 该用户【还没绑定】Riot 账号。他问每日商店/皮肤时，"
-                    "把下面这条链接原样发给他（30 分钟内有效，用手机浏览器或 QQ 内置浏览器打开，"
-                    "登录一次即可；绑好后你就能直接查到他的商店）：\n" + url)
+                    "把下面这条链接原样发给他（30 分钟内有效，用手机浏览器或 QQ 内置浏览器打开）。"
+                    "按页面提示登录一次并粘贴 ssid 即可长期免登录，绑好后你就能直接查到他的商店：\n" + url)
         except Exception as e:               # noqa: BLE001  绑定信息拿不到不能影响对话
             logger.warning("⚠️ 生成拳头绑定提示失败：%s", e)
             return ""
@@ -2067,8 +2072,13 @@ def public_base_url() -> str:
 
 
 class RiotPubBindRequest(BaseModel):
-    """群友/访客用的绑定请求：t = 机器人给的一次性令牌。"""
+    """群友/访客用的绑定请求：t = 机器人给的一次性令牌。
+
+    ssid = 长期 cookie（推荐）：粘一次就能永久免登录；
+    raw  = 登录后的整条地址（只有 1 小时）。
+    """
     t: str = ""
+    ssid: str = ""
     raw: str = ""
     region: str = "ap"
 
@@ -2082,8 +2092,9 @@ async def riot_pub_status(t: str = ""):
         raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
     b = get_riot_binding(uid) or {}
     name = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#")
-    return {"bound": bool(b.get("access_token")), "player": name,
-            "region": b.get("region") or "ap", "login_url": valorant_sdk.RIOT_AUTH_URL}
+    return {"bound": bool(b.get("access_token") or b.get("ssid")), "player": name,
+            "region": b.get("region") or "ap", "persistent": bool(b.get("ssid")),
+            "login_url": valorant_sdk.RIOT_AUTH_URL}
 
 
 @app.post("/api/riot/pub/bind")
@@ -2094,25 +2105,34 @@ async def riot_pub_bind(req: RiotPubBindRequest):
     if not uid:
         raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
     token = valorant_sdk.parse_access_token(req.raw)
-    if not token:
-        raise HTTPException(status_code=400, detail="没识别到登录令牌：请把浏览器地址栏里 "
-                                                   "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
     region = (req.region or "ap").strip().lower()
+    ssid = valorant_sdk.extract_ssid(req.ssid) if (req.ssid or "").strip() else ""
     try:
+        if ssid:                                  # 长期免登录：先用 ssid 换一张新令牌
+            got = await valorant_sdk.cookie_login(ssid)
+            if got.get("error"):
+                raise HTTPException(status_code=400, detail=got["error"])
+            token = got.get("access_token") or ""
+        if not token:
+            raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
+                                                       "或把浏览器地址栏里 "
+                                                       "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
         info = await valorant_sdk.account_info(token)
         if info.get("error"):
             raise HTTPException(status_code=400, detail=info["error"])
         save_riot_binding(uid, region, token, info.get("puuid", ""),
-                          info.get("game_name", ""), info.get("tag_line", ""))
+                          info.get("game_name", ""), info.get("tag_line", ""),
+                          ssid=(ssid or None))
         player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
-        logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s）", uid, player or "(未知)", region)
-        store = await valorant_sdk.store_with_token(token, region)
+        logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s，%s）", uid, player or "(未知)", region,
+                    "长期免登录" if ssid else "仅 1 小时令牌")
+        store = await valorant_sdk.bound_daily_store(region, uid=uid)
     except HTTPException:
         raise
     except Exception as e:                    # noqa: BLE001  网络类异常也给人话
         logger.warning("⚠️ [IM] 绑定失败 uid=%s：%s", uid, str(e)[:200])
         raise HTTPException(status_code=400, detail=f"绑定失败：{str(e)[:160]}")
-    return {"ok": True, "player": player, "region": region, "store": store}
+    return {"ok": True, "player": player, "region": region, "persistent": bool(ssid), "store": store}
 
 
 @app.post("/api/riot/pub/store")
@@ -2123,34 +2143,38 @@ async def riot_pub_store(t: str = ""):
     if not uid:
         raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
     b = get_riot_binding(uid) or {}
-    if not b.get("access_token"):
+    if not (b.get("access_token") or b.get("ssid")):
         raise HTTPException(status_code=404, detail="这个链接还没绑定过账号")
     try:
-        res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
+        res = await valorant_sdk.bound_daily_store(b.get("region") or "ap", uid=uid)
     except Exception as e:                    # noqa: BLE001
         logger.warning("⚠️ [IM] 查商店失败 uid=%s：%s", uid, str(e)[:200])
         raise HTTPException(status_code=400, detail=f"查询失败：{str(e)[:160]}")
-    if res.get("error") and "401" in str(res.get("error")):
-        return {"need_rebind": True, "error": "登录已过期，请让机器人再发一条绑定链接"}
+    res = dict(res or {})
+    if res.get("error") and "401" in str(res.get("error")) and not b.get("ssid"):
+        res["need_rebind"] = True
     return res
 
 
 class RiotBindRequest(BaseModel):
-    """raw = 用户粘贴的整条地址（playvalorant.com/opt_in#access_token=...）或裸令牌。"""
+    """raw = 用户粘贴的整条地址（playvalorant.com/opt_in#access_token=...）或裸令牌；
+    ssid = 长期 cookie（推荐，粘一次以后就不用再登了）。"""
     raw: str = ""
+    ssid: str = ""
     region: str = "ap"
 
 
 @app.get("/api/riot")
 async def riot_status(user: dict = Depends(require_user)):
-    """Riot 绑定状态：是否已绑、绑定账号、区服、登录入口地址。"""
+    """Riot 绑定状态：是否已绑、绑定账号、区服、是否长期免登录、登录入口地址。"""
     from build_mcp.services import valorant_sdk
     b = get_riot_binding(user["id"]) or {}
     name = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#")
     return {
-        "bound": bool(b.get("access_token")),
+        "bound": bool(b.get("access_token") or b.get("ssid")),
         "player": name,
         "region": b.get("region") or "ap",
+        "persistent": bool(b.get("ssid")),
         "updated_at": float(b.get("updated_at") or 0),
         "login_url": valorant_sdk.RIOT_AUTH_URL,
     }
@@ -2158,34 +2182,44 @@ async def riot_status(user: dict = Depends(require_user)):
 
 @app.post("/api/riot/bind")
 async def riot_bind(req: RiotBindRequest, user: dict = Depends(require_user)):
-    """绑定：校验令牌 → 存库 → 立刻试查一次商店（绑定成功就能看到东西）。"""
+    """绑定：校验凭证 → 存库 → 立刻试查一次商店（绑定成功就能看到东西）。"""
     from build_mcp.services import valorant_sdk
     token = valorant_sdk.parse_access_token(req.raw)
-    if not token:
-        raise HTTPException(status_code=400, detail="没识别到登录令牌：请把浏览器地址栏里 "
-                                                   "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
     region = (req.region or "ap").strip().lower()
+    ssid = valorant_sdk.extract_ssid(req.ssid) if (req.ssid or "").strip() else ""
+    if ssid:
+        got = await valorant_sdk.cookie_login(ssid)
+        if got.get("error"):
+            raise HTTPException(status_code=400, detail=got["error"])
+        token = got.get("access_token") or ""
+    if not token:
+        raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
+                                                   "或把浏览器地址栏里 "
+                                                   "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
     info = await valorant_sdk.account_info(token)
     if info.get("error"):
         raise HTTPException(status_code=400, detail=info["error"])
     save_riot_binding(user["id"], region, token, info.get("puuid", ""),
-                      info.get("game_name", ""), info.get("tag_line", ""))
+                      info.get("game_name", ""), info.get("tag_line", ""),
+                      ssid=(ssid or None))
     player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
-    logger.info("🎮 用户[%s] 绑定 Riot 账号 %s（%s）", user["username"], player or "(未知)", region)
-    store = await valorant_sdk.store_with_token(token, region)
-    return {"ok": True, "player": player, "region": region, "store": store}
+    logger.info("🎮 用户[%s] 绑定 Riot 账号 %s（%s，%s）", user["username"], player or "(未知)", region,
+                "长期免登录" if ssid else "仅 1 小时令牌")
+    store = await valorant_sdk.bound_daily_store(region, uid=user["id"])
+    return {"ok": True, "player": player, "region": region,
+            "persistent": bool(ssid), "store": store}
 
 
 @app.post("/api/riot/store")
 async def riot_store(user: dict = Depends(require_user)):
-    """用已绑定的账号查每日商店；令牌过期返回 need_rebind 让前端提示重新登录。"""
+    """用已绑定的账号查每日商店（有 ssid 会自动续令牌）；失效则提示重新登录。"""
     from build_mcp.services import valorant_sdk
     b = get_riot_binding(user["id"]) or {}
-    if not b.get("access_token"):
+    if not (b.get("access_token") or b.get("ssid")):
         raise HTTPException(status_code=404, detail="还没绑定 Riot 账号")
-    res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
-    if res.get("error") and "401" in str(res.get("error")):
-        return {"need_rebind": True, "error": "登录已过期，请点「重新登录绑定」再来一次"}
+    res = dict(await valorant_sdk.bound_daily_store(b.get("region") or "ap", uid=user["id"]) or {})
+    if res.get("error") and "401" in str(res.get("error")) and not b.get("ssid"):
+        res["need_rebind"] = True
     return res
 
 

@@ -125,10 +125,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id, created_at);
 
 -- Riot（拳头）账号绑定：服务器 IP 不能直接密码登录（Riot 强制人机验证），
 -- 由用户在浏览器里登录完成后回填 access_token，后台据此查瓦洛兰特每日商店。
+-- ssid = 登录后浏览器里的长期 cookie，用它能在后台自动换新令牌（access_token 只有 1 小时）。
 CREATE TABLE IF NOT EXISTS riot_bindings(
   user_id      INTEGER PRIMARY KEY REFERENCES users(id),
   region       TEXT NOT NULL DEFAULT 'ap',
   access_token TEXT NOT NULL DEFAULT '',
+  ssid         TEXT NOT NULL DEFAULT '',
   puuid        TEXT NOT NULL DEFAULT '',
   game_name    TEXT NOT NULL DEFAULT '',
   tag_line     TEXT NOT NULL DEFAULT '',
@@ -153,6 +155,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "ws_mode" not in ucols:
         # local = 个人工作空间（默认）；server = 云服务器代码目录（仅管理员可选）
         conn.execute("ALTER TABLE users ADD COLUMN ws_mode TEXT NOT NULL DEFAULT 'local'")
+
+    # Riot 绑定：老库没有 ssid 列 → 补上（ssid 用于长期免登录自动换令牌）
+    rcols = {r[1] for r in conn.execute("PRAGMA table_info(riot_bindings)")}
+    if rcols and "ssid" not in rcols:
+        conn.execute("ALTER TABLE riot_bindings ADD COLUMN ssid TEXT NOT NULL DEFAULT ''")
 
 
 def init_db(import_env_codes: str = ""):
@@ -693,20 +700,39 @@ def _main():
 # ── Riot（拳头）账号绑定 ─────────────────────────────────────────────────────
 
 def save_riot_binding(user_id: int, region: str, access_token: str,
-                      puuid: str = "", game_name: str = "", tag_line: str = "") -> None:
-    """保存/覆盖某用户的 Riot 绑定（令牌为浏览器登录换来，有效期约 1 小时）。"""
+                      puuid: str = "", game_name: str = "", tag_line: str = "",
+                      ssid: Optional[str] = None) -> None:
+    """保存/覆盖某用户的 Riot 绑定。
+
+    access_token 是浏览器登录换来的短期令牌（1 小时）；
+    ssid 是长期 cookie，有它后台就能自动续令牌（不传 = 保留库里已有的，不会被清掉）。
+    """
     conn = _conn()
     try:
         with conn:
             conn.execute(
-                "INSERT INTO riot_bindings(user_id,region,access_token,puuid,game_name,tag_line,updated_at)"
-                " VALUES(?,?,?,?,?,?,?)"
+                "INSERT INTO riot_bindings(user_id,region,access_token,ssid,puuid,game_name,tag_line,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(user_id) DO UPDATE SET region=excluded.region,"
-                " access_token=excluded.access_token, puuid=excluded.puuid,"
-                " game_name=excluded.game_name, tag_line=excluded.tag_line,"
+                " access_token=excluded.access_token,"
+                " ssid=CASE WHEN excluded.ssid IS NULL THEN riot_bindings.ssid ELSE excluded.ssid END,"
+                " puuid=excluded.puuid, game_name=excluded.game_name, tag_line=excluded.tag_line,"
                 " updated_at=excluded.updated_at",
-                (int(user_id), region or "ap", access_token, puuid, game_name, tag_line, time.time()),
+                (int(user_id), region or "ap", access_token, ssid, puuid, game_name, tag_line, time.time()),
             )
+    finally:
+        conn.close()
+
+
+def update_riot_access_token(user_id: int, access_token: str) -> None:
+    """只刷新短期令牌（用 ssid 自动续期后调用），不动 ssid/账号信息。"""
+    if not access_token:
+        return
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute("UPDATE riot_bindings SET access_token=?, updated_at=? WHERE user_id=?",
+                         (access_token, time.time(), int(user_id)))
     finally:
         conn.close()
 
