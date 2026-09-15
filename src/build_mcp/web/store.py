@@ -23,6 +23,7 @@ import secrets
 import sqlite3
 import time
 from pathlib import Path
+from typing import Optional
 
 # ---------------- 路径配置 ----------------
 DATA_DIR = Path(os.environ.get("MCP_WEB_DATA_DIR", str(Path.home() / "build-mcp-data")))
@@ -121,6 +122,18 @@ CREATE TABLE IF NOT EXISTS run_events(
   PRIMARY KEY(run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_user ON runs(user_id, created_at);
+
+-- Riot（拳头）账号绑定：服务器 IP 不能直接密码登录（Riot 强制人机验证），
+-- 由用户在浏览器里登录完成后回填 access_token，后台据此查瓦洛兰特每日商店。
+CREATE TABLE IF NOT EXISTS riot_bindings(
+  user_id      INTEGER PRIMARY KEY REFERENCES users(id),
+  region       TEXT NOT NULL DEFAULT 'ap',
+  access_token TEXT NOT NULL DEFAULT '',
+  puuid        TEXT NOT NULL DEFAULT '',
+  game_name    TEXT NOT NULL DEFAULT '',
+  tag_line     TEXT NOT NULL DEFAULT '',
+  updated_at   REAL NOT NULL DEFAULT 0
+);
 
 """
 
@@ -675,6 +688,59 @@ def _main():
     elif args.cmd == "users":
         for u in list_users():
             print(f"  #{u['id']:<3} {u['username']:<20} 注册于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(u['created_at']))}")
+
+
+# ── Riot（拳头）账号绑定 ─────────────────────────────────────────────────────
+
+def save_riot_binding(user_id: int, region: str, access_token: str,
+                      puuid: str = "", game_name: str = "", tag_line: str = "") -> None:
+    """保存/覆盖某用户的 Riot 绑定（令牌为浏览器登录换来，有效期约 1 小时）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO riot_bindings(user_id,region,access_token,puuid,game_name,tag_line,updated_at)"
+                " VALUES(?,?,?,?,?,?,?)"
+                " ON CONFLICT(user_id) DO UPDATE SET region=excluded.region,"
+                " access_token=excluded.access_token, puuid=excluded.puuid,"
+                " game_name=excluded.game_name, tag_line=excluded.tag_line,"
+                " updated_at=excluded.updated_at",
+                (int(user_id), region or "ap", access_token, puuid, game_name, tag_line, time.time()),
+            )
+    finally:
+        conn.close()
+
+
+def get_riot_binding(user_id: int) -> Optional[dict]:
+    """取某用户的 Riot 绑定（无则 None）。"""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM riot_bindings WHERE user_id=?",
+                           (int(user_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def clear_riot_binding(user_id: int) -> None:
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute("DELETE FROM riot_bindings WHERE user_id=?", (int(user_id),))
+    finally:
+        conn.close()
+
+
+def latest_riot_binding() -> Optional[dict]:
+    """最近一次绑定的账号（给 IM 机器人用：主人绑一次，群里就能查）。"""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM riot_bindings WHERE access_token<>'' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

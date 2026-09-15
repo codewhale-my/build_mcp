@@ -65,6 +65,9 @@ from build_mcp.web import store
 from build_mcp.web.whatsnew import latest_version, payload_for
 from build_mcp.web.store import (
     init_db,
+    save_riot_binding,        # 瓦洛兰特：浏览器登录后回填令牌
+    get_riot_binding,
+    clear_riot_binding,
     get_user_by_id,
     get_user_by_name,
     create_user,
@@ -2027,6 +2030,73 @@ async def _im_fetch_run(run_id: str, since: int = 0) -> dict:
         "error": mem.get("error") or "",
         "events": events,
     }
+
+
+# ══════════════════ 拳头账号（瓦洛兰特每日商店）══════════════════════════
+# 为什么不让后台直接登录：Riot 对机房/VPN IP 的密码登录强制 hCaptcha，
+# 服务器发起的登录一律 auth_failure（实测 46 个节点 + 家宽全覆盖）。
+# 所以改成「用户在浏览器里登录 → 把结果令牌交给后台」。
+
+class RiotBindRequest(BaseModel):
+    """raw = 用户粘贴的整条地址（playvalorant.com/opt_in#access_token=...）或裸令牌。"""
+    raw: str = ""
+    region: str = "ap"
+
+
+@app.get("/api/riot")
+async def riot_status(user: dict = Depends(require_user)):
+    """Riot 绑定状态：是否已绑、绑定账号、区服、登录入口地址。"""
+    from build_mcp.services import valorant_sdk
+    b = get_riot_binding(user["id"]) or {}
+    name = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#")
+    return {
+        "bound": bool(b.get("access_token")),
+        "player": name,
+        "region": b.get("region") or "ap",
+        "updated_at": float(b.get("updated_at") or 0),
+        "login_url": valorant_sdk.RIOT_AUTH_URL,
+    }
+
+
+@app.post("/api/riot/bind")
+async def riot_bind(req: RiotBindRequest, user: dict = Depends(require_user)):
+    """绑定：校验令牌 → 存库 → 立刻试查一次商店（绑定成功就能看到东西）。"""
+    from build_mcp.services import valorant_sdk
+    token = valorant_sdk.parse_access_token(req.raw)
+    if not token:
+        raise HTTPException(status_code=400, detail="没识别到登录令牌：请把浏览器地址栏里 "
+                                                   "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
+    region = (req.region or "ap").strip().lower()
+    info = await valorant_sdk.account_info(token)
+    if info.get("error"):
+        raise HTTPException(status_code=400, detail=info["error"])
+    save_riot_binding(user["id"], region, token, info.get("puuid", ""),
+                      info.get("game_name", ""), info.get("tag_line", ""))
+    player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
+    logger.info("🎮 用户[%s] 绑定 Riot 账号 %s（%s）", user["username"], player or "(未知)", region)
+    store = await valorant_sdk.store_with_token(token, region)
+    return {"ok": True, "player": player, "region": region, "store": store}
+
+
+@app.post("/api/riot/store")
+async def riot_store(user: dict = Depends(require_user)):
+    """用已绑定的账号查每日商店；令牌过期返回 need_rebind 让前端提示重新登录。"""
+    from build_mcp.services import valorant_sdk
+    b = get_riot_binding(user["id"]) or {}
+    if not b.get("access_token"):
+        raise HTTPException(status_code=404, detail="还没绑定 Riot 账号")
+    res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
+    if res.get("error") and "401" in str(res.get("error")):
+        return {"need_rebind": True, "error": "登录已过期，请点「重新登录绑定」再来一次"}
+    return res
+
+
+@app.delete("/api/riot")
+async def riot_unbind(user: dict = Depends(require_user)):
+    """解绑：删掉本机保存的令牌。"""
+    clear_riot_binding(user["id"])
+    logger.info("🎮 用户[%s] 解绑 Riot 账号", user["username"])
+    return {"ok": True}
 
 
 @app.post("/api/chat")

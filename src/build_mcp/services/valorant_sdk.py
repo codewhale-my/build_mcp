@@ -7,8 +7,10 @@
 import asyncio
 import base64
 import json
+import re
 import time
 import uuid as uuidlib
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
@@ -216,3 +218,133 @@ async def daily_store(username: str, password: str, region: str = "ap") -> Dict[
         "refresh_in_seconds": remain,
         "items": items,
     }
+
+
+# ══════════════ 浏览器登录模式（绕过 Riot 对机房 IP 的强制人机验证）══════════════
+# 服务器/VPS 的 IP 在 Riot 眼里是"风险 IP"，密码登录一律返回 auth_failure（要求 hCaptcha）。
+# 因此：用户在【自己的浏览器】里打开下面这条官方授权页登录（人机验证在浏览器里完成），
+# 登录成功后浏览器停在 https://playvalorant.com/opt_in#access_token=...&id_token=...
+# 用户把整条地址粘回网页端 → 后台取出 access_token → 调 Riot 接口查商店。
+RIOT_AUTH_URL = (
+    "https://auth.riotgames.com/authorize"
+    "?client_id=play-valorant-web-prod&nonce=1"
+    "&redirect_uri=https%3A%2F%2Fplayvalorant.com%2Fopt_in"
+    "&response_type=token%20id_token&scope=account%20openid"
+)
+
+_ACCESS_TOKEN_RE = re.compile(r"access_token=([^&\s\"'#]+)")
+_JWT_RE = re.compile(r"^[A-Za-z0-9_\-\.]{80,}$")
+
+
+def parse_access_token(raw: str) -> str:
+    """从用户粘贴的内容里取出 access_token：支持整条 URL（#/query 都行）或裸令牌。"""
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return ""
+    m = _ACCESS_TOKEN_RE.search(s)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    if _JWT_RE.match(s) and s.count(".") == 2:
+        return s
+    return ""
+
+
+async def account_info(access_token: str) -> Dict[str, Any]:
+    """用令牌取账号信息（puuid / 游戏名#Tag）。令牌无效或过期会返回 error。"""
+    st, raw = await _http("https://auth.riotgames.com/userinfo",
+                          headers={"Authorization": f"Bearer {access_token}"})
+    if st != 200:
+        return {"error": f"令牌无效或已过期（Riot 返回 {st}）"}
+    try:
+        j = json.loads(raw)
+    except Exception:
+        return {"error": "Riot 返回内容无法解析"}
+    acct = j.get("acct") or {}
+    return {
+        "puuid": j.get("sub") or acct.get("puuid") or "",
+        "game_name": j.get("gameName") or acct.get("game_name") or "",
+        "tag_line": j.get("tagLine") or acct.get("tag_line") or "",
+    }
+
+
+async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, Any]:
+    """用已登录令牌查每日商店（不再需要密码，因此不触发人机验证）。"""
+    region = (region or "ap").lower()
+    shard = _REGION_SHARD.get(region)
+    if not shard:
+        return {"error": f"未知 region: {region}（可用 ap/na/eu/kr/latam/br）"}
+
+    info = await account_info(access_token)
+    if info.get("error"):
+        return info
+    puuid = info.get("puuid") or ""
+    if not puuid:
+        return {"error": "令牌里没有 puuid，请重新登录后再粘贴一次"}
+
+    st, raw = await _http("https://entitlements.auth.riotgames.com/api/token/entitlements",
+                          method="POST", headers={"Authorization": f"Bearer {access_token}"})
+    ent = ""
+    if st == 200:
+        try:
+            ent = json.loads(raw).get("entitlements_token", "")
+        except Exception:
+            ent = ""
+
+    st, raw = await _http("https://valorant-api.com/v1/version")
+    client_version = "release-13.05-shipping-11-5350494"
+    try:
+        if st == 200:
+            client_version = json.loads(raw)["data"]["riotClientVersion"] or client_version
+    except Exception:
+        pass
+
+    hdrs = {
+        "Authorization": f"Bearer {access_token}",
+        "X-Riot-Entitlements-Token": ent,
+        "X-Riot-ClientVersion": client_version,
+        "X-Riot-ClientPlatform": _CLIENT_PLATFORM,
+    }
+    st, raw = await _http(f"https://pd.{shard}.a.pvp.net/store/v2/storefront/{puuid}", headers=hdrs)
+    if st != 200:
+        return {"error": f"商店接口失败（Riot 返回 {st}）：{raw[:160]}"}
+    try:
+        storefront = json.loads(raw)
+    except Exception:
+        return {"error": "商店接口返回无法解析"}
+
+    price_map: Dict[str, int] = {}
+    st2, raw2 = await _http(f"https://pd.{shard}.a.pvp.net/store/v3/offers", headers=hdrs)
+    if st2 == 200:
+        try:
+            for o in (json.loads(raw2).get("Offers") or []):
+                if o.get("IsDirectPurchase") is False:
+                    for cost in (o.get("Cost") or {}).values():
+                        price_map[o.get("OfferID")] = cost
+        except Exception:
+            pass
+
+    panel = storefront.get("SkinsPanelLayout", {}) or {}
+    uuids = panel.get("SingleItemOffers") or []
+    remain = panel.get("SingleItemOffersRemainingDurationSeconds", 0)
+    skinmap = await _skin_map()
+    items = [{"name": skinmap.get(u, u), "uuid": u, "price_vp": price_map.get(u)} for u in uuids]
+    return {
+        "player": f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#"),
+        "region": region,
+        "refresh_in_seconds": remain,
+        "items": items,
+    }
+
+
+async def bound_daily_store(region: str = "") -> Dict[str, Any]:
+    """用网页端绑定的账号查每日商店（IM 机器人走这条：主人绑一次，群里就能查）。"""
+    try:
+        from build_mcp.web import store as _webstore
+        row = _webstore.latest_riot_binding()
+    except Exception as e:                                    # noqa: BLE001
+        return {"error": f"读取绑定信息失败：{e}"}
+    if not row or not row.get("access_token"):
+        return {"error": "还没有绑定 Riot 账号。请先在网页端右上角「🎮」里登录绑定一次"
+                         "（服务器直连会被 Riot 的人机验证拦下，必须在浏览器里登录）"}
+    return await store_with_token(row["access_token"],
+                                  (region or row.get("region") or "ap").lower())

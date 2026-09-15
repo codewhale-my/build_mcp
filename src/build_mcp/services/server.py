@@ -180,15 +180,18 @@ async def market_quote(
 from build_mcp.services import valorant_sdk
 
 
-@mcp.tool(name="valorant_daily_store", description="查询瓦洛兰特（国际服）账号的每日商店：四件每日皮肤、VP 价格、刷新倒计时。需提供 Riot 账号用户名/密码。region: ap/na/eu/kr/latam/br（国服不支持）。")
+@mcp.tool(name="valorant_daily_store", description="查询瓦洛兰特（国际服）账号的每日商店：四件每日皮肤、VP 价格、刷新倒计时。默认用网页端已绑定的账号（主人账号）查询，不用填账号密码；填了才走密码登录（服务器 IP 会被人机验证拦下，通常失败）。region: ap/na/eu/kr/latam/br（国服不支持）。")
 async def valorant_daily_store(
-        username: Annotated[str, Field(description="Riot 账号用户名（不是游戏内昵称）")],
-        password: Annotated[str, Field(description="Riot 账号密码")],
+        username: Annotated[str, Field(description="Riot 账号用户名（留空 = 用网页端绑定的账号，推荐）")] = "",
+        password: Annotated[str, Field(description="Riot 账号密码（留空即可）")] = "",
         region: Annotated[str, Field(description="服务器区域：ap(亚太)/na(北美)/eu(欧洲)/kr(韩国)/latam/br")] = "ap",
 ) -> ApiResponse:
-  logger.info(f"valorant_daily_store region={region}")
+  logger.info(f"valorant_daily_store bound={not username.strip()} region={region}")
   try:
-    result = await valorant_sdk.daily_store(username, password, region)
+    if not username.strip():
+        result = await valorant_sdk.bound_daily_store(region)
+    else:
+        result = await valorant_sdk.daily_store(username, password, region)
     if result.get("error"):
       return ApiResponse.fail(result["error"], meta=result)
     return ApiResponse.ok(data=result)
