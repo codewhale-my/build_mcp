@@ -217,7 +217,8 @@ async def daily_store(username: str, password: str, region: str = "ap") -> Dict[
 
     panel = storefront.get("SkinsPanelLayout", {})
     offer_uuids = panel.get("SingleItemOffers", []) or []
-    remain = panel.get("SingleItemOffersRemainingDurationSeconds", 0)
+    remain = panel.get("SingleItemOffersRemainingDurationInSeconds",
+                       panel.get("SingleItemOffersRemainingDurationSeconds", 0)) or 0
 
     # 价格表：offer uuid -> VP 价格
     price_map: Dict[str, int] = {}
@@ -360,7 +361,8 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
 
     panel = storefront.get("SkinsPanelLayout", {}) or {}
     uuids = panel.get("SingleItemOffers") or []
-    remain = panel.get("SingleItemOffersRemainingDurationSeconds", 0)
+    remain = panel.get("SingleItemOffersRemainingDurationInSeconds",
+                       panel.get("SingleItemOffersRemainingDurationSeconds", 0)) or 0
 
     # 价格直接在 storefront 响应里：SingleItemStoreOffers[*].{OfferID,Cost}
     price_map: Dict[str, int] = {}
