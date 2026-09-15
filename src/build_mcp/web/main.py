@@ -969,6 +969,18 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         del buf[:-30]                    # 只留最近 30 条，内存里不无限涨
         logger.info("📨 [qq/group-all] group=%s sender=%s(%s) text=%s",
                     msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
+        # ⚠️ 群主开了「获取群内全部消息」后，@ 机器人的消息【不再】单独走
+        # GROUP_AT_MESSAGE_CREATE，而是带着 <@botid> 前缀从这条全量通道进来。
+        # @ 必须 100% 回：剥掉 @ 标签、把事件改回 AT（下游身份/语气/去重照旧），
+        # 绕过插话的规则/概率/冷却三道闸门。
+        _t = (msg.text or "").strip()
+        if _t.startswith("<@"):
+            _cleaned = re.sub(r"<@[0-9A-Fa-f]{8,}>\s*", "", _t).strip()
+            if not _cleaned:
+                return None                      # 纯 @ 无内容，没得回答
+            msg.event = "GROUP_AT_MESSAGE_CREATE"
+            logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理")
+            return _cleaned
         if mode != "reply":
             return None                  # observe：只记录，先把群 openid 拿到手
         groups = [str(g).strip() for g in (cfg.get("groups") or []) if str(g).strip()]
