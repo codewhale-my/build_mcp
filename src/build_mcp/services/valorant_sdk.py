@@ -300,6 +300,12 @@ def extract_ssid(raw: str) -> str:
     return ""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止 urllib 自动跟随 3xx —— cookie 续期需要自己读 Location 头。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
 async def cookie_login(ssid: str) -> Dict[str, Any]:
     """用 ssid cookie 在后台换一个新的 access_token（不触发人机验证）。
 
@@ -317,39 +323,32 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         return {"error": f"这串只有 {len(ssid)} 个字符，太短了不像 ssid。"
                          "请确认复制的是 Cookies 里【名字叫 ssid】那一行的完整 Value"}
 
-    auth_url = "https://auth.riotgames.com/api/v1/authorization"
-    body = {
-        "client_id": "play-valorant-web-prod",
-        "nonce": "1",
-        "redirect_uri": "https://playvalorant.com/opt_in",
-        "response_type": "token id_token",
-        "scope": "account openid",
-    }
+    # Cookie 续期走 /authorize（同 SkinPeek redeemCookies）：GET + ssid cookie → 303，
+    # Location 带 #access_token=... 为成功；Location 以 /login 开头 = ssid 无效。
+    # ⚠️ 不要用 PUT /api/v1/authorization —— 那是密码登录入口，会无视 ssid 另开会话，永远 type=auth。
+    auth_url = ("https://auth.riotgames.com/authorize?redirect_uri="
+                "https%3A%2F%2Fplayvalorant.com%2Fopt_in&client_id=play-valorant-web-prod"
+                "&response_type=token%20id_token&scope=account%20openid&nonce=1")
 
     def _sync():
-        import http.cookiejar
-        cj = http.cookiejar.CookieJar()
-        cj.set_cookie(http.cookiejar.Cookie(
-            0, "ssid", ssid, None, False, ".riotgames.com", False, False,
-            "/", True, False, None, True, None, None, {}))
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(cj),
-            urllib.request.ProxyHandler(dict(_PROXY)))
-        req = urllib.request.Request(auth_url, data=json.dumps(body).encode(),
-                                     headers={**_UA, "Content-Type": "application/json"})
         last = ""
         for attempt in (1, 2):
+            req = urllib.request.Request(auth_url, headers={**_UA, "Cookie": f"ssid={ssid}"})
+            opener = urllib.request.build_opener(
+                _NoRedirect(), urllib.request.ProxyHandler(dict(_PROXY)))
             try:
                 resp = opener.open(req, timeout=15)
-                return json.loads(resp.read().decode("utf-8", "replace"))
+                loc = resp.geturl()                       # 200 直落 = 没带上会话
+                return {"type": "page", "url": loc}
             except urllib.error.HTTPError as e:
-                try:
-                    return json.loads(e.read().decode("utf-8", "replace"))
-                except Exception:                 # noqa: BLE001
-                    return {"type": "http", "status": e.code}
-            except Exception as e:                # noqa: BLE001
+                loc = e.headers.get("Location", "") if e.headers else ""
+                if e.code in (301, 302, 303, 307, 308):
+                    return {"type": "redirect", "location": loc,
+                            "set_cookie": (e.headers.get("Set-Cookie") or "") if e.headers else ""}
+                return {"type": "http", "status": e.code}
+            except Exception as e:                        # noqa: BLE001
                 last = f"{type(e).__name__}: {e}"
-                if attempt == 1:                  # 网络/代理抖动 → 自愈重试一次
+                if attempt == 1:                          # 网络/代理抖动 → 自愈重试一次
                     _proxy_reset()
                     time.sleep(1.0)
         return {"type": "net_error", "detail": last}
@@ -359,18 +358,24 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
     except Exception as e:                        # noqa: BLE001
         return {"error": f"续期失败（网络异常）：{e}"}
 
-    if j.get("type") == "response":
-        uri = ((j.get("response") or {}).get("parameters") or {}).get("uri", "")
-        tok = parse_access_token(uri)
-        return {"access_token": tok} if tok else {"error": "Riot 返回里没有令牌，请重新登录一次"}
-    if j.get("type") == "multifactor":
-        return {"error": "该账号开了二次验证，需要重新登录一次"}
+    if j.get("type") == "redirect":
+        loc = j.get("location") or ""
+        if loc.startswith("/login"):
+            return {"error": "这个 ssid 已经失效（Riot 要它重新登录）：可能改过密码或太久没用，"
+                             "请在群里让机器人再发一条绑定链接"}
+        tok = parse_access_token(loc)
+        if tok:
+            out = {"access_token": tok}
+            m = re.search(r"[; ]ssid=([^;\\s]+)", j.get("set_cookie") or "")
+            if m:                                     # Riot 轮换了 ssid → 一并回传让调用方更新
+                out["new_ssid"] = m.group(1)
+            return out
+        return {"error": "Riot 返回的重定向里没有令牌，请重新登录一次"}
     if j.get("type") == "net_error":
         return {"error": f"连不上 Riot（网络/代理异常）：{str(j.get('detail'))[:100]}"}
-    if j.get("error") == "invalid_session_id":
-        return {"error": "Riot 说这个 ssid 无效（invalid_session_id）：要么贴的不是【名字叫 ssid】"
-                         "那一行的 Value（注意别拿成 tdid），要么登录态已失效需要重新登录一次"}
-    return {"error": "登录状态已失效，请在群里让机器人再发一条绑定链接"}   # type=auth
+    if j.get("type") == "http" and j.get("status") == 403:
+        return {"error": "Riot 拒绝了请求（403，可能是 Cloudflare/风控），稍后再试一次"}
+    return {"error": "登录状态已失效，请在群里让机器人再发一条绑定链接"}
 
 
 async def account_info(access_token: str) -> Dict[str, Any]:
