@@ -771,8 +771,17 @@ RESTART_RULE = (
     "重启命令永远是最后一步。绝不允许先重启后答复，也不允许用「重启后我会汇报」来搪塞。"
 )
 
-OWNER_ACK = "🤖 收到，主人。"
-GUEST_ACK = "🤖 等着。"
+# 主人要求：不要「收到/等着」这类过渡话术 —— 有结果直接给结果。
+# 常量留空串即代表不发回执（core 里 ack_text 为空就跳过发送），逻辑无需改动。
+OWNER_ACK = ""
+GUEST_ACK = ""
+
+# 输出纪律：所有身份（主人/访客/插话）都追加这一条，压掉客套式过渡语。
+NO_FILLER = (
+    "\n\n[输出纪律] 禁止回「收到」「好的」「稍等」「马上来」「正在查询」「已排队」"
+    "这类过渡话术，也不要复述对方的指令或问句；有结果就直接给结果，"
+    "没结果就说没结果，不要用一句过渡语占一条消息。"
+)
 
 
 def qq_owner_ids() -> set:
@@ -941,7 +950,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             _m = str(qq_allmsg_cfg().get("model") or "").strip()
             if _m:
                 model = _m
-        ident = perm + tone
+        ident = perm + tone + NO_FILLER
         if not host:
             logger.warning("⚠️ IM 消息无法路由：sender=%s（主人=%s）", sender or "(无)", is_owner)
             raise RuntimeError("IM 宿主账号不可用（主人需管理员账号已注册 / 访客账号创建失败）")
@@ -980,18 +989,12 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             return ""
 
     def _ack_for(msg):                       # noqa: ANN001
-        """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。
+        """一律不发即时回执（主人要求：有结果直接给结果，不要说"收到/等着"）。
 
-        群消息·全量模式下默认【不发回执】：那是我方主动插话，不是有人点名提问，
-        回一句"收到"既多余又白占一条回复额度（QQ 一条入站消息最多回 5 条）。
+        即时回执还会白占一条回复额度（QQ 一条入站消息最多回 5 条），
+        对长任务来说那句"稍等"反而把最终答复的额度挤掉。这里恒返回空串 = 不发。
         """
-        try:
-            if getattr(msg, "event", "") == "GROUP_MESSAGE_CREATE":
-                if not qq_allmsg_cfg().get("ack"):
-                    return ""
-            return OWNER_ACK if (msg.user_id and msg.user_id in qq_owner_ids()) else GUEST_ACK
-        except Exception:                    # noqa: BLE001
-            return GUEST_ACK
+        return ""
 
     # ── 群消息·全量模式的闸门 ──────────────────────────────────────────────
     # 群里每一条消息都会走到这里，所以全程只有本地判断（O(1)），绝不在这里调模型。
@@ -1022,6 +1025,14 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             if not _cleaned:
                 return None                      # 纯 @ 无内容，没得回答
             msg.event = "GROUP_AT_MESSAGE_CREATE"
+            # 带上群上文 —— 否则被 @ 时它不知道你们刚在聊什么，答非所问。
+            n = int(cfg.get("at_context_lines") or cfg.get("context_lines") or 6)
+            if n > 0 and len(buf) > 1:
+                head = "[群里最近的对话]\n" + "\n".join(buf[:-1][-n:]) + "\n[最新一条] "
+                logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理（附上文 %d 行）",
+                            min(n, len(buf) - 1))
+                return (head + f"{who}：{_cleaned}\n\n"
+                        "（上面是群里的上文，最新那条 @ 了你，直接回答它。）")
             logger.info("🎯 [qq/group-all] 检测到 @（全量通道），按普通 AT 必回处理")
             return _cleaned
         if mode != "reply":
@@ -1061,7 +1072,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     hub = ChannelHub(transport, _start_run, _im_fetch_run,
                      SessionMap(alloc_base=100000), model=_im_model,
                      progress="off", max_progress=0, max_replies=4,
-                     ack="🤖 收到，正在处理，稍等…", ack_fn=_ack_for,
+                     ack="", ack_fn=_ack_for,
                      prepare_fn=_prepare)
 
     _seen: dict = {}

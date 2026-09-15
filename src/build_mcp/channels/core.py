@@ -263,10 +263,9 @@ class ChannelHub:
                 return
             msg.prepared = str(prepared).strip()
         if self._chat_tasks.get(msg.chat_id) is not None and not self._chat_tasks[msg.chat_id].done():
-            # 排队告知只给「用户点名要回」的消息（@ / 单聊）；插话是我们主动开口，
-            # 悄悄排着就行，回一句"已排队"既吵又白占回复额度。
-            if getattr(msg, "event", "") != "GROUP_MESSAGE_CREATE":
-                asyncio.get_running_loop().create_task(self._busy_notice(msg))
+            # 忙线不再回任何提示（主人要求：不要"收到/等着/已排队"这类过渡话术）。
+            # 消息照旧进队列，轮到时直接给结果 —— 少一句废话就少占一条回复额度。
+            pass
         q = self._chat_queues.setdefault(msg.chat_id, asyncio.Queue())
         q.put_nowait(msg)
         t = self._chat_tasks.get(msg.chat_id)
@@ -275,15 +274,12 @@ class ChannelHub:
                 self._worker(msg.chat_id))
 
     async def _busy_notice(self, msg: Inbound) -> None:
-        """忙线告知：尽量发，发不出去（窗口过期等）就算了。"""
-        try:
-            await self.transport.send(Outbound(
-                chat_id=msg.chat_id, chat_type=msg.chat_type,
-                text="⏳ 上一条还在处理中，你这条已排队，马上来…",
-                reply_to=msg.msg_id,
-                mention=msg.user_id if msg.chat_type == "group" else ""))
-        except Exception:                      # noqa: BLE001
-            pass
+        """已废弃：忙线不再发任何提示（主人要求去掉"已排队"这类过渡话术）。
+
+        保留空实现是为了兼容旧调用点/自测；如需恢复"排队告知"，把
+        BUSY_NOTICE_TEXT 改成想要的文案并在此发送即可。
+        """
+        return None
 
     async def _worker(self, chat_id: str) -> None:
         """单会话串行消费者：逐条跑 handle，队列空了自动收摊。"""
