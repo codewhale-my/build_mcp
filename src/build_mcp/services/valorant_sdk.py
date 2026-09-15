@@ -277,6 +277,8 @@ def parse_access_token(raw: str) -> str:
 
 
 _SSID_RE = re.compile(r"ssid\s*[=:]\s*[\"']?([^;'\"\s\\]+)")
+# Riot 登录后的整包 cookie（白名单，避免从 cURL 的 URL 参数里捞到垃圾）
+_RIOT_COOKIE_NAMES = ("ssid", "tdid", "csid", "asid", "ccid", "clid", "__cf_bm", "did", "pvp.net")
 
 
 def extract_ssid(raw: str) -> str:
@@ -300,6 +302,31 @@ def extract_ssid(raw: str) -> str:
     return ""
 
 
+def extract_riot_cookie(raw: str) -> str:
+    """从粘贴内容提取发给 Riot 的 Cookie 头。
+
+    实测只发 ssid 一个 cookie 会被 303 到登录页；SkinPeek 是把登录收到的
+    **整包 cookie**（ssid/csid/asid/tdid/__cf_bm…）一起发。这里从用户粘贴的
+    Cookie 串 / Copy as cURL 文本里把白名单内的 name=value 都捞出来拼成
+    `k=v; k2=v2`；只有裸 ssid 值时也兜底成 `ssid=...`。取不到 ssid 返回 ""。
+    """
+    s = raw or ""
+    ssid = extract_ssid(s)
+    if not ssid:
+        return ""
+    pairs = [f"ssid={ssid}"]
+    for name in _RIOT_COOKIE_NAMES:
+        if name == "ssid":
+            continue
+        m = re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) +
+                      r"\s*[=:]\s*[\"']?([^;'\"\s\\]+)", s)
+        if m:
+            v = urllib.parse.unquote(m.group(1)).strip()
+            if v and v != ssid:
+                pairs.append(f"{name}={v}")
+    return "; ".join(pairs)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """禁止 urllib 自动跟随 3xx —— cookie 续期需要自己读 Location 头。"""
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
@@ -307,20 +334,28 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 async def cookie_login(ssid: str) -> Dict[str, Any]:
-    """用 ssid cookie 在后台换一个新的 access_token（不触发人机验证）。
+    """用登录 cookie 在后台换一个新的 access_token（不触发人机验证）。
 
-    access_token 只有 1 小时，ssid 是长期 cookie —— 有它就能"登录一次、以后一直查"。
+    参数可以是裸 ssid 值，也可以是 extract_riot_cookie 拼好的整包 Cookie 头
+    （实测只发 ssid 一个会被 303 到登录页，整包更稳）。access_token 只有 1 小时，
+    ssid 是长期 cookie —— 有它就能"登录一次、以后一直查"。
     ssid 失效（改密码/长时间不用/被踢）时返回 error，需要用户重新登录一次。
     """
-    ssid = (ssid or "").strip().strip('"').strip("'")
-    if not ssid:
+    cookie_hdr = (ssid or "").strip().strip('"').strip("'")
+    if not cookie_hdr:
         return {"error": "没识别到 ssid，请重新复制"}
-    # 常见误贴：tdid（设备标识 JWT，以 eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 开头、两百多字符）
-    if ssid.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"):
+    pure = extract_ssid(cookie_hdr)                # 里面真正的 ssid 值（做防呆用）
+    if not pure:
+        return {"error": "没识别到 ssid，请重新复制"}
+    if "ssid=" not in cookie_hdr:
+        cookie_hdr = f"ssid={cookie_hdr}"
+    # 常见误贴：tdid（设备标识，JWT 头带 typ，形如 eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…）。
+    # 真 ssid 的头是短版 eyJhbGciOiJIUzI1NiJ9.（没有 IsInR5cCI6…），两者开头只差一点点。
+    if pure.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"):
         return {"error": "你贴的这串是 tdid（设备标识），不是 ssid。请在 Cookies 列表里找"
                          "名字叫【ssid】的那一行，复制它的 Value（一般 100 字符以上）"}
-    if len(ssid) < 32:
-        return {"error": f"这串只有 {len(ssid)} 个字符，太短了不像 ssid。"
+    if len(pure) < 32:
+        return {"error": f"这串只有 {len(pure)} 个字符，太短了不像 ssid。"
                          "请确认复制的是 Cookies 里【名字叫 ssid】那一行的完整 Value"}
 
     # Cookie 续期走 /authorize（同 SkinPeek redeemCookies）：GET + ssid cookie → 303，
@@ -333,7 +368,7 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
     def _sync():
         last = ""
         for attempt in (1, 2):
-            req = urllib.request.Request(auth_url, headers={**_UA, "Cookie": f"ssid={ssid}"})
+            req = urllib.request.Request(auth_url, headers={**_UA, "Cookie": cookie_hdr})
             opener = urllib.request.build_opener(
                 _NoRedirect(), urllib.request.ProxyHandler(dict(_PROXY)))
             try:
@@ -362,8 +397,8 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         loc = j.get("location") or ""
         # 失效时 Riot 303 到 https://authenticate.riotgames.com/login?...（实测）
         if loc.startswith("/login") or "riotgames.com/login" in loc:
-            logger.warning("🔐 ssid 被 Riot 拒绝：长度=%d 开头=%s…（完整 ssid 通常 150~500 字符，"
-                           "过短=复制不全）", len(ssid), ssid[:8])
+            logger.warning("🔐 ssid 被 Riot 拒绝：cookie包=%d字符 ssid值=%d字符 开头=%s…（完整 ssid 通常 200+ 字符，"
+                           "过短=复制不全）", len(cookie_hdr), len(pure), pure[:8])
             return {"error": "Riot 没认出这个 ssid：常见原因是【复制不完整】（要整条 Value，"
                              "通常几百字符，首尾都不能少），其次是它真失效了。请重新完整复制再贴一次；"
                              "还不行就在本页用「③ 登录地址绑定」重新登录一次拳头账号即可，不用回群里要链接"}

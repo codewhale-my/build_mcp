@@ -70,13 +70,13 @@ details .tip{margin-top:8px}
         <b>电脑上（推荐，一次性）：</b><br>
         1. 浏览器按 <kbd>F12</kbd> 打开开发者工具；<br>
         2. 切到 <b>Application / 应用</b> → 左侧 <b>Cookies</b> → 点 <kbd>https://auth.riotgames.com</kbd>；<br>
-        3. 在列表里看 <b>「Name / 名称」这一列</b>，找到写 <kbd>ssid</kbd> 的那一行，复制这一行的 <b>Value</b>。<br>
-        <b>⚠️ 别拿错行！</b>列表里有好几个长得像的（<code>tdid</code>、<code>csid</code>…），<b>名字列必须是 ssid</b>。
-        自查方法：ssid 的 Value 以 <code>eyJhbGciOi<b>J</b>SUzI1NiIs</code> 开头（注意 J 后面是 <b>S</b>）；
-        以 <code>eyJhbGciOi<b>I</b>UzI1NiIs</code> 开头的是 <code>tdid</code>，贴了没用。<br>
+        3. 在列表里看 <b>「Name / 名称」这一列</b>，找到写 <kbd>ssid</kbd> 的那一行，复制这一行的 <b>Value</b>（约 230 字符）。<br>
+        <b>⚠️ 注意：</b>列表里 <code>ssid</code> 和 <code>tdid</code> 开头几乎一样（都是 <code>eyJhbGciOiJIUzI1Ni…</code>），
+        <b>必须认「Name 列」</b>，别按开头猜。<br>
         <br>
-        <b>更省事的替代（推荐）：</b>在开发者工具 <b>Network / 网络</b> 里随便点一条 <kbd>auth.riotgames.com</kbd> 的请求 →
-        右键 → <b>Copy → Copy as cURL</b>，把整段文本直接粘到下面（本页会自动从里面提取 ssid，不会拿错）。<br>
+        <b>★ 最稳的方式（强推）：Copy as cURL</b> —— 在开发者工具 <b>Network / 网络</b> 里随便点一条 <kbd>auth.riotgames.com</kbd> 的请求 →
+        右键 → <b>Copy → Copy as cURL (bash)</b>，把整段文本直接粘到下面。这样会把登录后的<b>整包 Cookie</b> 一起交给后台，
+        比 单贴 ssid 成功率高得多（实测只发 ssid 可能被 Riot 拒）。<br>
         <br>
         <b>只有手机？</b>手机浏览器读不到 ssid，只能用下面「③ 备选」的地址方式（每次要重登）。想长期免登录，借台电脑操作一次即可。
       </div>

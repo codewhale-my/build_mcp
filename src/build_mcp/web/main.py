@@ -2106,13 +2106,16 @@ async def riot_pub_bind(req: RiotPubBindRequest):
         raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
     token = valorant_sdk.parse_access_token(req.raw)
     region = (req.region or "ap").strip().lower()
-    ssid = valorant_sdk.extract_ssid(req.ssid) if (req.ssid or "").strip() else ""
+    cookie_hdr = valorant_sdk.extract_riot_cookie(req.ssid) if (req.ssid or "").strip() else ""
     try:
-        if ssid:                                  # 长期免登录：先用 ssid 换一张新令牌
-            got = await valorant_sdk.cookie_login(ssid)
+        if cookie_hdr:                            # 长期免登录：先用登录 cookie 换一张新令牌
+            got = await valorant_sdk.cookie_login(cookie_hdr)
             if got.get("error"):
                 raise HTTPException(status_code=400, detail=got["error"])
             token = got.get("access_token") or ""
+            # Riot 可能轮换了 ssid —— 把整包新 cookie 回写，保持长期有效
+            if got.get("new_ssid"):
+                cookie_hdr = valorant_sdk.extract_riot_cookie("ssid=" + got["new_ssid"])
         if not token:
             raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
                                                        "或把浏览器地址栏里 "
@@ -2122,17 +2125,17 @@ async def riot_pub_bind(req: RiotPubBindRequest):
             raise HTTPException(status_code=400, detail=info["error"])
         save_riot_binding(uid, region, token, info.get("puuid", ""),
                           info.get("game_name", ""), info.get("tag_line", ""),
-                          ssid=(ssid or None))
+                          ssid=(cookie_hdr or None))
         player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
         logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s，%s）", uid, player or "(未知)", region,
-                    "长期免登录" if ssid else "仅 1 小时令牌")
+                    "长期免登录" if cookie_hdr else "仅 1 小时令牌")
         store = await valorant_sdk.bound_daily_store(region, uid=uid)
     except HTTPException:
         raise
     except Exception as e:                    # noqa: BLE001  网络类异常也给人话
         logger.warning("⚠️ [IM] 绑定失败 uid=%s：%s", uid, str(e)[:200])
         raise HTTPException(status_code=400, detail=f"绑定失败：{str(e)[:160]}")
-    return {"ok": True, "player": player, "region": region, "persistent": bool(ssid), "store": store}
+    return {"ok": True, "player": player, "region": region, "persistent": bool(cookie_hdr), "store": store}
 
 
 @app.post("/api/riot/pub/store")
@@ -2186,12 +2189,14 @@ async def riot_bind(req: RiotBindRequest, user: dict = Depends(require_user)):
     from build_mcp.services import valorant_sdk
     token = valorant_sdk.parse_access_token(req.raw)
     region = (req.region or "ap").strip().lower()
-    ssid = valorant_sdk.extract_ssid(req.ssid) if (req.ssid or "").strip() else ""
-    if ssid:
-        got = await valorant_sdk.cookie_login(ssid)
+    cookie_hdr = valorant_sdk.extract_riot_cookie(req.ssid) if (req.ssid or "").strip() else ""
+    if cookie_hdr:
+        got = await valorant_sdk.cookie_login(cookie_hdr)
         if got.get("error"):
             raise HTTPException(status_code=400, detail=got["error"])
         token = got.get("access_token") or ""
+        if got.get("new_ssid"):
+            cookie_hdr = valorant_sdk.extract_riot_cookie("ssid=" + got["new_ssid"])
     if not token:
         raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
                                                    "或把浏览器地址栏里 "
@@ -2201,13 +2206,13 @@ async def riot_bind(req: RiotBindRequest, user: dict = Depends(require_user)):
         raise HTTPException(status_code=400, detail=info["error"])
     save_riot_binding(user["id"], region, token, info.get("puuid", ""),
                       info.get("game_name", ""), info.get("tag_line", ""),
-                      ssid=(ssid or None))
+                      ssid=(cookie_hdr or None))
     player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
     logger.info("🎮 用户[%s] 绑定 Riot 账号 %s（%s，%s）", user["username"], player or "(未知)", region,
-                "长期免登录" if ssid else "仅 1 小时令牌")
+                "长期免登录" if cookie_hdr else "仅 1 小时令牌")
     store = await valorant_sdk.bound_daily_store(region, uid=user["id"])
     return {"ok": True, "player": player, "region": region,
-            "persistent": bool(ssid), "store": store}
+            "persistent": bool(cookie_hdr), "store": store}
 
 
 @app.post("/api/riot/store")
