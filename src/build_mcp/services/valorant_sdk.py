@@ -360,7 +360,8 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
 
     if j.get("type") == "redirect":
         loc = j.get("location") or ""
-        if loc.startswith("/login"):
+        # 失效时 Riot 303 到 https://authenticate.riotgames.com/login?...（实测）
+        if loc.startswith("/login") or "riotgames.com/login" in loc:
             return {"error": "这个 ssid 已经失效（Riot 要它重新登录）：可能改过密码或太久没用，"
                              "请在群里让机器人再发一条绑定链接"}
         tok = parse_access_token(loc)
