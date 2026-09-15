@@ -196,12 +196,21 @@ async def test_qq_transport_token_and_send():
 
     assert str(calls[1].url) == f"{API_BASE}/v2/groups/G1/messages"
     assert calls[1].headers["authorization"] == "QQBot tok123"
-    assert json.loads(calls[1].content) == {"content": "你好", "msg_type": 0, "msg_id": "M1"}
+    # 被动回复必须带 msg_seq（同一条入站消息第 1 条回复 = 1）；
+    # 少了它腾讯按「重复消息」拒收：400 code=40054005（2026-09-14 线上实锤）。
+    assert json.loads(calls[1].content) == {
+        "content": "你好", "msg_type": 0, "msg_id": "M1", "msg_seq": 1}
 
-    # 第二次发送必须复用 token（不再打 bots.qq.com）
+    # 第二次发送必须复用 token（不再打 bots.qq.com），且 msg_seq 递增为 2
     await tr.send(Outbound(chat_id="G1", chat_type="group", text="再来", reply_to="M1"))
     assert sum(1 for r in calls if r.url.host == "bots.qq.com") == 1
     assert str(calls[2].url) == f"{API_BASE}/v2/groups/G1/messages"
+    assert json.loads(calls[2].content) == {
+        "content": "再来", "msg_type": 0, "msg_id": "M1", "msg_seq": 2}
+
+    # 换一条入站消息：msg_seq 从 1 重新开始（锚点是 msg_id）
+    await tr.send(Outbound(chat_id="G1", chat_type="group", text="另一条", reply_to="M2"))
+    assert json.loads(calls[3].content)["msg_seq"] == 1
     await tr.aclose()
 
 

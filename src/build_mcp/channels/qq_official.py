@@ -132,6 +132,10 @@ class QQTransport:
 
 # ── 网关长连接 ──────────────────────────────────────────────────────────────
 
+class Reconnect(RuntimeError):
+    """服务端要求重连（op=7 被顶号 / op=9 Invalid Session）：应尽快重连，不走长退避。"""
+
+
 class QQGateway:
     """维护与 QQ 网关的 WS 长连接，把事件交给 on_inbound。"""
 
@@ -160,6 +164,12 @@ class QQGateway:
                 backoff = 1                      # 正常结束也重置
             except asyncio.CancelledError:
                 raise
+            except Reconnect as e:
+                # 被顶号 / Invalid Session：属于「服务端让我重连」，应当尽快回来，
+                # 不能沿用指数退避（否则一次抖动就退到 60s，消息尽数落在断窗里丢掉）。
+                logger.warning("QQ 网关需重连：%s；2s 后重连", e)
+                await asyncio.sleep(2)
+                backoff = 1
             except Exception as e:               # noqa: BLE001 —— 网关必须永不退出
                 logger.warning("QQ 网关断开：%s；%ds 后重连", e, backoff)
                 await asyncio.sleep(backoff)
@@ -213,11 +223,11 @@ class QQGateway:
             if ib:
                 await self.on_inbound(ib)
         elif op == 7:
-            raise RuntimeError("服务端要求重连(op=7)")
+            raise Reconnect("服务端要求重连(op=7)——通常是同 AppID 的另一条连接顶号")
         elif op == 9:
             self._session_id = ""
             self._seq = 0
-            raise RuntimeError("Invalid Session(op=9)，将重新 Identify")
+            raise Reconnect("Invalid Session(op=9)，将重新 Identify")
 
     async def aclose(self) -> None:
         await self.transport.aclose()

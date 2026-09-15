@@ -733,21 +733,24 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         logger.warning("QQ 桥接模块不可用：%s", e)
         return None
 
+    # 凭据来源：进程环境变量优先，其次 /home/admin/.secrets/qq_bot.env（键名同名）。
+    # 注意 QQ_SANDBOX / QQ_DUAL 也要能从文件读到——否则改了文件不生效、只能去动 systemd。
+    _sec = Path("/home/admin/.secrets/qq_bot.env")
+    if _sec.exists():
+        try:
+            for ln in _sec.read_text(encoding="utf-8").splitlines():
+                ln = ln.strip()
+                if not ln or ln.startswith("#") or "=" not in ln:
+                    continue
+                k, v = (s.strip() for s in ln.split("=", 1))
+                if k in ("QQ_APPID", "QQ_SECRET", "QQ_SANDBOX", "QQ_DUAL") and not os.environ.get(k):
+                    os.environ[k] = v
+        except Exception:
+            logger.warning("读取 %s 失败，仅使用进程环境变量", _sec)
+
     appid = os.environ.get("QQ_APPID", "").strip()
     secret = os.environ.get("QQ_SECRET", "").strip()
-    sandbox = os.environ.get("QQ_SANDBOX", "1").strip().lower() in ("1", "true", "yes")
-    if not appid or not secret:
-        try:
-            for ln in Path("/home/admin/.secrets/qq_bot.env").read_text(encoding="utf-8").splitlines():
-                ln = ln.strip()
-                if ln.startswith("QQ_APPID="):
-                    appid = ln.split("=", 1)[1].strip()
-                elif ln.startswith("QQ_SECRET="):
-                    secret = ln.split("=", 1)[1].strip()
-                elif ln.startswith("QQ_SANDBOX="):
-                    sandbox = ln.split("=", 1)[1].strip().lower() in ("1", "true", "yes")
-        except Exception:
-            pass
+    sandbox = os.environ.get("QQ_SANDBOX", "0").strip().lower() in ("1", "true", "yes")
     if not appid or not secret:
         logger.info("ℹ️ 未配置 QQ 机器人凭据，跳过 IM 桥接")
         return None
@@ -793,7 +796,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     async def _run_env(is_sbx: bool, label: str) -> None:
         c = QQConfig(appid, secret, is_sbx)
         gw = QQGateway(c, _handle, QQTransport(c))
-        logger.info("🤖 QQ 桥接连接【%s】appid=%s", label, appid)
+        logger.info("🤖 QQ 桥接连接【%s】appid=%s base=%s", label, appid, c.api_base)
         try:
             await gw.run_forever()
         except asyncio.CancelledError:
@@ -801,12 +804,17 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         finally:
             await gw.aclose()
 
-    # 双连接：正式 + 沙箱。实测两者是**互不干扰的两套会话空间**，
-    # 而且事件分落两边（群 @ 落正式、单聊落沙箱），只连一个必然漏事件。
-    # 出站统一走正式通道（群消息只在正式环境发得出去）。
-    envs = [(False, "正式"), (True, "沙箱")]
-    if os.environ.get("QQ_DUAL", "1").strip().lower() in ("0", "false", "no"):
-        envs = [(sandbox, "沙箱" if sandbox else "正式")]
+    # ⚠️ 默认单连接：同一 AppID 在同一 shard 上只允许一条 WS 长连接。
+    # 2026-09-15 实测（线上日志为证）：同时连「正式 + 沙箱」会互相顶号 ——
+    # 日志被「网关断开：服务端要求重连(op=7)」周期性刷屏（一天 38 次，正式/沙箱交替），
+    # 两条连接轮流被踢，事件落在断窗里被平台丢弃，入站消息 0 条。
+    # 目标环境由 QQ_SANDBOX 决定（服务器凭据文件里是 0 = 正式网关）；
+    # 出站同样走该环境（api_base 跟着 sandbox 走）。
+    # 只有显式 QQ_DUAL=1 才开双连接（历史遗留实验，仅排障用，不推荐）。
+    envs = [(sandbox, "沙箱" if sandbox else "正式")]
+    if os.environ.get("QQ_DUAL", "0").strip().lower() in ("1", "true", "yes"):
+        logger.warning("⚠️ QQ_DUAL=1：将同时连正式与沙箱两条网关，同一 AppID 会互相顶号，仅供排障")
+        envs = [(False, "正式"), (True, "沙箱")]
 
     async def _run() -> None:
         await asyncio.gather(*[_run_env(s, l) for s, l in envs])
