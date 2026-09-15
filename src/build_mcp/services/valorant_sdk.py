@@ -336,15 +336,20 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
     }
 
 
-async def bound_daily_store(region: str = "") -> Dict[str, Any]:
-    """用网页端绑定的账号查每日商店（IM 机器人走这条：主人绑一次，群里就能查）。"""
+async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]:
+    """用已绑定的账号查每日商店。
+
+    uid 指定时查那个用户自己的绑定（群里每个人各绑各的）；
+    不指定则回退到最近一次绑定（兼容老调用）。
+    """
     try:
         from build_mcp.web import store as _webstore
-        row = _webstore.latest_riot_binding()
+        row = (_webstore.get_riot_binding(int(uid)) if uid else None) \
+            or _webstore.latest_riot_binding()
     except Exception as e:                                    # noqa: BLE001
         return {"error": f"读取绑定信息失败：{e}"}
     if not row or not row.get("access_token"):
-        return {"error": "还没有绑定 Riot 账号。请先在网页端右上角「🎮」里登录绑定一次"
-                         "（服务器直连会被 Riot 的人机验证拦下，必须在浏览器里登录）"}
+        return {"error": "还没绑定 Riot 账号：请打开绑定链接登录一次"
+                         "（Riot 对服务器 IP 强制人机验证，只能在浏览器里登录）"}
     return await store_with_token(row["access_token"],
                                   (region or row.get("region") or "ap").lower())

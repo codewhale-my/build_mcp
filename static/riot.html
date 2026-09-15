@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1117">
+<title>绑定拳头账号 · 瓦洛兰特每日商店</title>
+<style>
+:root{
+  --bg:#f6f7fb; --card:#fff; --text:#1b1f2a; --text2:#5a6273; --text3:#8b93a5;
+  --border:#e4e7ef; --accent:#4f7cff; --err:#d93a3a; --ok:#1a9e6a;
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#0f1117; --card:#161a25; --text:#eef1f8; --text2:#b3bacb; --text3:#8b93a5;
+         --border:#252b3a; --accent:#6f92ff; --err:#ff6b6b; --ok:#4ad39a; }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:18px 14px 40px;background:var(--bg);color:var(--text);
+  font:15px/1.7 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;}
+.wrap{max-width:560px;margin:0 auto}
+h1{font-size:19px;margin:6px 0 14px;display:flex;align-items:center;gap:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px}
+.step{color:var(--text2);font-size:13.5px;margin:0 0 10px}
+.step b{color:var(--text)}
+button{font:inherit;border-radius:10px;border:1px solid var(--border);background:var(--card);
+  color:var(--text);padding:11px 14px;cursor:pointer;width:100%;margin-top:8px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button[disabled]{opacity:.55;cursor:default}
+select,textarea{width:100%;font:inherit;font-size:14px;padding:11px;border-radius:10px;
+  border:1px solid var(--border);background:var(--bg);color:var(--text);outline:none}
+select:focus,textarea:focus{border-color:var(--accent)}
+.row{display:flex;gap:10px;align-items:center}
+.row select{flex:0 0 42%}
+.tip{color:var(--text3);font-size:12.5px;line-height:1.7}
+.msg{margin-top:10px;font-size:13.5px;line-height:1.7}
+.msg.err{color:var(--err)}
+.msg.ok{color:var(--ok)}
+.acct{font-size:16px;font-weight:600;margin-bottom:4px}
+.item{display:flex;justify-content:space-between;gap:10px;padding:9px 11px;border-radius:10px;
+  background:var(--bg);border:1px solid var(--border);margin-top:6px;font-size:14px}
+.item .p{color:var(--accent);flex:none;font-variant-numeric:tabular-nums}
+.hide{display:none}
+.foot{color:var(--text3);font-size:12px;text-align:center;margin-top:18px;line-height:1.8}
+kbd{background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:1px 5px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎮 绑定拳头账号</h1>
+
+  <div class="card" id="bindCard">
+    <p class="step">Riot 对服务器 IP 强制人机验证，所以后台不能直接登录。<b>你在自己手机上登录一次</b>，之后机器人就能直接帮你查每日商店了。</p>
+    <p class="step"><b>①</b> 点下面按钮打开 Riot 官方登录页（手机需要能访问 Riot，通常要开代理），登录你的拳头账号。</p>
+    <button class="primary" id="openBtn">① 打开 Riot 登录页</button>
+    <p class="step" style="margin-top:14px"><b>②</b> 登录成功后地址栏会停在 <kbd>playvalorant.com/opt_in#access_token=…</kbd>，
+      把<b>整条地址</b>复制，粘贴到下面，点「绑定」。</p>
+    <textarea id="raw" rows="3" placeholder="粘贴 https://playvalorant.com/opt_in#access_token=... 整条地址"></textarea>
+    <div class="row" style="margin-top:10px">
+      <select id="region">
+        <option value="ap">亚太 AP</option>
+        <option value="na">北美 NA</option>
+        <option value="eu">欧服 EU</option>
+        <option value="kr">韩服 KR</option>
+        <option value="latam">拉美</option>
+        <option value="br">巴西</option>
+      </select>
+      <span class="tip">区服（国服不支持）</span>
+    </div>
+    <button class="primary" id="bindBtn">② 绑定</button>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card hide" id="doneCard">
+    <div class="acct" id="acct">已绑定</div>
+    <div class="tip" id="meta"></div>
+    <button class="primary" id="queryBtn">查一次我的每日商店</button>
+    <button id="againBtn">换账号 / 重新绑定</button>
+    <div class="msg" id="msg2"></div>
+    <div id="items"></div>
+  </div>
+
+  <div class="foot">
+    链接 30 分钟内有效，只能绑到你自己的账号名下。<br>
+    登录令牌约 1 小时过期，过期后回到群里让它再发一条链接即可。
+  </div>
+</div>
+
+<script>
+var T=(location.search.match(/[?&]t=([^&]+)/)||[])[1]||'';
+var $=function(id){return document.getElementById(id)};
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function say(el,txt,cls){var e=$(el);e.className='msg '+(cls||'');e.innerHTML=txt||''}
+function left(sec){sec=Number(sec||0);if(!sec)return '—';
+  var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60);return (h?h+' 小时 ':'')+m+' 分'}
+function api(path,opt){
+  opt=opt||{};
+  return fetch(path,opt).then(function(r){
+    return r.json().catch(function(){return {}}).then(function(d){
+      if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+      return d;
+    });
+  });
+}
+function loginUrl(u){ if(u) window.open(u,'_blank'); }
+function renderStore(d){
+  if(!d) return '';
+  if(d.need_rebind) return '<div class="msg err">⚠️ '+esc(d.error||'登录已过期')+'</div>';
+  if(d.error) return '<div class="msg err">⚠️ '+esc(d.error)+'</div>';
+  var h='<div class="tip" style="margin-top:10px">'+esc(d.player||'')+' · '+esc(String(d.region||'').toUpperCase())+
+        ' · 刷新倒计时 '+esc(left(d.refresh_in_seconds))+'</div>';
+  (d.items||[]).forEach(function(it){
+    h+='<div class="item"><span>'+esc(it.name)+'</span><span class="p">'+(it.price_vp==null?'—':it.price_vp+' VP')+'</span></div>';
+  });
+  return h;
+}
+function showBound(st){
+  $('bindCard').className='card hide';
+  $('doneCard').className='card';
+  $('acct').textContent='🎮 '+(st.player||'已绑定');
+  $('meta').textContent='区服 '+String(st.region||'ap').toUpperCase()+' · 登录令牌约 1 小时有效';
+}
+var region='ap', loginUrlSaved='';
+api('/api/riot/pub?t='+encodeURIComponent(T)).then(function(st){
+  loginUrlSaved=st.login_url||'';
+  if(st.bound){ showBound(st); }
+  else { $('region').value=st.region||'ap'; }
+}).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); });
+
+$('openBtn').onclick=function(){ loginUrl(loginUrlSaved); };
+$('bindBtn').onclick=function(){
+  var raw=$('raw').value.trim();
+  if(!raw){ say('msg','请先粘贴登录后的整条地址','err'); return; }
+  var b=$('bindBtn'); b.disabled=true; say('msg','正在验证令牌并查询商店…');
+  region=$('region').value||'ap';
+  api('/api/riot/pub/bind',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({t:T,raw:raw,region:region})}).then(function(d){
+      showBound({player:d.player,region:d.region});
+      say('msg2','✅ 绑定成功','ok');
+      $('items').innerHTML=renderStore(d.store);
+    }).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); })
+    .then(function(){ b.disabled=false; });
+};
+$('queryBtn').onclick=function(){
+  var b=$('queryBtn'); b.disabled=true; say('msg2','查询中…');
+  api('/api/riot/pub/store?t='+encodeURIComponent(T),{method:'POST'}).then(function(d){
+      say('msg2','');
+      $('items').innerHTML=renderStore(d);
+    }).catch(function(e){ say('msg2','⚠️ '+esc(e.message),'err'); })
+    .then(function(){ b.disabled=false; });
+};
+$('againBtn').onclick=function(){
+  $('bindCard').className='card'; $('doneCard').className='card hide';
+};
+</script>
+</body>
+</html>

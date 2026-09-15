@@ -182,13 +182,21 @@ from build_mcp.services import valorant_sdk
 
 @mcp.tool(name="valorant_daily_store", description="查询瓦洛兰特（国际服）账号的每日商店：四件每日皮肤、VP 价格、刷新倒计时。默认用网页端已绑定的账号（主人账号）查询，不用填账号密码；填了才走密码登录（服务器 IP 会被人机验证拦下，通常失败）。region: ap/na/eu/kr/latam/br（国服不支持）。")
 async def valorant_daily_store(
-        username: Annotated[str, Field(description="Riot 账号用户名（留空 = 用网页端绑定的账号，推荐）")] = "",
+        username: Annotated[str, Field(description="Riot 账号用户名（留空 = 用已绑定的账号，推荐）")] = "",
         password: Annotated[str, Field(description="Riot 账号密码（留空即可）")] = "",
         region: Annotated[str, Field(description="服务器区域：ap(亚太)/na(北美)/eu(欧洲)/kr(韩国)/latam/br")] = "ap",
+        bind_key: Annotated[str, Field(description="绑定账号标识（系统会在对话里给出，形如 qq:12345；查「这个人」自己的商店时原样填上）")] = "",
 ) -> ApiResponse:
-  logger.info(f"valorant_daily_store bound={not username.strip()} region={region}")
+  logger.info(f"valorant_daily_store bind_key={bind_key} pwd_login={bool(username.strip())} region={region}")
   try:
-    if not username.strip():
+    if bind_key and not username.strip():
+        uid = None
+        try:
+            uid = int(str(bind_key).split(":")[-1])
+        except Exception:
+            uid = None
+        result = await valorant_sdk.bound_daily_store(region, uid=uid)
+    elif not username.strip():
         result = await valorant_sdk.bound_daily_store(region)
     else:
         result = await valorant_sdk.daily_store(username, password, region)

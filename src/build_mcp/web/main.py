@@ -63,6 +63,7 @@ from build_mcp.client.conversation import (
 from mcp.client.session import ClientSession
 from build_mcp.web import store
 from build_mcp.web.whatsnew import latest_version, payload_for
+from build_mcp.web import riot_token
 from build_mcp.web.store import (
     init_db,
     save_riot_binding,        # 瓦洛兰特：浏览器登录后回填令牌
@@ -947,8 +948,31 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         note = f"\n\n[消息来源] 这条消息来自 {source or 'IM'}。" if source else ""
         logger.info("👤 IM 身份判定 sender=%s → %s（host=%s）",
                     sender or "(无)", who, host["username"])
-        return await _spawn_run(host, query, model, extra_note=note + ident,
+        return await _spawn_run(host, query, model,
+                                extra_note=note + ident + _riot_note_for(host),
                                 hard_timeout=270)
+
+    def _riot_note_for(host: dict) -> str:
+        """把「这个人的拳头账号绑没绑」告诉模型：没绑就给链接，绑了就直接查。
+
+        Riot 对服务器 IP 强制人机验证，后台密码登录必失败（实测 46 个节点全覆盖），
+        所以只能在用户自己的浏览器里登录一次 —— 群里就靠这条一次性链接。
+        """
+        try:
+            b = get_riot_binding(host["id"]) or {}
+            key = f"qq:{host['id']}"
+            if b.get("access_token"):
+                who = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#") or "已绑定账号"
+                return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}）。"
+                        f"他问每日商店时直接调用 valorant_daily_store(bind_key=\"{key}\")，"
+                        "不要向他要账号密码，也不要说没有权限。")
+            url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
+            return ("\n\n[拳头账号] 该用户【还没绑定】Riot 账号。他问每日商店/皮肤时，"
+                    "把下面这条链接原样发给他（30 分钟内有效，用手机浏览器或 QQ 内置浏览器打开，"
+                    "登录一次即可；绑好后你就能直接查到他的商店）：\n" + url)
+        except Exception as e:               # noqa: BLE001  绑定信息拿不到不能影响对话
+            logger.warning("⚠️ 生成拳头绑定提示失败：%s", e)
+            return ""
 
     def _ack_for(msg):                       # noqa: ANN001
         """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。
@@ -2036,6 +2060,70 @@ async def _im_fetch_run(run_id: str, since: int = 0) -> dict:
 # 为什么不让后台直接登录：Riot 对机房/VPN IP 的密码登录强制 hCaptcha，
 # 服务器发起的登录一律 auth_failure（实测 46 个节点 + 家宽全覆盖）。
 # 所以改成「用户在浏览器里登录 → 把结果令牌交给后台」。
+
+def public_base_url() -> str:
+    """公网访问地址（给群里的绑定链接用；服务器端口 8000 只在本机，必须走 nginx 的 443）。"""
+    return os.environ.get("MCP_PUBLIC_BASE", "https://47.108.234.194").rstrip("/")
+
+
+class RiotPubBindRequest(BaseModel):
+    """群友/访客用的绑定请求：t = 机器人给的一次性令牌。"""
+    t: str = ""
+    raw: str = ""
+    region: str = "ap"
+
+
+@app.get("/api/riot/pub")
+async def riot_pub_status(t: str = ""):
+    """公开查询绑定状态（凭令牌，无需登录网页端）。"""
+    from build_mcp.services import valorant_sdk
+    uid = riot_token.parse_token(t)
+    if not uid:
+        raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
+    b = get_riot_binding(uid) or {}
+    name = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#")
+    return {"bound": bool(b.get("access_token")), "player": name,
+            "region": b.get("region") or "ap", "login_url": valorant_sdk.RIOT_AUTH_URL}
+
+
+@app.post("/api/riot/pub/bind")
+async def riot_pub_bind(req: RiotPubBindRequest):
+    """公开绑定（凭令牌）：校验令牌 → 存到该用户名下 → 立刻试查一次商店。"""
+    from build_mcp.services import valorant_sdk
+    uid = riot_token.parse_token(req.t)
+    if not uid:
+        raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
+    token = valorant_sdk.parse_access_token(req.raw)
+    if not token:
+        raise HTTPException(status_code=400, detail="没识别到登录令牌：请把浏览器地址栏里 "
+                                                   "playvalorant.com/opt_in#access_token=... 那条完整地址复制过来")
+    region = (req.region or "ap").strip().lower()
+    info = await valorant_sdk.account_info(token)
+    if info.get("error"):
+        raise HTTPException(status_code=400, detail=info["error"])
+    save_riot_binding(uid, region, token, info.get("puuid", ""),
+                      info.get("game_name", ""), info.get("tag_line", ""))
+    player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
+    logger.info("🎮 [IM] 用户 id=%s 绑定 Riot 账号 %s（%s）", uid, player or "(未知)", region)
+    store = await valorant_sdk.store_with_token(token, region)
+    return {"ok": True, "player": player, "region": region, "store": store}
+
+
+@app.post("/api/riot/pub/store")
+async def riot_pub_store(t: str = ""):
+    """公开查商店（凭令牌）：群里那个人绑完之后自己也能点一下看结果。"""
+    from build_mcp.services import valorant_sdk
+    uid = riot_token.parse_token(t)
+    if not uid:
+        raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
+    b = get_riot_binding(uid) or {}
+    if not b.get("access_token"):
+        raise HTTPException(status_code=404, detail="这个链接还没绑定过账号")
+    res = await valorant_sdk.store_with_token(b["access_token"], b.get("region") or "ap")
+    if res.get("error") and "401" in str(res.get("error")):
+        return {"need_rebind": True, "error": "登录已过期，请让机器人再发一条绑定链接"}
+    return res
+
 
 class RiotBindRequest(BaseModel):
     """raw = 用户粘贴的整条地址（playvalorant.com/opt_in#access_token=...）或裸令牌。"""
