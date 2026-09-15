@@ -19,6 +19,12 @@ from build_mcp.common.logger import get_logger
 logger = get_logger(name="valorant_sdk")
 
 _UA = {"User-Agent": "Mozilla/5.0"}
+# Cookie 续期专用 UA：**必须是拳头客户端 UA**，不能用浏览器 UA。
+# 依据：SkinPeek 在 getUserAgent() 里明确注释 "temporary bypass for Riot adding hCaptcha"，
+# 固定返回这个 ShooterGame 串；用浏览器 UA 请求 /authorize 时，即使 cookie 是对的，
+# Riot 也可能直接把请求 303 到登录页（拿不到令牌）—— 这是「ssid 明明对却一直说失效」的
+# 另一半原因，别改回 Mozilla。（商店/PD 接口仍用 _UA，实测没问题。）
+_AUTH_UA = {"User-Agent": "ShooterGame/13 Windows/10.0.19043.1.256.64bit"}
 _cache: Dict[str, Any] = {}
 
 _CLIENT_PLATFORM = base64.b64encode(json.dumps({
@@ -327,6 +333,39 @@ def extract_riot_cookie(raw: str) -> str:
     return "; ".join(pairs)
 
 
+def merge_riot_cookies(base: str, set_cookie: str) -> str:
+    """把响应里的 Set-Cookie 合并进请求时带的 cookie 串（同名覆盖，其余保留）。
+
+    ⚠️ 为什么不能「用新 ssid 直接覆盖整包」：Riot 在续期成功后会**轮换 ssid**，
+    同时登录会话还依赖 csid/asid/tdid 这些 cookie。老代码只把新 ssid 写回库、
+    丢掉其它 cookie，结果就是「第一次能查、第二次说失效」—— 因为第二次拿着一张
+    光杆 ssid 去续期，Riot 不认。所以轮换时必须整包合并回写。
+    响应方向只收 `_RIOT_COOKIE_NAMES` 白名单，避免把 Path/Expires 之类混进来。
+    """
+    jar = {}
+    for part in re.split(r";\s*", base or ""):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = k.strip()
+            if k:
+                jar[k] = v.strip()
+    # Set-Cookie 可能是多条（逗号分隔）；只在「逗号后面像新 cookie 名」处切
+    changed = False
+    for ck in re.split(r",\s*(?=[A-Za-z_][A-Za-z0-9_\-]*=)", set_cookie or ""):
+        head = ck.split(";", 1)[0]
+        if "=" in head:
+            k, v = head.split("=", 1)
+            k = k.strip()
+            if k in _RIOT_COOKIE_NAMES:
+                if jar.get(k) != v.strip():
+                    changed = True
+                jar[k] = v.strip()
+    if not jar or not changed:                    # 响应没带（或带的跟原来一样）→ 原样返回
+        return base or ""
+    order = [c for c in _RIOT_COOKIE_NAMES if c in jar] + [k for k in jar if k not in _RIOT_COOKIE_NAMES]
+    return "; ".join(f"{k}={jar[k]}" for k in order)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """禁止 urllib 自动跟随 3xx —— cookie 续期需要自己读 Location 头。"""
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
@@ -368,7 +407,7 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
     def _sync():
         last = ""
         for attempt in (1, 2):
-            req = urllib.request.Request(auth_url, headers={**_UA, "Cookie": cookie_hdr})
+            req = urllib.request.Request(auth_url, headers={**_AUTH_UA, "Cookie": cookie_hdr})
             opener = urllib.request.build_opener(
                 _NoRedirect(), urllib.request.ProxyHandler(dict(_PROXY)))
             try:
@@ -405,9 +444,14 @@ async def cookie_login(ssid: str) -> Dict[str, Any]:
         tok = parse_access_token(loc)
         if tok:
             out = {"access_token": tok}
-            m = re.search(r"[; ]ssid=([^;\\s]+)", j.get("set_cookie") or "")
-            if m:                                     # Riot 轮换了 ssid → 一并回传让调用方更新
-                out["new_ssid"] = m.group(1)
+            # ★ 整包回写：Riot 续期会轮换 ssid，只回写 ssid 会把 csid/asid/tdid 丢掉
+            #   → 下一次续期必失败（「第一次能查、第二次说失效」就是这个坑）。
+            merged = merge_riot_cookies(cookie_hdr, j.get("set_cookie") or "")
+            if merged and merged != cookie_hdr:
+                out["new_cookie"] = merged
+                m = re.search(r"(?:^|;\s*)ssid=([^;\s]+)", merged)
+                if m:                                 # 兼容旧调用方
+                    out["new_ssid"] = m.group(1)
             return out
         return {"error": "Riot 返回的重定向里没有令牌，请重新登录一次"}
     if j.get("type") == "net_error":
@@ -558,7 +602,10 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
         if got.get("access_token"):
             token = got["access_token"]
             try:
-                _webstore.update_riot_access_token(int(row["user_id"]), token)
+                # ★ 连带把轮换后的整包 cookie 一起回写：只写令牌不写 cookie，
+                #   下一次续期就会因为 ssid 已被轮换而失效。
+                _webstore.update_riot_access_token(int(row["user_id"]), token,
+                                                   ssid=got.get("new_cookie"))
             except Exception as e:                        # noqa: BLE001  刷新不影响本次查询
                 logger.warning("刷新 Riot 令牌入库失败：%s", e)
         elif not token:

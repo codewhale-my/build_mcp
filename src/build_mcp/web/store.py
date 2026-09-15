@@ -714,17 +714,24 @@ def save_riot_binding(user_id: int, region: str, access_token: str,
     """保存/覆盖某用户的 Riot 绑定。
 
     access_token 是浏览器登录换来的短期令牌（1 小时）；
-    ssid 是长期 cookie，有它后台就能自动续令牌（不传 = 保留库里已有的，不会被清掉）。
+    ssid 是长期 cookie，有它后台就能自动续令牌（不传/空 = 保留库里已有的，不会被清掉）。
+
+    ⚠️ 两个坑（2026-09-15 实测踩到，别改回去）：
+      · ssid 列是 NOT NULL → 不能直接往 VALUES 里塞 NULL，SQLite 会当场报
+        `NOT NULL constraint failed`，而且 **ON CONFLICT 兜不住 NOT NULL**
+        （NOT NULL 不是「冲突」，是立即中止）→ 接口 500。所以用 COALESCE(?,'')。
+      · 原来的 `CASE WHEN excluded.ssid IS NULL` 是**死分支**（NULL 根本插不进来），
+        要判的是空串 `''`。
     """
     conn = _conn()
     try:
         with conn:
             conn.execute(
                 "INSERT INTO riot_bindings(user_id,region,access_token,ssid,puuid,game_name,tag_line,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?)"
+                " VALUES(?,?,?,COALESCE(?,''),?,?,?,?)"
                 " ON CONFLICT(user_id) DO UPDATE SET region=excluded.region,"
                 " access_token=excluded.access_token,"
-                " ssid=CASE WHEN excluded.ssid IS NULL THEN riot_bindings.ssid ELSE excluded.ssid END,"
+                " ssid=CASE WHEN excluded.ssid = '' THEN riot_bindings.ssid ELSE excluded.ssid END,"
                 " puuid=excluded.puuid, game_name=excluded.game_name, tag_line=excluded.tag_line,"
                 " updated_at=excluded.updated_at",
                 (int(user_id), region or "ap", access_token, ssid, puuid, game_name, tag_line, time.time()),
@@ -733,15 +740,23 @@ def save_riot_binding(user_id: int, region: str, access_token: str,
         conn.close()
 
 
-def update_riot_access_token(user_id: int, access_token: str) -> None:
-    """只刷新短期令牌（用 ssid 自动续期后调用），不动 ssid/账号信息。"""
+def update_riot_access_token(user_id: int, access_token: str, ssid: Optional[str] = None) -> None:
+    """只刷新短期令牌（用 ssid 自动续期后调用），不动账号信息。
+
+    ssid 传值时**整包覆盖**登录 cookie：Riot 续期会轮换 ssid，若只回写令牌不带
+    新 cookie，下一次续期就会失效（「第一次能查、第二次说失效」）。
+    """
     if not access_token:
         return
     conn = _conn()
     try:
         with conn:
-            conn.execute("UPDATE riot_bindings SET access_token=?, updated_at=? WHERE user_id=?",
-                         (access_token, time.time(), int(user_id)))
+            if ssid:
+                conn.execute("UPDATE riot_bindings SET access_token=?, ssid=?, updated_at=?"
+                             " WHERE user_id=?", (access_token, ssid, time.time(), int(user_id)))
+            else:
+                conn.execute("UPDATE riot_bindings SET access_token=?, updated_at=? WHERE user_id=?",
+                             (access_token, time.time(), int(user_id)))
     finally:
         conn.close()
 

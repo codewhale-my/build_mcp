@@ -2207,8 +2207,11 @@ async def riot_pub_bind(req: RiotPubBindRequest):
             if got.get("error"):
                 raise HTTPException(status_code=400, detail=got["error"])
             token = got.get("access_token") or ""
-            # Riot 可能轮换了 ssid —— 把整包新 cookie 回写，保持长期有效
-            if got.get("new_ssid"):
+            # Riot 轮换了 ssid —— 必须回写【整包】cookie，只写 ssid 会丢掉 csid/asid/tdid，
+            # 下次续期就失效（「第一次能查、第二次说失效」的机制）。
+            if got.get("new_cookie"):
+                cookie_hdr = got["new_cookie"]
+            elif got.get("new_ssid"):
                 cookie_hdr = valorant_sdk.extract_riot_cookie("ssid=" + got["new_ssid"])
         if not token:
             raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
@@ -2289,7 +2292,9 @@ async def riot_bind(req: RiotBindRequest, user: dict = Depends(require_user)):
         if got.get("error"):
             raise HTTPException(status_code=400, detail=got["error"])
         token = got.get("access_token") or ""
-        if got.get("new_ssid"):
+        if got.get("new_cookie"):
+            cookie_hdr = got["new_cookie"]
+        elif got.get("new_ssid"):
             cookie_hdr = valorant_sdk.extract_riot_cookie("ssid=" + got["new_ssid"])
     if not token:
         raise HTTPException(status_code=400, detail="没识别到登录凭证：推荐粘贴 ssid（长期免登录），"
