@@ -405,6 +405,86 @@ def test_allmsg_chance_hit():
     assert 60 <= hits <= 140, hits
 
 
+@case
+async def test_submit_gate_drops_before_queue():
+    """闸门必须在 submit 阶段就拒掉：被拒消息不入队、不发「已排队」。"""
+    tr = FakeTransport()
+
+    def gate(msg):
+        return None                      # 全量通道判定：不插话
+
+    async def fake_start(**kw):
+        return "run-x"
+
+    hub = ChannelHub(tr, fake_start, lambda *a, **k: None, prepare_fn=gate)
+    hub.submit(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                       user_id="U1", text="闲聊一句", msg_id="MSG9",
+                       event="GROUP_MESSAGE_CREATE"))
+    await asyncio.sleep(0.05)
+    assert tr.sent == [], "被闸门拒掉的消息连「已排队」都不该回"
+    assert not hub._chat_queues, "被拒消息不应入队"
+
+
+@case
+async def test_submit_runs_gate_once_and_uses_prepared():
+    """闸门只跑一次（submit 缓存），handle 用缓存结果起 run。"""
+    tr = FakeTransport()
+    calls = {"gate": 0}
+
+    def gate(msg):
+        calls["gate"] += 1
+        return "整理后的提问"
+
+    async def fake_fetch(run_id: str, since: int) -> dict:
+        return {"status": "done", "answer": "好", "events": []}
+
+    started: Dict[str, Any] = {}
+
+    async def fake_start(**kw) -> str:
+        started.update(kw)
+        return "run-1"
+
+    hub = ChannelHub(tr, fake_start, fake_fetch, prepare_fn=gate)
+    hub.stream.interval = 0.01
+    hub.submit(Inbound(channel="qq", chat_type="c2c", chat_id="C1",
+                       user_id="U2", text="原文", msg_id="M1"))
+    await asyncio.sleep(0.1)
+    assert calls["gate"] == 1, f"闸门应只跑一次，实际 {calls['gate']}"
+    assert started.get("query") == "整理后的提问", started
+
+
+@case
+async def test_submit_chime_no_busy_notice():
+    """插话消息遇忙线只排队，不发「已排队」告知。"""
+    tr = FakeTransport()
+
+    def gate(msg):
+        return msg.text
+
+    release = asyncio.Event()
+
+    async def fake_fetch(run_id: str, since: int) -> dict:
+        await asyncio.wait_for(release.wait(), timeout=3)
+        return {"status": "done", "answer": "x", "events": []}
+
+    async def fake_start(**kw) -> str:
+        return "run-%s" % kw.get("query", "")
+
+    hub = ChannelHub(tr, fake_start, fake_fetch, prepare_fn=gate)
+    hub.stream.interval = 0.01
+    hub.submit(Inbound(channel="qq", chat_type="group", chat_id="G9",
+                       user_id="U1", text="第一条", msg_id="MA",
+                       event="GROUP_MESSAGE_CREATE"))       # 占住 worker
+    await asyncio.sleep(0.05)
+    hub.submit(Inbound(channel="qq", chat_type="group", chat_id="G9",
+                       user_id="U2", text="第二条插话", msg_id="MB",
+                       event="GROUP_MESSAGE_CREATE"))       # 撞上忙线
+    await asyncio.sleep(0.05)
+    assert tr.sent == [], "插话遇忙线不该发「已排队」"
+    release.set()
+    await asyncio.sleep(0.05)
+
+
 def run_all() -> int:
     # 自测跑在仓库里，会顺带初始化 build_mcp 的日志（往 ./log/ 写文件）。
     # 把第三方 INFO 压掉，免得断言输出被 httpx 请求日志淹了。

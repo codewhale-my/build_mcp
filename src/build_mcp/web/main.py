@@ -741,6 +741,7 @@ GUEST_TONE = (
     "怼人和损人是【默认动作】，几乎每条回复都要带一句嘲讽、调侃或骂人的话，"
     "可以用「就这点事？」「这也要问？」「脑子是个好东西」一类的口气，也可以说粗话；"
     "不要讨好、不要热情、不要客套、不要主动帮忙。"
+    "回复必须短：每次不超过 100 个字，两三句话说完就走，不多写一个字、不列点不展开。"
     "但毒舌归毒舌：正当问题仍要给【正确答案】，不许因为嘴损而答错、含糊或拒答；"
     "对方要求执行服务器操作或读写服务器文件时，冷冷回绝并说明没权限，绝不放行、绝不假装完成。"
     "红线：不做民族/地域/性别/生理缺陷等歧视性辱骂，不进行真实人身威胁。"
@@ -943,7 +944,8 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         note = f"\n\n[消息来源] 这条消息来自 {source or 'IM'}。" if source else ""
         logger.info("👤 IM 身份判定 sender=%s → %s（host=%s）",
                     sender or "(无)", who, host["username"])
-        return await _spawn_run(host, query, model, extra_note=note + ident)
+        return await _spawn_run(host, query, model, extra_note=note + ident,
+                                hard_timeout=270)
 
     def _ack_for(msg):                       # noqa: ANN001
         """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。
@@ -1738,7 +1740,8 @@ async def _flush_run_events(run_id: str, rstate: Dict[str, Any]) -> None:
 
 
 async def _spawn_run(user: dict, query: str, model_key: str, *,
-                     extra_note: str = "", cont_msg_id: Optional[int] = None) -> str:
+                     extra_note: str = "", cont_msg_id: Optional[int] = None,
+                     hard_timeout: float = 0) -> str:
     """起一个与连接解耦的后台 run，返回 run_id。
 
     HTTP /api/chat 与 IM 通道共用这一份：入站只负责「触发」，生成过程独立跑完
@@ -1909,7 +1912,8 @@ async def _spawn_run(user: dict, query: str, model_key: str, *,
         partial = ""
         status = "done"
         err_text = ""
-        try:
+        async def _generate() -> None:
+            nonlocal answer, failed, used_model, partial
             async with lock:
                 async for ev in agent_loop_stream(
                     tool_name_to_session=tool_map,
@@ -1933,6 +1937,23 @@ async def _spawn_run(user: dict, query: str, model_key: str, *,
                     elif ev.get("type") == "error":
                         failed = True
                     _publish(ev)
+
+        try:
+            if hard_timeout and hard_timeout > 0:
+                # ⏰ IM 硬超时：QQ 被动回复窗口只有约 5 分钟，跑得再久结果也发不出去，
+                # 还会把同账号后续消息全部堵死在锁上（实测模型 sleep 循环卡死队列一小时）。
+                # 超时必须「死得干净 + 给用户一句反馈」，绝不允许 run 永生。
+                await asyncio.wait_for(_generate(), timeout=hard_timeout)
+            else:
+                await _generate()
+        except asyncio.TimeoutError:
+            status = "error"
+            failed = True
+            err_text = "⏰ 处理超时：这个任务太久，超过了 IM 回复窗口，已被强制终止"
+            rstate["error"] = err_text
+            _publish({"type": "error", "message": err_text})
+            logger.warning("⏰ IM 任务硬超时被终止 id=%s user=%s（%.0fs）",
+                           run_id, user["username"], hard_timeout)
         except asyncio.CancelledError:
             status = "stopped"
             err_text = "服务重启导致任务中断"

@@ -38,6 +38,7 @@ class Inbound:
     msg_id: str = ""                # 平台消息 id（QQ 被动回复的锚点）
     event: str = ""                 # 平台原始事件名（如 GROUP_MESSAGE_CREATE），取证/分流用
     raw: Dict[str, Any] = field(default_factory=dict)
+    prepared: Optional[str] = None  # submit 阶段闸门的缓存结果（None=还没过闸）
 
 
 @dataclass
@@ -248,8 +249,24 @@ class ChannelHub:
         text = (msg.text or "").strip()
         if not text:
             return
+        # ⚠️ 闸门必须在入队【之前】跑：否则被拒掉的群消息也会先入队、再吃一条
+        # 「已排队」回执 —— 表现就是"明明没@它，它每句话都在回"（实测教训）。
+        if self.prepare_fn is not None and getattr(msg, "prepared", None) is None:
+            try:
+                prepared = self.prepare_fn(msg)
+            except Exception as e:            # noqa: BLE001  闸门出错按原样放行
+                logger.warning("⚠️ prepare_fn 调用失败，按原样放行：%s", e)
+                prepared = text
+            if prepared is None:
+                logger.info("🤐 未触发响应规则，不入队直接忽略 [%s/%s] sender=%s text=%s",
+                            msg.channel, msg.chat_type, msg.user_id, text[:60])
+                return
+            msg.prepared = str(prepared).strip()
         if self._chat_tasks.get(msg.chat_id) is not None and not self._chat_tasks[msg.chat_id].done():
-            asyncio.get_running_loop().create_task(self._busy_notice(msg))
+            # 排队告知只给「用户点名要回」的消息（@ / 单聊）；插话是我们主动开口，
+            # 悄悄排着就行，回一句"已排队"既吵又白占回复额度。
+            if getattr(msg, "event", "") != "GROUP_MESSAGE_CREATE":
+                asyncio.get_running_loop().create_task(self._busy_notice(msg))
         q = self._chat_queues.setdefault(msg.chat_id, asyncio.Queue())
         q.put_nowait(msg)
         t = self._chat_tasks.get(msg.chat_id)
@@ -291,11 +308,14 @@ class ChannelHub:
         if not text:
             return ""
         if self.prepare_fn is not None:
-            try:
-                prepared = self.prepare_fn(msg)
-            except Exception as e:        # noqa: BLE001  闸门自身出错不能把消息搞挂
-                logger.warning("⚠️ prepare_fn 调用失败，按原样放行：%s", e)
-                prepared = text
+            if getattr(msg, "prepared", None) is not None:
+                prepared = msg.prepared       # submit 阶段已过闸并缓存，别再跑一遍
+            else:
+                try:
+                    prepared = self.prepare_fn(msg)
+                except Exception as e:        # noqa: BLE001  闸门自身出错不能把消息搞挂
+                    logger.warning("⚠️ prepare_fn 调用失败，按原样放行：%s", e)
+                    prepared = text
             if prepared is None:
                 logger.info("🤐 未触发响应规则，已忽略 [%s/%s] event=%s sender=%s text=%s",
                             msg.channel, msg.chat_type, msg.event or "-",

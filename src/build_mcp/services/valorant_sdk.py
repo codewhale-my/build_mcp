@@ -39,7 +39,9 @@ async def _http(url: str, method: str = "GET", body: Optional[dict] = None,
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={**_UA, "Content-Type": "application/json", **(headers or {})})
         try:
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            _proxy = urllib.request.ProxyHandler({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
+            _opener = urllib.request.build_opener(_proxy)
+            resp = _opener.open(req, timeout=timeout)
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, raw
         except urllib.error.HTTPError as e:
@@ -94,7 +96,9 @@ async def _riot_login(username: str, password: str) -> Dict[str, Any]:
     # 用 cookiejar 保证整个登录流程共享会话
     import http.cookiejar
     cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj),
+        urllib.request.ProxyHandler({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}))
 
     def _req(method, url, body=None, headers=None):
         data = json.dumps(body).encode() if body is not None else None
@@ -165,7 +169,8 @@ async def daily_store(username: str, password: str, region: str = "ap") -> Dict[
     }
 
     def _sync():
-        cj_less = urllib.request.build_opener()
+        cj_less = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}))
         def _g(url):
             req = urllib.request.Request(url, headers={**_UA, **base_headers})
             resp = cj_less.open(req, timeout=12)
