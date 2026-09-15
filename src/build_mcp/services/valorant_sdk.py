@@ -33,24 +33,47 @@ _REGION_SHARD = {
 }
 
 
+MIHOMO_CTRL = "http://127.0.0.1:9090"
+_PROXY = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+
+
+def _proxy_reset() -> None:
+    """把代理选择组切回自动择优（PICK → OUT）。
+
+    排障/扫节点时会把 PICK 钉在某个具体节点上；一旦那个节点挂了，全网都不通，
+    表现成"5 秒超时 + HTTP 000"，很容易被误判成"被 Riot 封了"。这里做自愈。
+    """
+    try:
+        req = urllib.request.Request(f"{MIHOMO_CTRL}/proxies/PICK",
+                                     data=json.dumps({"name": "OUT"}).encode(),
+                                     method="PUT", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+        logger.info("🩺 代理已切回自动择优组（PICK→OUT）")
+    except Exception:                             # noqa: BLE001  控制器不可用就算了
+        pass
+
+
 async def _http(url: str, method: str = "GET", body: Optional[dict] = None,
                 headers: Optional[Dict[str, str]] = None, timeout: float = 12.0) -> Any:
-    """返回 (status, json/text)。"""
+    """返回 (status, json/text)；连不上时代理自愈并重试一次。"""
     def _do():
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={**_UA, "Content-Type": "application/json", **(headers or {})})
-        try:
-            _proxy = urllib.request.ProxyHandler({"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
-            _opener = urllib.request.build_opener(_proxy)
-            resp = _opener.open(req, timeout=timeout)
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, raw
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace")
-        except Exception as e:                    # noqa: BLE001
-            # 代理节点抖动/SSL EOF/超时都算"没连上"，绝不能把上层接口打成 500
-            return 0, f"{type(e).__name__}: {e}"
+        last = ""
+        for attempt in (1, 2):
+            try:
+                _opener = urllib.request.build_opener(urllib.request.ProxyHandler(_PROXY))
+                resp = _opener.open(req, timeout=timeout)
+                return resp.status, resp.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8", "replace")
+            except Exception as e:                # noqa: BLE001
+                last = f"{type(e).__name__}: {e}"
+                if attempt == 1:                  # 自愈：切回择优组，稍等再试一次
+                    _proxy_reset()
+                    time.sleep(1.0)
+        return 0, last
     return await asyncio.get_event_loop().run_in_executor(None, _do)
 
 
