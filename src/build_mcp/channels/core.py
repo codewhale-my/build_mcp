@@ -47,6 +47,7 @@ class Outbound:
     chat_type: str
     text: str
     reply_to: str = ""              # 被动回复锚点（QQ 需要，企微可空）
+    mention: str = ""               # 要 @ 的对象（QQ 群 = 对方 member_openid；空 = 不 @）
 
 
 class Transport(Protocol):
@@ -232,6 +233,57 @@ class ChannelHub:
         #   字符串 = 用这个字符串当 query（可用来给群消息补「最近的对话」上下文）。
         # 不传 = 老行为：原文直接起 run。
         self.prepare_fn = prepare_fn
+        # ── 异步会话：入站消息不阻塞网关事件循环 ──
+        # 每个会话（chat_id）一条 FIFO 队列 + 一个串行 worker：
+        #   * handle() 全程跑在后台 task 里，网关立刻腾出手收下一条消息；
+        #   * 同一会话内仍按顺序逐条处理（上下文不乱）；
+        #   * 忙线时新消息先进队列，并立刻回一条「排队」告知（尽力而为）。
+        self._chat_tasks: Dict[str, asyncio.Task] = {}
+        self._chat_queues: Dict[str, "asyncio.Queue[Inbound]"] = {}
+
+    # ── 异步受理 ────────────────────────────────────────────────────────────
+
+    def submit(self, msg: Inbound) -> None:
+        """异步受理一条入站消息：绝不阻塞调用方（网关事件循环）。"""
+        text = (msg.text or "").strip()
+        if not text:
+            return
+        if self._chat_tasks.get(msg.chat_id) is not None and not self._chat_tasks[msg.chat_id].done():
+            asyncio.get_running_loop().create_task(self._busy_notice(msg))
+        q = self._chat_queues.setdefault(msg.chat_id, asyncio.Queue())
+        q.put_nowait(msg)
+        t = self._chat_tasks.get(msg.chat_id)
+        if t is None or t.done():
+            self._chat_tasks[msg.chat_id] = asyncio.create_task(
+                self._worker(msg.chat_id))
+
+    async def _busy_notice(self, msg: Inbound) -> None:
+        """忙线告知：尽量发，发不出去（窗口过期等）就算了。"""
+        try:
+            await self.transport.send(Outbound(
+                chat_id=msg.chat_id, chat_type=msg.chat_type,
+                text="⏳ 上一条还在处理中，你这条已排队，马上来…",
+                reply_to=msg.msg_id,
+                mention=msg.user_id if msg.chat_type == "group" else ""))
+        except Exception:                      # noqa: BLE001
+            pass
+
+    async def _worker(self, chat_id: str) -> None:
+        """单会话串行消费者：逐条跑 handle，队列空了自动收摊。"""
+        q = self._chat_queues[chat_id]
+        while True:
+            msg = await q.get()
+            try:
+                await self.handle(msg)
+            except Exception as e:             # noqa: BLE001
+                logger.warning("⚠️ 会话任务异常 [%s/%s]：%s",
+                               msg.channel, chat_id, str(e)[:200])
+            finally:
+                q.task_done()
+                if q.empty():
+                    self._chat_tasks.pop(chat_id, None)
+                    self._chat_queues.pop(chat_id, None)
+                    return
 
     async def handle(self, msg: Inbound) -> str:
         """处理一条入站消息，返回 run_id（便于测试与日志关联）。"""
@@ -305,7 +357,8 @@ class ChannelHub:
         """发一条；失败返回 False（QQ 被动回复窗口过期 / 无权限时会失败）。"""
         try:
             await self.transport.send(Outbound(chat_id=msg.chat_id, chat_type=msg.chat_type,
-                                               text=text, reply_to=msg.msg_id))
+                                               text=text, reply_to=msg.msg_id,
+                                               mention=msg.user_id if msg.chat_type == "group" else ""))
             return True
         except Exception as e:            # noqa: BLE001
             logger.warning("⚠️ 出站失败[%s/%s]：%s", msg.channel, msg.chat_type, str(e)[:160])

@@ -139,7 +139,24 @@ class QQTransport:
 
     async def send(self, msg: Outbound) -> None:
         tok = await self.token()
+        if getattr(msg, "mention", "") and msg.chat_type == "group":
+            # 群里 @某人：官方要求走 markdown（msg_type=2，<@member_openid>）。
+            # markdown 权限未开通时会 4xx，自动退回纯文本重发，保证消息不丢。
+            if await self._send_md(msg, tok):
+                return
+        await self._send_plain(msg, tok)
+
+    async def _send_md(self, msg: Outbound, tok: str) -> bool:
+        body = {"content": msg.text, "msg_type": 2,
+                "markdown": {"content": f"<@{msg.mention}> {msg.text}"}}
+        return await self._post(msg, body, tok, quiet=True)
+
+    async def _send_plain(self, msg: Outbound, tok: str) -> None:
         body: Dict[str, Any] = {"content": msg.text, "msg_type": 0}
+        await self._post(msg, body, tok)
+
+    async def _post(self, msg: Outbound, body: Dict[str, Any], tok: str,
+                    quiet: bool = False) -> bool:
         if msg.reply_to:
             body["msg_id"] = msg.reply_to       # 被动回复
             # 同一条入站消息要回多条（ack + 分片正文）：第 2 条起必须递增 msg_seq，
@@ -152,8 +169,13 @@ class QQTransport:
         r = await self._client.post(self._url(msg), json=body,
                                     headers={"Authorization": f"QQBot {tok}"})
         if r.status_code >= 300:
+            if quiet:
+                logger.info("QQ markdown 发送被拒（%s），退回纯文本：%s",
+                            r.status_code, r.text[:120])
+                return False
             logger.warning("QQ 发送失败 %s：%s", r.status_code, r.text[:300])
         r.raise_for_status()
+        return True
 
     async def aclose(self) -> None:
         await self._client.aclose()

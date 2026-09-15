@@ -1042,7 +1042,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
                                    ensure_ascii=False, default=str))
         except Exception:                              # noqa: BLE001
             pass
-        await hub.handle(msg)
+        hub.submit(msg)          # 异步受理：绝不阻塞网关事件循环（忙线自动排队）
 
     async def _run_env(is_sbx: bool, label: str) -> None:
         c = QQConfig(appid, secret, is_sbx)

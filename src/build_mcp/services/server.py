@@ -175,3 +175,39 @@ async def market_quote(
   except Exception as e:
     logger.error(f"Error market_quote: {e}")
     return ApiResponse.fail(str(e))
+
+# ================= 瓦洛兰特（国际服） =================
+from build_mcp.services import valorant_sdk
+
+
+@mcp.tool(name="valorant_daily_store", description="查询瓦洛兰特（国际服）账号的每日商店：四件每日皮肤、VP 价格、刷新倒计时。需提供 Riot 账号用户名/密码。region: ap/na/eu/kr/latam/br（国服不支持）。")
+async def valorant_daily_store(
+        username: Annotated[str, Field(description="Riot 账号用户名（不是游戏内昵称）")],
+        password: Annotated[str, Field(description="Riot 账号密码")],
+        region: Annotated[str, Field(description="服务器区域：ap(亚太)/na(北美)/eu(欧洲)/kr(韩国)/latam/br")] = "ap",
+) -> ApiResponse:
+  logger.info(f"valorant_daily_store region={region}")
+  try:
+    result = await valorant_sdk.daily_store(username, password, region)
+    if result.get("error"):
+      return ApiResponse.fail(result["error"], meta=result)
+    return ApiResponse.ok(data=result)
+  except Exception as e:
+    logger.error(f"Error valorant_daily_store: {e}")
+    return ApiResponse.fail(str(e))
+
+
+@mcp.tool(name="valorant_skin_search", description="按关键词搜索瓦洛兰特皮肤（中文名，免费公开数据，无需登录），返回名称/UUID/图标。")
+async def valorant_skin_search(
+        keyword: Annotated[str, Field(description="皮肤关键词，如 '爆裂''幻象''狂徒'")],
+        limit: Annotated[int, Field(description="返回条数上限", ge=1, le=20)] = 8,
+) -> ApiResponse:
+  logger.info(f"valorant_skin_search kw={keyword}")
+  try:
+    result = await valorant_sdk.search_skins(keyword, limit)
+    if result.get("error"):
+      return ApiResponse.fail(result["error"])
+    return ApiResponse.ok(data=result)
+  except Exception as e:
+    logger.error(f"Error valorant_skin_search: {e}")
+    return ApiResponse.fail(str(e))
