@@ -76,9 +76,18 @@ if [ "${ONLY_RESTART}" = "0" ]; then
     for f in $GUARD_FILES; do
       [ -f "$SRC/$f" ] || continue
       lh="$(tr -d '\r' < "$SRC/$f" | sha1sum | cut -c1-12)"
+      # ⚠️ 必须显式判断远端文件是否存在：文件不存在时 `tr` 报错但 `sha1sum` 仍会
+      # 在 EOF 上算出空串的 sha1（da39a3ee5e6b），会被当成「服务器上的别的版本」而
+      # 误拦「本次新增的源码文件」。所以不存在时直接回 missing。
       rh="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-              "tr -d '\r' < '${REMOTE_DIR}/$f' 2>/dev/null | sha1sum | cut -c1-12" 2>/dev/null || echo missing)"
+              "if [ -f '${REMOTE_DIR}/$f' ]; then tr -d '\r' < '${REMOTE_DIR}/$f' | sha1sum | cut -c1-12; else echo missing; fi" 2>/dev/null || echo missing)"
       [ "$lh" = "$rh" ] && continue
+      if [ "$rh" = "missing" ]; then
+        # 服务器上还没有这个文件 = 本次新增的源码，无内容可保护，直接放行。
+        # （若不特判，新文件第一次部署会被误判成「服务器版本不在 git 历史里」而拦下。）
+        printf '   \033[1;32m＋ 新增\033[0m %s（服务器上还没有，直接写入）\n' "$f"
+        continue
+      fi
       if _version_in_git "$f" "$rh"; then
         printf '   \033[1;32m↻ 待更新\033[0m %s（服务器是已入库的旧版本，可安全覆盖）\n' "$f"
       else
