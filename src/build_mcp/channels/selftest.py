@@ -17,7 +17,8 @@ from typing import Any, Dict, List
 
 import httpx
 
-from .core import ChannelHub, Inbound, Outbound, SessionMap, split_text
+from .core import (ChannelHub, Inbound, Outbound, SessionMap,
+                   allmsg_chance_hit, allmsg_should_reply, split_text)
 from .qq_official import (API_BASE, SANDBOX_API_BASE, TOKEN_URL, QQConfig,
                           QQTransport, parse_dispatch, read_owner_ids)
 from .wecom import WeComWebhookTransport
@@ -299,6 +300,109 @@ async def test_hub_ack_fn_by_identity():
     await hub3.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
                               user_id="U1", text="hi", msg_id="M3"))
     assert tr3.sent[0].text == "固定文案", tr3.sent[0].text
+
+
+@case
+def test_parse_group_all_message():
+    """全量群消息（不 @）：与 @ 消息同构，但要带 event 与发送者昵称。"""
+    ib = parse_dispatch("GROUP_MESSAGE_CREATE", {
+        "id": "M-ALL-1", "content": "  大家早上好  ", "group_openid": "G-ALL",
+        "author": {"member_openid": "U-ALL", "username": "小明", "member_role": "member"},
+    })
+    assert ib is not None
+    assert (ib.chat_type, ib.chat_id, ib.user_id) == ("group", "G-ALL", "U-ALL")
+    assert ib.text == "大家早上好" and ib.msg_id == "M-ALL-1"
+    assert ib.event == "GROUP_MESSAGE_CREATE" and ib.user_name == "小明"
+    # 出站仍走群接口：chat_type 必须还是 "group"（改成别的会把 URL 拼坏）
+    assert ib.chat_type == "group"
+    # @ 事件也要带 event（日志取证 / 分流都靠它）
+    ib2 = parse_dispatch("GROUP_AT_MESSAGE_CREATE",
+                         {"id": "M1", "content": "hi", "group_openid": "G1",
+                          "author": {"member_openid": "U1"}})
+    assert ib2.event == "GROUP_AT_MESSAGE_CREATE" and ib2.user_id == "U1"
+    # 无关事件依旧返回 None
+    assert parse_dispatch("GROUP_ADD_ROBOT", {"group_openid": "G1"}) is None
+
+
+@case
+def test_allmsg_should_reply():
+    """插话规则：keyword / owner / question / any / off 五态，任一命中即插。"""
+    K = dict(keywords=["机器人", "小助手"])
+    assert allmsg_should_reply("叫一下机器人", rules=["keyword"], **K) is True
+    assert allmsg_should_reply("今天天气不错", rules=["keyword"], **K) is False
+    assert allmsg_should_reply("在吗？", rules=["question"]) is True
+    assert allmsg_should_reply("这个多少钱", rules=["question"]) is True
+    assert allmsg_should_reply("我去吃饭了", rules=["question"]) is False
+    # 「什么」故意不算疑问词："没什么事"这种陈述句太常见，算进去会明显变吵
+    assert allmsg_should_reply("今天吃什么", rules=["question"]) is False
+    assert allmsg_should_reply("随便说点", rules=["owner"], is_owner=False) is False
+    assert allmsg_should_reply("随便说点", rules=["owner"], is_owner=True) is True
+    assert allmsg_should_reply("", rules=["any"]) is False
+    assert allmsg_should_reply("啥都行", rules=["off"]) is False
+    assert allmsg_should_reply("啥都行", rules=["any"]) is True
+    assert allmsg_should_reply("随便", rules=["keyword", "question"], **K) is False
+    assert allmsg_should_reply("随便?", rules=["keyword", "question"], **K) is True
+    assert allmsg_should_reply("x", rules=None) is False      # 默认 keyword、且无关键词
+
+
+@case
+async def test_hub_prepare_fn_gate():
+    """prepare_fn 是最后一道闸门：None 不起 run / 不发消息；字符串则替换 query。"""
+    started: List[Dict[str, Any]] = []
+
+    async def fake_start(**kw) -> str:
+        started.append(kw)
+        return "run-p"
+
+    async def fake_fetch(run_id: str, since: int) -> dict:
+        return {"status": "done", "answer": "好", "events": []}
+
+    tr = FakeTransport()
+    hub = ChannelHub(tr, fake_start, fake_fetch, ack="", progress="off", max_progress=0,
+                     prepare_fn=lambda m: None)
+    hub.stream.interval = 0.01
+    rid = await hub.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                                   user_id="U1", text="闲聊一句",
+                                   event="GROUP_MESSAGE_CREATE"))
+    assert rid == "" and started == [] and tr.sent == [], "被闸门拦下就不该起 run、不该发消息"
+
+    tr2 = FakeTransport()
+    hub2 = ChannelHub(tr2, fake_start, fake_fetch, ack="", progress="off", max_progress=0,
+                      prepare_fn=lambda m: f"[群聊上下文]{m.text}")
+    hub2.stream.interval = 0.01
+    await hub2.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                              user_id="U1", text="正文", event="GROUP_MESSAGE_CREATE"))
+    assert started and started[-1]["query"] == "[群聊上下文]正文", started
+    assert [m.text for m in tr2.sent] == ["好"]
+    # event 必须透传给 start_run：插话要据此换语气、换模型
+    assert started[-1]["event"] == "GROUP_MESSAGE_CREATE", started[-1].get("event")
+
+    # 闸门自己抛异常时必须放行（不能因为写错配置把消息全吞了）
+    tr3 = FakeTransport()
+    hub3 = ChannelHub(tr3, fake_start, fake_fetch, ack="", progress="off", max_progress=0,
+                      prepare_fn=lambda m: 1 / 0)
+    hub3.stream.interval = 0.01
+    await hub3.handle(Inbound(channel="qq", chat_type="group", chat_id="G1",
+                              user_id="U1", text="照样要跑", event="GROUP_MESSAGE_CREATE"))
+    assert started[-1]["query"] == "照样要跑"
+
+
+@case
+def test_allmsg_chance_hit():
+    """概率闸门：0 永不、1 必中、边界严格用 <（rnd=chance 不算中）。"""
+    assert allmsg_chance_hit(0, 0.0) is False
+    assert allmsg_chance_hit(0.0, 0.99) is False
+    assert allmsg_chance_hit(1, 0.99) is True
+    assert allmsg_chance_hit(1.0, 0.0) is True
+    assert allmsg_chance_hit(0.1, 0.05) is True
+    assert allmsg_chance_hit(0.1, 0.1) is False        # 边界：不算中
+    assert allmsg_chance_hit(0.1, 0.999) is False
+    assert allmsg_chance_hit("0.5", 0.4) is True       # 配置里是字符串也要认
+    assert allmsg_chance_hit("", 0.0) is False
+    assert allmsg_chance_hit(None, 0.0) is False
+    # 1000 次 1/10 抽样应落在 6%~14%（防"概率写反"这类低级错）
+    hits = sum(1 for i in range(1000) if allmsg_chance_hit(0.1, (i % 100) / 100))
+    assert 60 <= hits <= 140, hits
 
 
 def run_all() -> int:

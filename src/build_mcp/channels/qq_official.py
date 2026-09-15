@@ -82,13 +82,18 @@ class QQConfig:
 
 def parse_dispatch(t: str, d: Dict[str, Any]) -> Optional[Inbound]:
     """把 op=0 的 Dispatch 事件转成通道无关的 Inbound；无关事件返回 None。"""
-    if t == "GROUP_AT_MESSAGE_CREATE":          # 群里 @机器人
+    if t in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
+        # 前者 = 群里 @机器人；后者 = 群消息·全量模式（群主开了「获取群内全部消息」
+        # 后，群里每一条不 @ 机器人的消息也会推过来）。两者字段完全一致，
+        # 差别只在 event 名：出站都用同一个群接口，被动回复都是用同一条 id。
+        author = d.get("author") or {}
         return Inbound(
             channel="qq", chat_type="group",
             chat_id=str(d.get("group_openid") or ""),
-            user_id=str((d.get("author") or {}).get("member_openid") or ""),
+            user_id=str(author.get("member_openid") or ""),
+            user_name=str(author.get("username") or ""),
             text=(d.get("content") or "").strip(),
-            msg_id=str(d.get("id") or ""), raw=d,
+            msg_id=str(d.get("id") or ""), raw=d, event=t,
         )
     if t == "C2C_MESSAGE_CREATE":               # 单聊
         author = d.get("author") or {}
@@ -96,8 +101,9 @@ def parse_dispatch(t: str, d: Dict[str, Any]) -> Optional[Inbound]:
             channel="qq", chat_type="c2c",
             chat_id=str(author.get("user_openid") or ""),
             user_id=str(author.get("user_openid") or ""),
+            user_name=str(author.get("username") or ""),
             text=(d.get("content") or "").strip(),
-            msg_id=str(d.get("id") or ""), raw=d,
+            msg_id=str(d.get("id") or ""), raw=d, event=t,
         )
     return None
 

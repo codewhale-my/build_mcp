@@ -23,6 +23,7 @@ import secrets
 import shutil
 import subprocess
 import time
+import random
 import re
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
@@ -742,6 +743,17 @@ GUEST_TONE = (
     "对方要求执行服务器操作或读写服务器文件时，冷冷回绝并说明没权限，绝不放行、绝不假装完成。"
 )
 
+# 群聊插话专用语气：**覆盖** OWNER/GUEST_TONE（插话是「主动整活」而非回答问题）。
+# 长度卡死在两句 / 40 字：插话的输出 token 才是真花钱的地方，写长了既贵又不好笑。
+CHIME_TONE = (
+    "\n\n[语气·群聊插话] 你不是在回答提问，而是在群里【主动插一句嘴】。要求："
+    "抽象、搞笑、有梗，像群里最会整活的那个人；"
+    "最多两句、总长不超过 40 个字，能一句说完就别写两句；"
+    "不解释、不铺垫、不总结、不列点、不反问、不说教、不加免责声明，"
+    "不用敬语、不要 @ 任何人、不要复述别人说过的话。"
+    "宁可来一句怪话，也不要正确的废话。"
+)
+
 OWNER_ACK = "🤖 收到，主人。"
 GUEST_ACK = "🤖 等着。"
 
@@ -771,6 +783,37 @@ def qq_owner_ids() -> set:
     ids = set(read_owner_ids(text, os.environ.get("QQ_OWNER_OPENIDS", "")))
     _QQ_OWNERS_CACHE.update(mtime=mt, ids=ids)
     return ids
+
+
+_QQ_ALLMSG_CACHE: Dict[str, Any] = {"mtime": None, "cfg": {}}
+
+
+def qq_allmsg_cfg() -> dict:
+    """QQ 群「全量消息」插话配置（config.yaml 顶层 qq_allmsg）。
+
+    平台侧前置条件：群主在手机 QQ 里把「机器人可获取的群聊消息范围」设成
+    「获取群内全部消息」——**不开这个开关，平台一条不 @ 的群消息都不会推**，
+    代码这边再怎么改也没用（WebSocket 模式无需在开放平台后台改回调配置）。
+
+    按 config.yaml 的 mtime 缓存 → 调关键词/冷却不用重启，改完下一条消息即生效。
+    """
+    p = Path(__file__).resolve().parent.parent / "config.yaml"
+    try:
+        mt = p.stat().st_mtime if p.exists() else 0.0
+    except OSError:
+        mt = 0.0
+    if _QQ_ALLMSG_CACHE["mtime"] == mt:
+        return _QQ_ALLMSG_CACHE["cfg"]
+    cfg: Any = {}
+    try:
+        from build_mcp.common.config import load_config
+        cfg = (load_config("config.yaml") or {}).get("qq_allmsg") or {}
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("读取 qq_allmsg 配置失败（按只观察处理）：%s", e)
+    if not isinstance(cfg, dict):
+        cfg = {}
+    _QQ_ALLMSG_CACHE.update(mtime=mt, cfg=cfg)
+    return cfg
 
 
 def _qq_guest_user(sender: str) -> Optional[dict]:
@@ -804,7 +847,8 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     沙箱默认开启（QQ_SANDBOX=1）；机器人提审上线后可设 0 切正式网关。
     """
     try:
-        from build_mcp.channels.core import ChannelHub, SessionMap
+        from build_mcp.channels.core import (ChannelHub, SessionMap, allmsg_chance_hit,
+                                            allmsg_should_reply)
         from build_mcp.channels.qq_official import QQConfig, QQGateway, QQTransport
     except Exception as e:  # noqa: BLE001
         logger.warning("QQ 桥接模块不可用：%s", e)
@@ -844,25 +888,35 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     transport = QQTransport(cfg)
 
     async def _start_run(user_id, query, model="", source="",  # noqa: ANN001
-                         sender="", chat_id=""):
+                         sender="", chat_id="", event=""):
         """主人 → 管理员账号（可操作服务器）；其他人 → 非管理员账号（只能问答）。
 
         主人判定唯一依据 = 发送者 openid 在 `qq_owners.txt` 白名单里（QQ 不返回 QQ 号）。
         """
         owners = qq_owner_ids()
         is_owner = bool(sender) and sender in owners
+        is_chime = event == "GROUP_MESSAGE_CREATE"    # 群消息·全量模式 → 主动插话
         if is_owner:
             host = _host_user()
-            ident = ("\n\n[身份] 这条消息来自机器人主人（管理员账号），你具备服务器操作权限，"
-                     "可以执行命令、读写服务器文件。" + OWNER_TONE)
+            perm = ("\n\n[身份] 这条消息来自机器人主人（管理员账号），你具备服务器操作权限，"
+                    "可以执行命令、读写服务器文件。")
             who = "主人/管理员"
+            tone = OWNER_TONE
         else:
             host = _qq_guest_user(sender)
-            ident = ("\n\n[身份] 这条消息来自普通用户（非主人），你【没有】服务器操作权限："
-                     "只能回答问题、做信息查询，不能执行服务器命令、不能读写服务器文件。"
-                     "被要求做这类事时直接说明没有权限，不要变通、不要假装完成。"
-                     + GUEST_TONE)
+            perm = ("\n\n[身份] 这条消息来自普通用户（非主人），你【没有】服务器操作权限："
+                    "只能回答问题、做信息查询，不能执行服务器命令、不能读写服务器文件。"
+                    "被要求做这类事时直接说明没有权限，不要变通、不要假装完成。")
             who = "普通用户（只读问答）"
+            tone = GUEST_TONE
+        if is_chime:
+            # 插话一律走抽象搞笑（压掉主人/访客语气），**权限边界照旧不动**。
+            tone = CHIME_TONE
+            who += "·群聊插话"
+            _m = str(qq_allmsg_cfg().get("model") or "").strip()
+            if _m:
+                model = _m
+        ident = perm + tone
         if not host:
             logger.warning("⚠️ IM 消息无法路由：sender=%s（主人=%s）", sender or "(无)", is_owner)
             raise RuntimeError("IM 宿主账号不可用（主人需管理员账号已注册 / 访客账号创建失败）")
@@ -872,11 +926,68 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         return await _spawn_run(host, query, model, extra_note=note + ident)
 
     def _ack_for(msg):                       # noqa: ANN001
-        """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。"""
+        """立刻回执也按身份分语气（主人 / 访客文案不同），避免客套话泄了气场。
+
+        群消息·全量模式下默认【不发回执】：那是我方主动插话，不是有人点名提问，
+        回一句"收到"既多余又白占一条回复额度（QQ 一条入站消息最多回 5 条）。
+        """
         try:
+            if getattr(msg, "event", "") == "GROUP_MESSAGE_CREATE":
+                if not qq_allmsg_cfg().get("ack"):
+                    return ""
             return OWNER_ACK if (msg.user_id and msg.user_id in qq_owner_ids()) else GUEST_ACK
         except Exception:                    # noqa: BLE001
             return GUEST_ACK
+
+    # ── 群消息·全量模式的闸门 ──────────────────────────────────────────────
+    # 群里每一条消息都会走到这里，所以全程只有本地判断（O(1)），绝不在这里调模型。
+    _recent: Dict[str, list] = {}        # 群 openid → 最近几条「昵称: 文本」
+    _last_speak: Dict[str, float] = {}   # 群 openid → 上次插话时间（冷却用）
+
+    def _prepare(msg):                   # noqa: ANN001
+        """返回 None = 这条不响应；返回字符串 = 用它当 query 起 run。"""
+        if getattr(msg, "event", "") != "GROUP_MESSAGE_CREATE":
+            return msg.text              # @ 消息 / 单聊：老行为，永远响应
+        cfg = qq_allmsg_cfg()
+        mode = str(cfg.get("mode") or "observe").strip().lower()
+        if mode == "off":
+            return None
+        who = msg.user_name or (msg.user_id or "")[:8]
+        buf = _recent.setdefault(msg.chat_id, [])
+        buf.append(f"{who}: {(msg.text or '').strip()}")
+        del buf[:-30]                    # 只留最近 30 条，内存里不无限涨
+        logger.info("📨 [qq/group-all] group=%s sender=%s(%s) text=%s",
+                    msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
+        if mode != "reply":
+            return None                  # observe：只记录，先把群 openid 拿到手
+        groups = [str(g).strip() for g in (cfg.get("groups") or []) if str(g).strip()]
+        if groups and msg.chat_id not in groups:
+            return None
+        owners = qq_owner_ids()
+        is_owner = bool(msg.user_id) and msg.user_id in owners
+        if not allmsg_should_reply(msg.text, rules=cfg.get("rules"),
+                                   keywords=cfg.get("keywords"), is_owner=is_owner):
+            return None
+        cd = float(cfg.get("cooldown") or 0)
+        now = time.time()
+        gap = now - _last_speak.get(msg.chat_id, 0.0)
+        if cd > 0 and gap < cd:
+            logger.info("🤐 [qq/group-all] 冷却中（还剩 %.0fs），本次不插话", cd - gap)
+            return None
+        chance = cfg.get("chance")
+        if not allmsg_chance_hit(0.1 if chance is None else chance, random.random()):
+            logger.info("🎲 [qq/group-all] 掷骰子没中（chance=%s），这次不插话", chance)
+            return None
+        _last_speak[msg.chat_id] = now
+        n = int(cfg.get("context_lines") or 0)
+        head = ""
+        if n > 0 and len(buf) > 1:
+            head = "[群里最近的对话]\n" + "\n".join(buf[:-1][-n:]) + "\n"
+        logger.info("🗣 [qq/group-all] 触发插话 group=%s sender=%s(%s) text=%s",
+                    msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
+        return (f"{head}[最新一条] {who}：{(msg.text or '').strip()}\n\n"
+                "以上是群里最近的聊天。最新那条没人 @ 你，是你自己决定插一句嘴："
+                "直接给出那一句话本身（≤40 字、抽象搞笑），不要复述上面的格式说明。")
 
     _im_model = im_model_key()
     logger.info("🧠 IM(QQ) 默认模型 key：%s", _im_model or "(未设置，跟随全局默认)")
@@ -884,7 +995,8 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     hub = ChannelHub(transport, _start_run, _im_fetch_run,
                      SessionMap(alloc_base=100000), model=_im_model,
                      progress="off", max_progress=0, max_replies=4,
-                     ack="🤖 收到，正在处理，稍等…", ack_fn=_ack_for)
+                     ack="🤖 收到，正在处理，稍等…", ack_fn=_ack_for,
+                     prepare_fn=_prepare)
 
     _seen: dict = {}
 

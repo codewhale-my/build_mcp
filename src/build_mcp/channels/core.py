@@ -36,6 +36,7 @@ class Inbound:
     user_name: str = ""
     text: str = ""
     msg_id: str = ""                # 平台消息 id（QQ 被动回复的锚点）
+    event: str = ""                 # 平台原始事件名（如 GROUP_MESSAGE_CREATE），取证/分流用
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -141,6 +142,65 @@ class RunStream:
 
 # ── 内核 ────────────────────────────────────────────────────────────────────
 
+# 疑问句特征词（"要不要插话"的 question 规则用）
+_QUESTION_WORDS = ("吗", "呢", "怎么", "为什么", "如何", "多少",
+                   "是不是", "能不能", "有没有", "啥", "咋")
+
+
+def allmsg_should_reply(text: str, *, rules=None, keywords=None,
+                        is_owner: bool = False) -> bool:
+    """群消息·全量模式：这一条要不要插话（纯函数，可离线测）。
+
+    rules = 规则名列表，**任一命中即插话**：
+      keyword   文本里出现任一关键词
+      owner     发送者是主人（openid 在白名单里）
+      question  疑问句（以 ? / ？ 结尾，或含「吗/呢/怎么/为什么/如何」等词）
+      any       任何消息都插（⚠️ 最吵、最烧钱，务必把 cooldown 设大）
+      off       永不插话
+
+    注意：这里只做「本地 O(1) 判断」，绝不调模型 —— 群里每一条消息都会走这里，
+    一旦在这里起模型调用，群里聊天量一大就会同时烧钱和吃内存。
+    """
+    rs = {str(r).strip().lower() for r in (rules or ["keyword"]) if str(r).strip()}
+    if not rs or "off" in rs:
+        return False
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "any" in rs:
+        return True
+    if "owner" in rs and is_owner:
+        return True
+    if "keyword" in rs:
+        low = t.lower()
+        for k in (keywords or []):
+            k = str(k).strip()
+            if k and k.lower() in low:
+                return True
+    if "question" in rs:
+        if t.endswith(("?", "？")) or any(w in t for w in _QUESTION_WORDS):
+            return True
+    return False
+
+
+def allmsg_chance_hit(chance: float, rnd: float) -> bool:
+    """概率闸门（纯函数，便于确定性测试）。
+
+    chance<=0 永不插话、>=1 必插；rnd 是 caller 传进来的 [0,1) 随机数。
+    单独抽出来是为了能离线断言「1/10 概率到底拦不拦得住」，
+    不然只能靠跑线上赌运气。
+    """
+    try:
+        ch = float(chance)
+    except (TypeError, ValueError):
+        return False
+    if ch <= 0:
+        return False
+    if ch >= 1:
+        return True
+    return rnd < ch
+
+
 class ChannelHub:
     """入站 → 起 run → 跟随事件 → 出站。"""
 
@@ -148,7 +208,8 @@ class ChannelHub:
                  sessions: Optional[SessionMap] = None, *,
                  model: str = "", progress: str = "brief", max_chunk: int = MAX_CHUNK,
                  max_progress: int = 1, max_replies: int = 5, ack: str = "",
-                 ack_fn=None):        # noqa: ANN001  可选 (Inbound) -> str
+                 ack_fn=None,         # noqa: ANN001  可选 (Inbound) -> str
+                 prepare_fn=None):    # noqa: ANN001  可选 (Inbound) -> Optional[str]
         self.transport = transport
         self.start_run = start_run
         self.stream = RunStream(fetch_run)
@@ -165,16 +226,37 @@ class ChannelHub:
         # 可选：(Inbound) -> str。按发送者身份定制回执文案（主人/访客语气不同）。
         # 传了它就用它的返回值取代固定文案；「占 1 条回复额度」的行为完全一致。
         self.ack_fn = ack_fn
+        # 可选：(Inbound) -> Optional[str]，起 run 之前的最后一道闸门。
+        #   None   = 这条入站不响应（只留一行日志）——群消息·全量模式就靠它筛，
+        #            否则群里每句闲聊都会起一次完整的 agent 循环（烧钱 + 吃内存）；
+        #   字符串 = 用这个字符串当 query（可用来给群消息补「最近的对话」上下文）。
+        # 不传 = 老行为：原文直接起 run。
+        self.prepare_fn = prepare_fn
 
     async def handle(self, msg: Inbound) -> str:
         """处理一条入站消息，返回 run_id（便于测试与日志关联）。"""
         text = (msg.text or "").strip()
         if not text:
             return ""
+        if self.prepare_fn is not None:
+            try:
+                prepared = self.prepare_fn(msg)
+            except Exception as e:        # noqa: BLE001  闸门自身出错不能把消息搞挂
+                logger.warning("⚠️ prepare_fn 调用失败，按原样放行：%s", e)
+                prepared = text
+            if prepared is None:
+                logger.info("🤐 未触发响应规则，已忽略 [%s/%s] event=%s sender=%s text=%s",
+                            msg.channel, msg.chat_type, msg.event or "-",
+                            msg.user_id, (msg.text or "")[:60])
+                return ""
+            prepared = str(prepared).strip()
+            if prepared:
+                text = prepared
         uid = self.sessions.resolve(msg.channel, msg.chat_id, msg.user_id)
         run_id = await self.start_run(user_id=uid, query=text, model=self.model,
                                       source=f"{msg.channel}:{msg.chat_type}",
-                                      sender=msg.user_id, chat_id=msg.chat_id)
+                                      sender=msg.user_id, chat_id=msg.chat_id,
+                                      event=msg.event)
         # 这里必须打【完整】发送者 id：主人白名单是按 openid 登记的，
         # 截断了就没法从日志里取证到底是哪个 openid 在说话。
         logger.info("📥 [%s/%s] sender=%s chat=%s → run=%s (user=%d)",
