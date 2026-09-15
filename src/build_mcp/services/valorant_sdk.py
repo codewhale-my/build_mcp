@@ -162,7 +162,7 @@ async def _riot_login(username: str, password: str) -> Dict[str, Any]:
                        headers={"Authorization": f"Bearer {access_token}"})
         ent = json.loads(raw)
         return {"access_token": access_token, "puuid": uinfo.get("sub"),
-                "entitlements_token": ent.get("entitlements_token"),
+                "entitlements_token": ent.get("entitlements_token") or ent.get("token") or "",
                 "game_name": uinfo.get("gameName", ""), "tag_line": uinfo.get("tagLine", "")}
 
     return await asyncio.get_event_loop().run_in_executor(None, _sync_flow)
@@ -191,7 +191,7 @@ async def daily_store(username: str, password: str, region: str = "ap") -> Dict[
 
     base_headers = {
         "Authorization": f"Bearer {token}",
-        "X-Riot-Entitlements-Token": ent,
+        "X-Riot-Entitlements-JWT": ent,
         "X-Riot-ClientVersion": client_version,
         "X-Riot-ClientPlatform": _CLIENT_PLATFORM,
     }
@@ -295,6 +295,25 @@ async def account_info(access_token: str) -> Dict[str, Any]:
     }
 
 
+async def _entitlements_token(access_token: str) -> str:
+    """取 entitlements JWT —— pd.*.a.pvp.net 的商店接口必须带 X-Riot-Entitlements-JWT，
+    缺了就是 403 MISSING_ENTITLEMENT。两个端点/键名都兼容（官方文档里混用过）。"""
+    for url in ("https://entitlements.auth.riotgames.com/api/token/v1",
+                "https://entitlements.auth.riotgames.com/api/token/entitlements"):
+        st, raw = await _http(url, method="POST",
+                              headers={"Authorization": f"Bearer {access_token}"})
+        if st != 200:
+            continue
+        try:
+            j = json.loads(raw)
+        except Exception:                             # noqa: BLE001
+            continue
+        ent = j.get("entitlements_token") or j.get("token") or ""
+        if ent:
+            return ent
+    return ""
+
+
 async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, Any]:
     """用已登录令牌查每日商店（不再需要密码，因此不触发人机验证）。"""
     region = (region or "ap").lower()
@@ -309,14 +328,9 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
     if not puuid:
         return {"error": "令牌里没有 puuid，请重新登录后再粘贴一次"}
 
-    st, raw = await _http("https://entitlements.auth.riotgames.com/api/token/entitlements",
-                          method="POST", headers={"Authorization": f"Bearer {access_token}"})
-    ent = ""
-    if st == 200:
-        try:
-            ent = json.loads(raw).get("entitlements_token", "")
-        except Exception:
-            ent = ""
+    ent = await _entitlements_token(access_token)
+    if not ent:
+        return {"error": "拿不到 entitlements 令牌（Riot 接口异常），请在群里再要一次绑定链接重新登录"}
 
     st, raw = await _http("https://valorant-api.com/v1/version")
     client_version = "release-13.05-shipping-11-5350494"
@@ -328,7 +342,7 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
 
     hdrs = {
         "Authorization": f"Bearer {access_token}",
-        "X-Riot-Entitlements-Token": ent,
+        "X-Riot-Entitlements-JWT": ent,
         "X-Riot-ClientVersion": client_version,
         "X-Riot-ClientPlatform": _CLIENT_PLATFORM,
     }
