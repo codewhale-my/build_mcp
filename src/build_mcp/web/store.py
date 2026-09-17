@@ -94,9 +94,14 @@ CREATE TABLE IF NOT EXISTS messages(
   text    TEXT NOT NULL,
   ts      REAL NOT NULL,
   model   TEXT NOT NULL DEFAULT '',
-  interrupted INTEGER NOT NULL DEFAULT 0   -- 1=这轮回答没生成完（断网/关页面），可继续
+  interrupted INTEGER NOT NULL DEFAULT 0,  -- 1=这轮回答没生成完（断网/关页面），可继续
+  -- 上下文隔离用：'' = web 客户端；'im:<chat_id>' = 某个 QQ 群/私聊会话。
+  -- 同一个账号（IM 宿主）会在多个群里说话，历史必须按会话分开，否则
+  -- 各群上下文互相污染（既答非所问，又把输入 token 顶到几万）。
+  scope   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(user_id, scope, id);
 
 -- 后台运行(run)：把生成任务从 HTTP 连接里摘出来，断网/关页面也继续跑；
 -- 过程事件(run_events)全部落库，用户回到页面能看到「它干了什么」。
@@ -148,11 +153,15 @@ CREATE TABLE IF NOT EXISTS im_summaries(
 
 -- IM 指令注入防御记账：谁试图给机器人植入指令（改口癖/系统攻击/JSON 劫持）。
 -- 第一次 = 警告；第二次起 = 封禁 banned_until 之前的所有消息（不回复不调模型）。
+-- 判定由大模型做（web/im_guard.py）；last_* 三列留证：凭什么警告/封了他。
 CREATE TABLE IF NOT EXISTS im_abuses(
   sender_id    TEXT PRIMARY KEY,
   warnings     INTEGER NOT NULL DEFAULT 0,
   banned_until REAL NOT NULL DEFAULT 0,
-  updated_at   REAL NOT NULL DEFAULT 0
+  updated_at   REAL NOT NULL DEFAULT 0,
+  last_text    TEXT NOT NULL DEFAULT '',
+  last_reason  TEXT NOT NULL DEFAULT '',
+  last_source  TEXT NOT NULL DEFAULT ''
 );
 
 """
@@ -166,6 +175,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "interrupted" not in cols:
         # interrupted=1：回答因断网/关页面未写完，前端据此在气泡下显示「继续」按钮
         conn.execute("ALTER TABLE messages ADD COLUMN interrupted INTEGER NOT NULL DEFAULT 0")
+    if "scope" not in cols:
+        # 上下文隔离（2026-09-17）：'' = web；'im:<chat_id>' = 某个 QQ 群/私聊。
+        conn.execute("ALTER TABLE messages ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+        # ★ 老数据的归属：以前 IM 所有群/私聊共用一个宿主账号的历史「大池子」，
+        #   无法拆分到具体某群 → 统一标成 im-legacy，让每个群从干净上下文开始
+        #   （旧记录仍留在库里可查，只是不再喂给模型，也不再撑大输入 token）。
+        conn.execute(
+            "UPDATE messages SET scope='im-legacy' WHERE scope='' AND user_id IN ("
+            "SELECT id FROM users WHERE username=? OR username LIKE 'qq\\_%' ESCAPE '\\')",
+            ("im_host",),
+        )
 
     ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
     if "last_seen_version" not in ucols:
@@ -173,6 +193,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "ws_mode" not in ucols:
         # local = 个人工作空间（默认）；server = 云服务器代码目录（仅管理员可选）
         conn.execute("ALTER TABLE users ADD COLUMN ws_mode TEXT NOT NULL DEFAULT 'local'")
+
+    acols = {r[1] for r in conn.execute("PRAGMA table_info(im_abuses)")}
+    for col in ("last_text", "last_reason", "last_source"):
+        # 注入判定改大模型后（2026-09-16）新增：留证「凭什么警告他」
+        if col not in acols:
+            conn.execute(f"ALTER TABLE im_abuses ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
     # Riot 绑定：老库没有 ssid 列 → 补上（ssid 用于长期免登录自动换令牌）
     rcols = {r[1] for r in conn.execute("PRAGMA table_info(riot_bindings)")}
@@ -382,14 +408,19 @@ def list_users() -> list[dict]:
 
 # ---------------- 消息 ----------------
 def add_message(user_id: int, role: str, text: str, model: str = "",
-                interrupted: int = 0) -> int:
-    """追加一条消息，返回新行 id。interrupted=1 表示这轮没答完（可继续）。"""
+                interrupted: int = 0, scope: str = "") -> int:
+    """追加一条消息，返回新行 id。interrupted=1 表示这轮没答完（可继续）。
+
+    scope 决定这条消息属于哪个上下文：'' = web 客户端；'im:<chat_id>' = 某个群/私聊。
+    """
     conn = _conn()
     try:
         with conn:
             cur = conn.execute(
-                "INSERT INTO messages(user_id,role,text,ts,model,interrupted) VALUES(?,?,?,?,?,?)",
-                (user_id, role, text, time.time(), model or "", 1 if interrupted else 0),
+                "INSERT INTO messages(user_id,role,text,ts,model,interrupted,scope) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (user_id, role, text, time.time(), model or "", 1 if interrupted else 0,
+                 str(scope or "")),
             )
             return int(cur.lastrowid)
     finally:
@@ -499,14 +530,18 @@ def history_window_info() -> dict:
 
 
 def recent_llm_messages(user_id: int, turns: int | None = None,
-                        mode: str | None = None) -> list[dict]:
-    """取作为 LLM 上下文的历史消息（默认分块累积窗口，见上方说明）。"""
+                        mode: str | None = None, scope: str = "") -> list[dict]:
+    """取作为 LLM 上下文的历史消息（默认分块累积窗口，见上方说明）。
+
+    scope 必须与写入时一致：'' = web 客户端；'im:<chat_id>' = 某个群/私聊。
+    同一账号会在多个 QQ 群里说话，不做这层隔离就会把各群上下文混成一锅。
+    """
     turns = _HISTORY_TURNS if turns is None else turns
     mode = _HISTORY_MODE if mode is None else mode
     conn = _conn()
     try:
         total = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE user_id=?", (user_id,)
+            "SELECT COUNT(*) FROM messages WHERE user_id=? AND scope=?", (user_id, str(scope or ""))
         ).fetchone()[0]
         offset, limit = _history_window(int(total or 0), turns, mode)
         if limit <= 0:
@@ -514,8 +549,9 @@ def recent_llm_messages(user_id: int, turns: int | None = None,
         rows = conn.execute(
             # 用 ASC + OFFSET：offset 即「跳过最老的多少条」，语义与 _history_window 一致。
             # （注意别用 DESC + OFFSET——那样 OFFSET 是从最新那头开始跳的，方向正好相反。）
-            "SELECT id,role,text FROM messages WHERE user_id=? ORDER BY id ASC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
+            "SELECT id,role,text FROM messages WHERE user_id=? AND scope=? "
+            "ORDER BY id ASC LIMIT ? OFFSET ?",
+            (user_id, str(scope or ""), limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -841,22 +877,31 @@ def get_im_abuse(sender_id: str) -> Optional[dict]:
         conn.close()
 
 
-def record_im_abuse(sender_id: str, ban_seconds: float = 0.0) -> dict:
-    """违规次数 +1（ban_seconds>0 时同时写入封禁截止时间），返回最新记录。"""
+def record_im_abuse(sender_id: str, ban_seconds: float = 0.0, *,
+                    text: str = "", reason: str = "", source: str = "") -> dict:
+    """违规次数 +1（ban_seconds>0 时同时写入封禁截止时间），返回最新记录。
+
+    text/reason/source 只用于留证：判定现在由大模型做（web/im_guard.py），
+    主人事后想知道「凭什么警告他」时，看一眼这三列就够了。
+    """
     sid = str(sender_id)
     ban_until = time.time() + float(ban_seconds) if ban_seconds > 0 else 0.0
     conn = _conn()
     try:
         with conn:
             conn.execute(
-                "INSERT INTO im_abuses(sender_id,warnings,banned_until,updated_at) "
-                "VALUES(?,1,?,?)"
+                "INSERT INTO im_abuses(sender_id,warnings,banned_until,updated_at,"
+                "last_text,last_reason,last_source) VALUES(?,1,?,?,?,?,?)"
                 " ON CONFLICT(sender_id) DO UPDATE SET"
                 " warnings=im_abuses.warnings+1,"
                 " banned_until=CASE WHEN ?>0 THEN excluded.banned_until"
                 " ELSE im_abuses.banned_until END,"
+                " last_text=excluded.last_text,"
+                " last_reason=excluded.last_reason,"
+                " last_source=excluded.last_source,"
                 " updated_at=excluded.updated_at",
-                (sid, ban_until, time.time(), ban_seconds),
+                (sid, ban_until, time.time(), str(text or "")[:300],
+                 str(reason or "")[:120], str(source or "")[:20], ban_seconds),
             )
         row = conn.execute("SELECT * FROM im_abuses WHERE sender_id=?", (sid,)).fetchone()
         return dict(row) if row else {}

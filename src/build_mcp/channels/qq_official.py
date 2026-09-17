@@ -38,6 +38,18 @@ from .core import Inbound, Outbound
 
 logger = logging.getLogger(__name__)
 
+# IM 取证日志（文件 handler 由 web/main.py 的 _init_im_event_log 挂上）：
+# 主日志在终端渲染时会把长行裁掉正文，未处理事件/出站结果必须另存一份才追得动。
+_IM_EV = logging.getLogger("build_mcp.im_events")
+
+
+def _ev(fmt: str, *args) -> None:
+    """写一行 IM 取证日志（绝不抛异常）。"""
+    try:
+        _IM_EV.info(fmt, *args)
+    except Exception:                     # noqa: BLE001
+        pass
+
 INTENT_GROUP_AND_C2C = 1 << 25
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 API_BASE = "https://api.sgroup.qq.com"
@@ -270,9 +282,18 @@ class QQGateway:
                 logger.info("机器人%s群：%s",
                             "被拉入" if t == "GROUP_ADD_ROBOT" else "被移出",
                             d.get("group_openid"))
+                _ev("GROUP %s openid=%s", "ADD" if t == "GROUP_ADD_ROBOT" else "DEL",
+                    d.get("group_openid"))
             ib = parse_dispatch(t, d)
             if ib:
                 await self.on_inbound(ib)
+            elif t != "READY":
+                # ⚠️ 未处理的事件类型【不能静默丢掉】：以前这里是默默 return None，
+                #   万一平台推的是频道事件（AT_MESSAGE_CREATE）或以后新增的事件名，
+                #   表现就是「@ 了完全没反应」且日志里一点线索都没有。
+                #   所以原样记一行到 IM 取证日志（log/im_events.log）。
+                _ev("EVENT-unhandled t=%s d=%s", t,
+                    json.dumps(d, ensure_ascii=False, default=str)[:300])
         elif op == 7:
             raise Reconnect("服务端要求重连(op=7)——通常是同 AppID 的另一条连接顶号")
         elif op == 9:
