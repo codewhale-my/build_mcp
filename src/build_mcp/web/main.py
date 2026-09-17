@@ -1200,8 +1200,8 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
                            "并说明这次建议按页面提示粘贴 ssid，之后就长期不用再登了。"))
             url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
             return ("\n\n[拳头账号] 该用户【还没绑定】Riot 账号。他问每日商店/皮肤时，"
-                    "把下面这条链接原样发给他（30 分钟内有效，用手机浏览器或 QQ 内置浏览器打开）。"
-                    "按页面提示登录一次并粘贴 ssid 即可长期免登录，绑好后你就能直接查到他的商店：\n" + url)
+                    "把下面这条链接原样发给他（30 分钟内有效，手机浏览器或 QQ 内置浏览器打开即可）。"
+                    "页面会引导他完成 curl 绑定，绑好后你就能直接查到他的商店：\n" + url)
         except Exception as e:               # noqa: BLE001  绑定信息拿不到不能影响对话
             logger.warning("⚠️ 生成拳头绑定提示失败：%s", e)
             return ""
