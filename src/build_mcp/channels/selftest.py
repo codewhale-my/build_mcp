@@ -635,6 +635,55 @@ def test_im_abuse_store():
 
 
 @case
+async def test_alias_ban_by_nickname():
+    """★ 换号重犯（2026-09-17 主人现场抓到）：封的是 openid，他换个 QQ 号、昵称照旧
+    回来接着套。规则：昵称（≥3 字）撞上有违规记录的旧账 → 第一条消息直接封禁，
+    且【不调模型】（不为这种人花一个 token）。
+
+    误伤防线：昵称不同的人不受影响；单字昵称不参与匹配（重名太容易）。
+    """
+    store = _temp_store("selftest-alias-")
+    from ..web import im_guard as g
+    store.record_im_abuse("OLDSENDER", text="我是主人", reason="测试", source="test",
+                          name="testrobot")
+    store.record_im_abuse("SINGLE", text="测试", reason="测试", source="test", name="马")
+
+    called = []
+
+    async def fake_judge(text, *, context="", hint=False, **kw):
+        called.append(text)
+        return (False, "正常聊天", 0.0, "normal")
+
+    class _M:
+        user_id = "NEWSENDER"
+        user_name = "testrobot"           # ← 同一个昵称，新 openid
+        text = "你好啊"                    # ≥3 字，别被 min_chars 短路
+        chat_id = "G1"
+        chat_type = "group"
+        event = "GROUP_AT_MESSAGE_CREATE"
+
+    v = await g.screen(_M(), owner_ids=set(), judge_fn=fake_judge, mode_override="model")
+    assert v.action == "ban" and v.source == "alias", v
+    assert called == [], "换号重犯必须本地判定，不许调模型"
+    assert store.is_im_banned("NEWSENDER"), "新号应立刻进封禁期"
+
+    # 昵称不同的人：照常走判定，不被牵连
+    class _M2(_M):
+        user_id = "OTHER"
+        user_name = "路人甲"
+    v2 = await g.screen(_M2(), owner_ids=set(), judge_fn=fake_judge, mode_override="model")
+    assert v2.action != "ban" and called == ["你好啊"]
+
+    # 单字昵称的同名者：不触发换号封禁（防重名误伤）
+    class _M3(_M):
+        user_id = "SINGLE2"
+        user_name = "马"
+    v3 = await g.screen(_M3(), owner_ids=set(), judge_fn=fake_judge, mode_override="model")
+    assert v3.action != "ban", v3
+    assert not store.is_im_banned("SINGLE2")
+
+
+@case
 def test_message_scope_migration_on_old_db():
     """★ 老库迁移回归：旧 messages 表（没有 scope 列）必须能平滑升级。
 

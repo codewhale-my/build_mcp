@@ -164,7 +164,8 @@ CREATE TABLE IF NOT EXISTS im_abuses(
   updated_at   REAL NOT NULL DEFAULT 0,
   last_text    TEXT NOT NULL DEFAULT '',
   last_reason  TEXT NOT NULL DEFAULT '',
-  last_source  TEXT NOT NULL DEFAULT ''
+  last_source  TEXT NOT NULL DEFAULT '',
+  last_name    TEXT NOT NULL DEFAULT ''   -- 群昵称：封了 openid 他换号，靠昵称认旧账
 );
 
 """
@@ -204,6 +205,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # 注入判定改大模型后（2026-09-16）新增：留证「凭什么警告他」
         if col not in acols:
             conn.execute(f"ALTER TABLE im_abuses ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "last_name" not in acols:
+        # 2026-09-17：封了 openid 他就换号重来 → 记下昵称，同名旧账可以继承
+        conn.execute("ALTER TABLE im_abuses ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
 
     # Riot 绑定：老库没有 ssid 列 → 补上（ssid 用于长期免登录自动换令牌）
     rcols = {r[1] for r in conn.execute("PRAGMA table_info(riot_bindings)")}
@@ -883,11 +887,13 @@ def get_im_abuse(sender_id: str) -> Optional[dict]:
 
 
 def record_im_abuse(sender_id: str, ban_seconds: float = 0.0, *,
-                    text: str = "", reason: str = "", source: str = "") -> dict:
+                    text: str = "", reason: str = "", source: str = "",
+                    name: str = "") -> dict:
     """违规次数 +1（ban_seconds>0 时同时写入封禁截止时间），返回最新记录。
 
     text/reason/source 只用于留证：判定现在由大模型做（web/im_guard.py），
     主人事后想知道「凭什么警告他」时，看一眼这三列就够了。
+    name=发送者群昵称：封了 openid 他还能换号，昵称是用来认「同一个人的旧账」的。
     """
     sid = str(sender_id)
     ban_until = time.time() + float(ban_seconds) if ban_seconds > 0 else 0.0
@@ -896,7 +902,7 @@ def record_im_abuse(sender_id: str, ban_seconds: float = 0.0, *,
         with conn:
             conn.execute(
                 "INSERT INTO im_abuses(sender_id,warnings,banned_until,updated_at,"
-                "last_text,last_reason,last_source) VALUES(?,1,?,?,?,?,?)"
+                "last_text,last_reason,last_source,last_name) VALUES(?,1,?,?,?,?,?,?)"
                 " ON CONFLICT(sender_id) DO UPDATE SET"
                 " warnings=im_abuses.warnings+1,"
                 " banned_until=CASE WHEN ?>0 THEN excluded.banned_until"
@@ -904,12 +910,37 @@ def record_im_abuse(sender_id: str, ban_seconds: float = 0.0, *,
                 " last_text=excluded.last_text,"
                 " last_reason=excluded.last_reason,"
                 " last_source=excluded.last_source,"
+                " last_name=CASE WHEN excluded.last_name<>'' THEN excluded.last_name"
+                " ELSE im_abuses.last_name END,"
                 " updated_at=excluded.updated_at",
                 (sid, ban_until, time.time(), str(text or "")[:300],
-                 str(reason or "")[:120], str(source or "")[:20], ban_seconds),
+                 str(reason or "")[:120], str(source or "")[:20],
+                 str(name or "").strip()[:40], ban_seconds),
             )
         row = conn.execute("SELECT * FROM im_abuses WHERE sender_id=?", (sid,)).fetchone()
         return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def get_im_abuse_by_name(name: str, *, within_days: float = 30,
+                         exclude_id: str = "") -> Optional[dict]:
+    """按**群昵称**找旧的违规记录（换号重犯用）。
+
+    只认最近 within_days 天内有活动的记录，且排除自己当前这个 openid；
+    昵称太短（<3 字符）的调用方不该来查（重名太容易）。
+    """
+    n = (name or "").strip()
+    if not n:
+        return None
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM im_abuses WHERE last_name=? AND sender_id<>? AND updated_at>=?"
+            " ORDER BY updated_at DESC LIMIT 1",
+            (n, str(exclude_id or ""), time.time() - float(within_days) * 86400),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 

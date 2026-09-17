@@ -523,6 +523,23 @@ async def screen(msg, *, context: str = "", owner_ids=None, judge_fn=None,
     if store.is_im_banned(uid):
         return Verdict("banned", source="ban")
 
+    # ★ 换号重犯（2026-09-17 主人现场抓到）：封的是 openid，他换个 QQ 号改个头像
+    #   就能接着套。昵称还叫同一个 → 按昵称继承旧账，直接封（不调模型、不花 token）。
+    _nick = str(getattr(msg, "user_name", "") or "").strip()
+    if len(_nick) >= 3 and _as_bool(opt("alias_ban")) is not False:
+        try:
+            _prev = store.get_im_abuse_by_name(_nick, exclude_id=uid)
+        except Exception as e:                # noqa: BLE001  查账失败不能把消息搞挂
+            logger.warning("⚠️ [im-guard] 同名旧账查询失败（本次跳过）：%s", str(e)[:120])
+            _prev = None
+        if _prev and int(_prev.get("warnings") or 0) >= 1:
+            reason = (f"换号重犯：昵称「{_nick}」已有 {int(_prev['warnings'])} 次违规记录"
+                      f"（原号 {str(_prev.get('sender_id') or '')[:8]}…）")
+            store.record_im_abuse(uid, ban_seconds=ban_seconds(), text=text,
+                                  reason=reason, source="alias", name=_nick)
+            logger.warning("⛔ [im-guard] 换号重犯 → 直接封禁 sender=%s nick=%s", uid, _nick)
+            return Verdict("ban", ABUSE_HIGH_BAN_TEXT, reason, "alias", RISK_HIGH)
+
     md = mode_override or mode()
     hint = injection_hit(text)
     # 伪造「[消息来源]/[身份]/来自主人（拥有权限）」这类框架标记 → 本地免费识别为高危
@@ -581,13 +598,14 @@ async def screen(msg, *, context: str = "", owner_ids=None, judge_fn=None,
     warn_no = int((store.get_im_abuse(uid) or {}).get("warnings") or 0) + 1
     if warn_no >= 2 or first_strike_ban:
         secs = ban_seconds()
-        store.record_im_abuse(uid, ban_seconds=secs, text=text, reason=reason, source=source)
+        store.record_im_abuse(uid, ban_seconds=secs, text=text, reason=reason,
+                              source=source, name=_nick)
         logger.warning("⛔ [im-guard] %s%s → 封禁 %s 秒 sender=%s text=%s",
                        "高危首犯即封：" if first_strike_ban and warn_no < 2 else "再次植入指令",
                        f"（{reason}）", secs, uid, text[:60])
         return Verdict("ban", ABUSE_HIGH_BAN_TEXT if high else ABUSE_BAN_TEXT,
                        reason, source, risk)
-    store.record_im_abuse(uid, text=text, reason=reason, source=source)
+    store.record_im_abuse(uid, text=text, reason=reason, source=source, name=_nick)
     logger.warning("🚨 [im-guard] 首次植入指令（%s判定：%s%s）→ 警告一次 sender=%s text=%s",
                    source, "高危·" if high else "", reason, uid, text[:60])
     return Verdict("warn", _warn_text(reason, risk), reason, source, risk)
