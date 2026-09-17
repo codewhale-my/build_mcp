@@ -101,7 +101,10 @@ CREATE TABLE IF NOT EXISTS messages(
   scope   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id);
-CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(user_id, scope, id);
+-- ⚠️ scope 的索引【不能】写在这里：老库的表已存在，CREATE TABLE IF NOT EXISTS 是空操作，
+--    于是建索引时 scope 列还不存在 → executescript 直接报 no such column: scope，
+--    而且 _migrate() 的 ALTER 还没轮到执行，服务就起不来了（2026-09-17 实际踩过）。
+--    所以它放在 _migrate() 里、ALTER 之后建。见 _migrate()。
 
 -- 后台运行(run)：把生成任务从 HTTP 连接里摘出来，断网/关页面也继续跑；
 -- 过程事件(run_events)全部落库，用户回到页面能看到「它干了什么」。
@@ -186,6 +189,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "SELECT id FROM users WHERE username=? OR username LIKE 'qq\\_%' ESCAPE '\\')",
             ("im_host",),
         )
+    # 索引必须在「列确实存在」之后再建（老库补列走上面的 ALTER；新库建表时就带了）。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_scope ON messages(user_id, scope, id)")
 
     ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
     if "last_seen_version" not in ucols:

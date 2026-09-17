@@ -578,6 +578,65 @@ def test_im_abuse_store():
 
 
 @case
+def test_message_scope_migration_on_old_db():
+    """★ 老库迁移回归：旧 messages 表（没有 scope 列）必须能平滑升级。
+
+    为什么专门测这个：scope 的索引一开始写在 SCHEMA 里，而老库的建表语句是
+    `CREATE TABLE IF NOT EXISTS`（空操作）→ executescript 建索引时列还不存在，
+    直接 `no such column: scope`，_migrate() 都轮不到执行，**服务整个起不来**
+    （2026-09-17 部署时真踩过，服务崩溃重启 20+ 次）。
+    """
+    import os
+    import sqlite3
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="selftest-olddb-")
+    old = os.path.join(tmp, "app.db")
+    c = sqlite3.connect(old)
+    c.executescript(
+        "CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,"
+        " pass_salt TEXT NOT NULL DEFAULT '', pass_hash TEXT NOT NULL DEFAULT '',"
+        " created_at REAL NOT NULL DEFAULT 0);"
+        # 故意用【旧结构】：没有 scope 列
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,"
+        " role TEXT NOT NULL, text TEXT NOT NULL, ts REAL NOT NULL,"
+        " model TEXT NOT NULL DEFAULT '', interrupted INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE im_abuses(sender_id TEXT PRIMARY KEY, warnings INTEGER NOT NULL DEFAULT 0,"
+        " banned_until REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0);"
+    )
+    c.execute("INSERT INTO users(id,username) VALUES(1,'im_host')")
+    c.execute("INSERT INTO users(id,username) VALUES(2,'qq_ABC')")
+    c.execute("INSERT INTO users(id,username) VALUES(3,'yanghj')")
+    for uid, txt in ((1, "旧池子-群A"), (1, "旧池子-群B"), (3, "网页的老消息")):
+        c.execute("INSERT INTO messages(user_id,role,text,ts) VALUES(?,?,?,0)", (uid, "user", txt))
+    c.commit()
+    c.close()
+
+    os.environ["MCP_WEB_DATA_DIR"] = tmp
+    os.environ["MCP_WEB_FS_ROOT"] = os.path.join(tmp, "fs")
+    import importlib
+    from ..web import store
+    importlib.reload(store)
+    assert str(store.DB_PATH).endswith("app.db")
+    store.init_db()                     # ← 这一步以前会崩
+
+    conn = store._conn()
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        assert "scope" in cols, "迁移后必须有 scope 列"
+        idx = {r[1] for r in conn.execute("PRAGMA index_list(messages)")}
+        assert "idx_messages_scope" in idx, "scope 索引要建上（列存在之后建）"
+        rows = {r[0]: r[1] for r in conn.execute("SELECT text,scope FROM messages")}
+        # old IM 池子 → im-legacy（不再喂给任何群）；web 的老消息保持 ''
+        assert rows["旧池子-群A"] == "im-legacy" and rows["旧池子-群B"] == "im-legacy"
+        assert rows["网页的老消息"] == ""
+        # 幂等：再跑一次迁移不能报错、也不能改坏数据
+        store.init_db()
+    finally:
+        conn.close()
+
+
+@case
 def test_im_history_scope_isolated():
     """★ 每个 IM 会话的上下文互不可见（主人 2026-09-17 要求）。
 
