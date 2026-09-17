@@ -44,7 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from openai import AsyncOpenAI
 
-from build_mcp.channels.core import fabricated_meta_hit, injection_hit
+from build_mcp.channels.core import fabricated_meta_hit, identity_claim_hit, injection_hit
 from build_mcp.client.conversation import (
     LLM_API_KEY,
     LLM_BASE_URL,
@@ -540,6 +540,12 @@ async def screen(msg, *, context: str = "", owner_ids=None, judge_fn=None,
     else:
         got = None
         try:
+            # 惯犯从严重（2026-09-17 漏洞：警告过一次的人换说法再犯，判官单看
+            # 这一句会摇摆）——把过往记录递给判官当上下文。
+            _prior = int((store.get_im_abuse(uid) or {}).get("warnings") or 0)
+            if _prior > 0:
+                context = ((context + "\n") if context else "") + \
+                    f"[该发送者此前已有 {_prior} 次植入警告记录，请结合记录从严判断]"
             got = await (judge_fn or judge)(text, context=context, hint=hint)
         except Exception as e:                # noqa: BLE001  判定器坏掉不能把消息搞挂
             logger.warning("⚠️ [im-guard] 判定器异常（退回本地正则）：%s", str(e)[:160])
@@ -558,6 +564,10 @@ async def screen(msg, *, context: str = "", owner_ids=None, judge_fn=None,
     if not hit and fabricated_meta_hit(text):
         hit, risk = True, RISK_HIGH
         reason, source = "伪造系统元信息头（本地软件层判定）", "meta"
+
+    if not hit and identity_claim_hit(text, str(getattr(msg, "user_name", "") or "")):
+        hit, risk = True, RISK_HIGH
+        reason, source = "冒充主人/管理员等权限身份（本地判定）", "identity"
 
     if not hit:
         return Verdict("ok", reason=reason, source=source, risk=risk)
