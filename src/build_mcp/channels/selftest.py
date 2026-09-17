@@ -18,8 +18,8 @@ from typing import Any, Dict, List
 import httpx
 
 from .core import (ChannelHub, Inbound, Outbound, SessionMap,
-                   allmsg_chance_hit, allmsg_should_reply, injection_hit,
-                   split_text)
+                   allmsg_chance_hit, allmsg_should_reply, at_mention_target,
+                   at_other_member, injection_hit, split_text)
 from .qq_official import (API_BASE, SANDBOX_API_BASE, TOKEN_URL, QQConfig,
                           QQTransport, parse_dispatch, read_owner_ids)
 from .wecom import WeComWebhookTransport
@@ -404,6 +404,34 @@ def test_allmsg_chance_hit():
     # 1000 次 1/10 抽样应落在 6%~14%（防"概率写反"这类低级错）
     hits = sum(1 for i in range(1000) if allmsg_chance_hit(0.1, (i % 100) / 100))
     assert 60 <= hits <= 140, hits
+
+
+@case
+def test_at_mention_target_and_other_member():
+    """★ 全量通道的 @ 归属判定（主人 2026-09-17 抓的现行：@ 别人也抢答）。
+
+    @ 机器人的消息和 @ 其他群友的消息都带 <@openid> 前缀从全量通道进来，
+    必须区分：@ 机器人=必回；@ 别人=他们俩的对话，绝不插嘴。
+    """
+    BOT = "6CFC5B1B23AB6281899B5CCD69F03AF9"
+    NN = "CED2A8C529C85F459EF028F053D80AC9"
+    # —— at_mention_target ——
+    assert at_mention_target(f"<@{BOT}> 5070涨价幅度是多少") == BOT
+    assert at_mention_target(f"<@!{BOT}> 小写也认") == BOT        # <@!> 变体
+    assert at_mention_target(f"<@{BOT.lower()}> openid 小写也认") == BOT
+    assert at_mention_target("普通闲聊，没人被@") == ""
+    assert at_mention_target("") == ""
+    assert at_mention_target("<@SHORT> 太短不算") == ""
+    # —— at_other_member：配置了 bot_openid 就以它为准 ——
+    assert at_other_member(BOT, BOT, set()) is False              # @ 机器人 → 必回
+    assert at_other_member(NN, BOT, set()) is True                # @ 别人 → 不抢答
+    assert at_other_member(NN.lower(), BOT, set()) is True        # 大小写不敏感
+    # —— 没配置 bot_openid：靠「见过的发送者」兜底（机器人永不发言）——
+    assert at_other_member(NN, "", {NN, "AAA"}) is True           # 目标是已知成员
+    assert at_other_member(BOT, "", {NN, "AAA"}) is False         # 没见过 → 当机器人
+    assert at_other_member("", "", set()) is False                # 空 target 不误判
+    # —— 都判不出来：维持老行为（当 @ 的是机器人）——
+    assert at_other_member(BOT, "", set()) is False
 
 
 @case

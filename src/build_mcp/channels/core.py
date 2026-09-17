@@ -167,6 +167,33 @@ _QUESTION_WORDS = ("吗", "呢", "怎么", "为什么", "如何", "多少",
                    "是不是", "能不能", "有没有", "啥", "咋")
 
 
+def at_mention_target(text: str) -> str:
+    """消息开头 <@XXXX> 里被 @ 的 openid（大写）；不是 @ 消息则返回空串。
+
+    群主开了「获取群内全部消息」后，@ 机器人和 @ 其他群友的消息都从全量通道
+    进来，文本都以 <@openid> 开头 —— 必须靠 openid 区分到底 @ 的是谁。
+    """
+    m = re.match(r"^\s*<@!?([0-9A-Fa-f]{8,})>", text or "")
+    return m.group(1).upper() if m else ""
+
+
+def at_other_member(target: str, bot_openid: str, seen_members) -> bool:
+    """<@target> 的 target 是不是「别的群友」（True = 别人的对话，不抢答）。
+
+    bot_openid 配置了就以它为准（target != 机器人 = 别人）；
+    没配置时用 seen_members（本群历史上真实发过言的 openid 集合 —— 机器人
+    永不发言，target 在集合里就一定是普通成员）兜底；
+    都判不出来返回 False，维持老行为（当 @ 的是机器人，必回）。
+    """
+    t = (target or "").strip().upper()
+    if not t:
+        return False
+    b = (bot_openid or "").strip().upper()
+    if b:
+        return t != b
+    return t in {str(x).strip().upper() for x in (seen_members or set()) if x}
+
+
 def allmsg_should_reply(text: str, *, rules=None, keywords=None,
                         is_owner: bool = False) -> bool:
     """群消息·全量模式：这一条要不要插话（纯函数，可离线测）。

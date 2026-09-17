@@ -1077,6 +1077,7 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     try:
         from build_mcp.channels.core import (ChannelHub, Outbound, SessionMap,
                                              allmsg_chance_hit, allmsg_should_reply,
+                                             at_mention_target, at_other_member,
                                              injection_hit)
         from build_mcp.channels.qq_official import QQConfig, QQGateway, QQTransport
     except Exception as e:  # noqa: BLE001
@@ -1217,6 +1218,9 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
     # 群里每一条消息都会走到这里，所以全程只有本地判断（O(1)），绝不在这里调模型。
     _recent: Dict[str, list] = {}        # 群 openid → 最近几条「昵称: 文本」
     _last_speak: Dict[str, float] = {}   # 群 openid → 上次插话时间（冷却用）
+    _chatters: Dict[str, set] = {}       # 群 openid → 见过的发送者 openid 集合。
+    # 机器人自己只会收消息不会发消息，所以这个集合里全是真人成员 —— 用来兜底
+    # 判断「<@X>」@ 的是别的群友（配置里写 bot_openid 后其实用不上，双保险）。
 
     def _guard_reply(msg, text):          # noqa: ANN001
         """不起 run 直接回一条（注入警告/封禁通知专用）。失败只记日志。"""
@@ -1303,11 +1307,19 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
         logger.info("📨 [qq/group-all] group=%s sender=%s(%s) text=%s",
                     msg.chat_id, msg.user_id, msg.user_name, (msg.text or "")[:60])
         # ⚠️ 群主开了「获取群内全部消息」后，@ 机器人的消息【不再】单独走
-        # GROUP_AT_MESSAGE_CREATE，而是带着 <@botid> 前缀从这条全量通道进来。
-        # @ 必须 100% 回：剥掉 @ 标签、把事件改回 AT（下游身份/语气/去重照旧），
-        # 绕过插话的规则/概率/冷却三道闸门。
+        # GROUP_AT_MESSAGE_CREATE，而是带着 <@botid> 前缀从这条全量通道进来；
+        # 但 @ **其他群友**的消息同样带 <@openid> 前缀 —— 不区分就会把别人
+        # 之间的对话当成在问自己，抢答尴尬（主人 2026-09-17 抓到的现行）。
         _t = (msg.text or "").strip()
-        if _t.startswith("<@"):
+        _at = at_mention_target(_t)
+        if _at:
+            _members = _chatters.setdefault(msg.chat_id, set())
+            _members.add(msg.user_id or "")
+            if at_other_member(_at, (qq_allmsg_cfg() or {}).get("bot_openid"),
+                               _members):
+                im_event(f"DROP chime-at-other chat={msg.chat_id} target={_at} "
+                         f"sender={msg.user_id} text={_t[:60]!r}")
+                return None                      # @ 的是别人：他们俩的对话，不抢答
             _cleaned = re.sub(r"<@[0-9A-Fa-f]{8,}>\s*", "", _t).strip()
             if not _cleaned:
                 return None                      # 纯 @ 无内容，没得回答
