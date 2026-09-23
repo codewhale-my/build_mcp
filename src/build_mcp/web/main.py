@@ -1216,20 +1216,31 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             key = f"qq:{host['id']}"
             if b.get("access_token") or b.get("ssid"):
                 who = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#") or "已绑定账号"
-                long_term = _riot_persistent(b)
-                life = ("长期有效（已存长期登录凭证，过期会自动续期，不用再登）" if long_term
-                        else "只有 1 小时有效，随时可能过期")
-                return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}，"
-                        f"授权状态：{life}）。"
-                        f"他问每日商店时直接调用 valorant_daily_store(bind_key=\"{key}\")，"
-                        "不要向他要账号密码，也不要说没有权限。"
-                        + ("" if long_term else
-                           "如果查询报「登录已失效」，把绑定链接再发他一条，"
-                           "并说明这次要在页面上点「一键登录」重新授权一次，之后就长期不用再登了。"))
+                if _riot_persistent(b):
+                    # 长期凭证到手（DPoP 的 refresh_token+私钥，或老的 ssid cookie）→ 不用再登
+                    how = ("DPoP 长期凭证（refresh_token + 本机私钥）"
+                           if (b.get("dpop_jwk") and b.get("refresh_token"))
+                           else "长期登录 Cookie（ssid）")
+                    return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}，"
+                            f"授权状态：长期有效 —— 已存{how}，过期会自动续期，不用再登）。"
+                            f"他问每日商店时直接调用 valorant_daily_store(bind_key=\"{key}\")，"
+                            "不要向他要账号密码，也不要说没有权限。")
+                # 只有 1 小时令牌（没存长期凭证）：预生成他的专属升级链接。
+                # 以前只说「把绑定链接再发他一条」，但模型手上没有链接，用户只能重新开口要 ——
+                # 现在程序在这里直接把可用链接准备好（主人 2026-09-19：程序去找可用的链接来使用）。
+                up_url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
+                return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}），"
+                        f"但只存了 1 小时的临时令牌，随时会过期。"
+                        f"他问每日商店时先试 valorant_daily_store(bind_key=\"{key}\")；"
+                        "如果查询报「登录已失效」，【不用让他再来找你要链接】，直接把下面这条"
+                        "他的专属升级链接原样发给他（30 分钟内有效），让他按页面引导点「① 一键登录」"
+                        "登录一次，页面会自动识别（监听剪贴板，不用粘贴），之后就长期免登录了：\n"
+                        + up_url)
             url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
             return ("\n\n[拳头账号] 该用户【还没绑定】Riot 账号。他问每日商店/皮肤时，"
                     "把下面这条链接原样发给他（30 分钟内有效）。"
-                    "页面会引导他点「一键登录」：打开拳头官方登录页登一次，之后长期免登录。"
+                    "页面会引导他点「① 一键登录」：打开拳头官方登录页登一次，"
+                    "回来页面会自动识别并绑定（监听剪贴板，不用粘贴、不用点按钮），之后长期免登录。"
                     "提醒他用系统浏览器（Chrome/Edge/Safari）打开，QQ 内置浏览器可能看不到地址栏。"
                     "绑好后你就能直接查到他的商店：\n" + url)
         except Exception as e:               # noqa: BLE001  绑定信息拿不到不能影响对话
