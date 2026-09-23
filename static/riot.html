@@ -300,7 +300,9 @@ $('openBtn').onclick=function(){
     dpopArmed=true;
     if(w){ w.location.href=d.login_url; } else { window.open(d.login_url,'_blank'); }
     say('msgQ','✅ 已打开拳头登录页。登录后会跳到一个打不开的 localhost 页面 —— 那是正常的，'+
-               '把地址栏那条完整地址复制下来，回到本页会自动绑定。','ok');
+               '把地址栏那条完整地址复制下来，回到本页会自动绑定。'+
+               '（若它没显示登录页、直接跳到了 localhost：说明你之前的拳头登录还没过期，'+
+               '是复用了会话，授权码已经拿到了 —— 一样复制那条 localhost 地址回来即可。）','ok');
     startPoll();
   }).catch(function(e){
     if(w){ try{w.close()}catch(_){} }
@@ -326,7 +328,8 @@ $('upQuickBtn').onclick=function(){
     dpopArmed=true;
     if(w){ w.location.href=d.login_url; } else { window.open(d.login_url,'_blank'); }
     say('msg2','✅ 已打开拳头登录页：登录 → 那个打不开的页面 → 复制地址栏整条地址 → '
-             +'回到本页会自动绑定（不用点任何按钮）。','ok');
+             +'回到本页会自动绑定（不用点任何按钮）。'
+             +'若直接跳到了 localhost 没看到登录页，是复用了之前的登录会话，属正常，照常复制地址即可。','ok');
     startPoll();
   }).catch(function(e){
     if(w){ try{w.close()}catch(_){} }

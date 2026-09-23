@@ -509,16 +509,28 @@ async def _entitlements_token(access_token: str) -> str:
     return ""
 
 
-async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, Any]:
-    """用已登录令牌查每日商店（不再需要密码，因此不触发人机验证）。"""
+async def store_with_token(access_token: str, region: str = "ap",
+                           account: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """用已登录令牌查每日商店（不再需要密码，因此不触发人机验证）。
+
+    `account`：dpop 模式由调用方递进来的 {"puuid","game_name","tag_line"}（绑定行里就有）。
+    2026-09-23 实测矩阵：
+      · auth.riotgames.com/userinfo —— DPoP 令牌【必须】带 DPoP 证明，裸 Bearer 401
+        `Missing required DPoP proof`（旧实现的死因就在这一步）；
+      · entitlements / pd 商店 —— 裸 Bearer 直接 200，不校验 DPoP。
+    所以 dpop 模式下不再裸打 userinfo，puuid 用库里的；库里没有才走带证明的
+    riot_dpop.userinfo 补一次。
+    """
     region = (region or "ap").lower()
     shard = _REGION_SHARD.get(region)
     if not shard:
         return {"error": f"未知 region: {region}（可用 ap/na/eu/kr/latam/br）"}
 
-    info = await account_info(access_token)
-    if info.get("error"):
-        return info
+    info = dict(account or {})
+    if not info.get("puuid"):
+        info = await account_info(access_token)
+        if info.get("error"):
+            return info
     puuid = info.get("puuid") or ""
     if not puuid:
         return {"error": "令牌里没有 puuid，请重新登录后再粘贴一次"}
@@ -624,6 +636,7 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
     """
     try:
         from build_mcp.web import store as _webstore
+        from build_mcp.services import riot_dpop
         row = (_webstore.get_riot_binding(int(uid)) if uid else None) \
             or _webstore.latest_riot_binding()
     except Exception as e:                                    # noqa: BLE001
@@ -639,6 +652,7 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
     mode = "token"
 
     # ① DPoP（首选）：令牌没过期就直接用；过期了就用私钥 + refresh_token 换新的
+    account: Optional[Dict[str, str]] = None
     if dpop_jwk and refresh:
         mode = "dpop"
         expires_at = float(row.get("token_expires_at") or 0)
@@ -651,6 +665,24 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
                 token = got["access_token"]
             elif not token:
                 return {"error": got.get("error") or "登录状态已失效，请重新绑定"}
+        # DPoP 令牌是发送方约束的：userinfo 裸 Bearer 必 401（2026-09-23 实测）。
+        # puuid/名字绑定时就入库了，直接用；没有才带 DPoP 证明补取一次。
+        account = {"puuid": row.get("puuid") or "",
+                   "game_name": row.get("game_name") or "",
+                   "tag_line": row.get("tag_line") or ""}
+        if not account["puuid"]:
+            try:
+                jwk = json.loads(dpop_jwk)
+                st, raw = await riot_dpop._run(riot_dpop._get_json_sync,
+                                               riot_dpop.USERINFO_ENDPOINT, jwk, token)
+                if st == 200:
+                    j = json.loads(raw)
+                    acct = j.get("acct") or {}
+                    account = {"puuid": j.get("sub") or acct.get("puuid") or "",
+                               "game_name": j.get("gameName") or acct.get("game_name") or "",
+                               "tag_line": j.get("tagLine") or acct.get("tag_line") or ""}
+            except Exception as e:                        # noqa: BLE001
+                logger.warning("DPoP userinfo 补取失败：%s", e)
     # ② 老路线：ssid cookie 换令牌
     elif ssid:
         mode = "cookie"

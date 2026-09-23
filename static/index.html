@@ -2443,7 +2443,7 @@ function riotRender(){
       const d=await riotApi('/api/riot/dpop/start',{method:'POST',
         headers:{'Content-Type':'application/json'},body:JSON.stringify({region:region})});
       if(w) w.location.href=d.login_url; else window.open(d.login_url,'_blank');
-      riotNote('✅ 已打开拳头登录页。登录后会跳到一个打不开的 localhost 页面 —— 那是正常的，把地址栏那条完整地址复制到下面第 ② 步。','');
+      riotNote('✅ 已打开拳头登录页。登录后会跳到一个打不开的 localhost 页面 —— 那是正常的，把地址栏那条完整地址复制到下面第 ② 步。（若没显示登录页、直接到了 localhost：是复用了之前的登录会话，属正常，照常复制地址即可。）','');
     }catch(e){ if(w) try{w.close()}catch(_){} riotNote('⚠️ '+riotEsc(e.message),'err'); }
     finally{ riotBusy=false; dstart.disabled=false; }
   };
