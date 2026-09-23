@@ -142,7 +142,25 @@ CREATE TABLE IF NOT EXISTS riot_bindings(
   puuid        TEXT NOT NULL DEFAULT '',
   game_name    TEXT NOT NULL DEFAULT '',
   tag_line     TEXT NOT NULL DEFAULT '',
+  -- DPoP 路线（2026-09-23）：refresh_token + 本地 ES256 私钥 = 不用 cookie 的长期续期。
+  -- dpop_jwk 是**含私钥分量**的 JWK(JSON 文本) —— 视同密码：不进日志、不外发。
+  dpop_jwk     TEXT NOT NULL DEFAULT '',
+  refresh_token TEXT NOT NULL DEFAULT '',
+  id_token     TEXT NOT NULL DEFAULT '',
+  token_expires_at REAL NOT NULL DEFAULT 0,
   updated_at   REAL NOT NULL DEFAULT 0
+);
+
+-- DPoP 登录的中间态：用户在浏览器里登录那几分钟，PKCE 的 code_verifier 和本次生成的
+-- DPoP 私钥必须先存着（verifier 要和 challenge 配同一份，私钥更不能离开服务器）。
+-- 每人同时只保留一次进行中的登录（PRIMARY KEY user_id），回贴授权码后立刻删。
+CREATE TABLE IF NOT EXISTS riot_auth_pending(
+  user_id       INTEGER PRIMARY KEY,
+  region        TEXT NOT NULL DEFAULT 'ap',
+  code_verifier TEXT NOT NULL DEFAULT '',
+  dpop_jwk      TEXT NOT NULL DEFAULT '',
+  redirect_uri  TEXT NOT NULL DEFAULT '',
+  created_at    REAL NOT NULL DEFAULT 0
 );
 
 -- IM（QQ 群/单聊）滚动摘要：超出「最近 10 条原文」窗口的旧消息，由后台任务
@@ -210,9 +228,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE im_abuses ADD COLUMN last_name TEXT NOT NULL DEFAULT ''")
 
     # Riot 绑定：老库没有 ssid 列 → 补上（ssid 用于长期免登录自动换令牌）
+    # 2026-09-23 新增 DPoP 四列，同样只能走 ALTER：
+    #   dpop_jwk（含私钥的 JWK）/ refresh_token / id_token / token_expires_at。
+    # ⚠️ 这四列【不能】在 SCHEMA 里加索引或触发器 —— 老库的 CREATE TABLE 是空操作，
+    #    建索引时会报 no such column 而服务直接起不来（2026-09-17 已踩过一次）。
     rcols = {r[1] for r in conn.execute("PRAGMA table_info(riot_bindings)")}
-    if rcols and "ssid" not in rcols:
-        conn.execute("ALTER TABLE riot_bindings ADD COLUMN ssid TEXT NOT NULL DEFAULT ''")
+    for _col, _ddl in (("ssid", "TEXT NOT NULL DEFAULT ''"),
+                       ("dpop_jwk", "TEXT NOT NULL DEFAULT ''"),
+                       ("refresh_token", "TEXT NOT NULL DEFAULT ''"),
+                       ("id_token", "TEXT NOT NULL DEFAULT ''"),
+                       ("token_expires_at", "REAL NOT NULL DEFAULT 0")):
+        if rcols and _col not in rcols:
+            conn.execute(f"ALTER TABLE riot_bindings ADD COLUMN {_col} {_ddl}")
 
 
 def init_db(import_env_codes: str = ""):
@@ -762,10 +789,26 @@ def _main():
 
 # ── Riot（拳头）账号绑定 ─────────────────────────────────────────────────────
 
+def _riot_same_account(conn: sqlite3.Connection, user_id: int, puuid: str) -> bool:
+    """这次绑定的是不是「同一个拳头账号」（按 puuid 认）。
+
+    为什么要问这个：一个用户身上现在能存**两套**凭证（老的 ssid cookie + 新的 DPoP），
+    而 DPoP 优先级更高。如果先用 DPoP 绑了账号 A、又用 ssid 绑了账号 B，两套并存的话
+    查出来永远是 A —— 「绑的是 B、查的是 A」这种鬼打墙。所以：
+      · puuid 相同（重新登录/换凭证）→ 两套都留着，互为兜底；
+      · puuid 不同（换账号了）      → 清掉另一套，避免查错人。
+    """
+    if not puuid:
+        return False                                   # 认不出来就按「换了」处理，宁可清干净
+    row = conn.execute("SELECT puuid FROM riot_bindings WHERE user_id=?",
+                       (int(user_id),)).fetchone()
+    return bool(row and row[0] and row[0] == puuid)
+
+
 def save_riot_binding(user_id: int, region: str, access_token: str,
                       puuid: str = "", game_name: str = "", tag_line: str = "",
                       ssid: Optional[str] = None) -> None:
-    """保存/覆盖某用户的 Riot 绑定。
+    """保存/覆盖某用户的 Riot 绑定（老的 cookie / 1 小时令牌路线）。
 
     access_token 是浏览器登录换来的短期令牌（1 小时）；
     ssid 是长期 cookie，有它后台就能自动续令牌（不传/空 = 保留库里已有的，不会被清掉）。
@@ -776,10 +819,14 @@ def save_riot_binding(user_id: int, region: str, access_token: str,
         （NOT NULL 不是「冲突」，是立即中止）→ 接口 500。所以用 COALESCE(?,'')。
       · 原来的 `CASE WHEN excluded.ssid IS NULL` 是**死分支**（NULL 根本插不进来），
         要判的是空串 `''`。
+
+    2026-09-23 补充：换了拳头账号（puuid 变了）时顺手清掉 DPoP 那套凭证，
+    见 _riot_same_account。
     """
     conn = _conn()
     try:
         with conn:
+            same = int(_riot_same_account(conn, user_id, puuid))
             conn.execute(
                 "INSERT INTO riot_bindings(user_id,region,access_token,ssid,puuid,game_name,tag_line,updated_at)"
                 " VALUES(?,?,?,COALESCE(?,''),?,?,?,?)"
@@ -787,9 +834,111 @@ def save_riot_binding(user_id: int, region: str, access_token: str,
                 " access_token=excluded.access_token,"
                 " ssid=CASE WHEN excluded.ssid = '' THEN riot_bindings.ssid ELSE excluded.ssid END,"
                 " puuid=excluded.puuid, game_name=excluded.game_name, tag_line=excluded.tag_line,"
+                " dpop_jwk=CASE WHEN ?=1 THEN riot_bindings.dpop_jwk ELSE '' END,"
+                " refresh_token=CASE WHEN ?=1 THEN riot_bindings.refresh_token ELSE '' END,"
+                " id_token=CASE WHEN ?=1 THEN riot_bindings.id_token ELSE '' END,"
+                " token_expires_at=CASE WHEN ?=1 THEN riot_bindings.token_expires_at ELSE 0 END,"
                 " updated_at=excluded.updated_at",
-                (int(user_id), region or "ap", access_token, ssid, puuid, game_name, tag_line, time.time()),
+                (int(user_id), region or "ap", access_token, ssid, puuid, game_name, tag_line,
+                 time.time(), same, same, same, same),
             )
+    finally:
+        conn.close()
+
+
+def save_riot_dpop_binding(user_id: int, region: str, dpop_jwk: str, access_token: str,
+                           refresh_token: str, id_token: str, expires_at: float,
+                           puuid: str = "", game_name: str = "", tag_line: str = "") -> None:
+    """保存 DPoP 长期绑定：refresh_token + 该账号专用的 ES256 私钥。
+
+    dpop_jwk 是**含私钥分量**的 JWK(JSON 文本) —— 视同密码，绝不写日志、不外发。
+    region/access_token/puuid 等和 save_riot_binding 语义一致；ssid 只在「同一个账号」
+    时保留（换账号就清掉，理由见 _riot_same_account）。
+    """
+    conn = _conn()
+    try:
+        with conn:
+            same = int(_riot_same_account(conn, user_id, puuid))
+            conn.execute(
+                "INSERT INTO riot_bindings(user_id,region,access_token,ssid,puuid,game_name,"
+                " tag_line,dpop_jwk,refresh_token,id_token,token_expires_at,updated_at)"
+                " VALUES(?,?,?,'',?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(user_id) DO UPDATE SET region=excluded.region,"
+                " access_token=excluded.access_token, puuid=excluded.puuid,"
+                " game_name=excluded.game_name, tag_line=excluded.tag_line,"
+                " dpop_jwk=excluded.dpop_jwk, refresh_token=excluded.refresh_token,"
+                " id_token=excluded.id_token, token_expires_at=excluded.token_expires_at,"
+                " ssid=CASE WHEN ?=1 THEN riot_bindings.ssid ELSE '' END,"
+                " updated_at=excluded.updated_at",
+                (int(user_id), region or "ap", access_token, puuid, game_name, tag_line,
+                 dpop_jwk, refresh_token, id_token, float(expires_at or 0), time.time(), same),
+            )
+    finally:
+        conn.close()
+
+
+def update_riot_dpop_tokens(user_id: int, access_token: str, expires_at: float = 0,
+                            refresh_token: Optional[str] = None,
+                            id_token: Optional[str] = None) -> None:
+    """DPoP 续期后回写令牌。
+
+    ⚠️ refresh_token 会**轮换**：Riot 每次续期可能发一张新的，必须回写；
+    不回写就等于抱着旧的那张去续期，下一次必失败 —— 和 ssid 轮换是同一类坑
+    （RIOT.md 里「第一次能查、第二次说失效」的根因）。
+    """
+    if not access_token:
+        return
+    sets = ["access_token=?", "token_expires_at=?", "updated_at=?"]
+    params: list = [access_token, float(expires_at or 0), time.time()]
+    if refresh_token:
+        sets.append("refresh_token=?")
+        params.append(refresh_token)
+    if id_token:
+        sets.append("id_token=?")
+        params.append(id_token)
+    params.append(int(user_id))
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(f"UPDATE riot_bindings SET {', '.join(sets)} WHERE user_id=?", params)
+    finally:
+        conn.close()
+
+
+def save_riot_pending(user_id: int, code_verifier: str, dpop_jwk: str,
+                      region: str = "ap", redirect_uri: str = "") -> None:
+    """暂存一次进行中的 DPoP 登录（PKCE verifier + 本次私钥）。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO riot_auth_pending(user_id,region,code_verifier,dpop_jwk,"
+                " redirect_uri,created_at) VALUES(?,?,?,?,?,?)"
+                " ON CONFLICT(user_id) DO UPDATE SET region=excluded.region,"
+                " code_verifier=excluded.code_verifier, dpop_jwk=excluded.dpop_jwk,"
+                " redirect_uri=excluded.redirect_uri, created_at=excluded.created_at",
+                (int(user_id), region or "ap", code_verifier, dpop_jwk, redirect_uri, time.time()),
+            )
+    finally:
+        conn.close()
+
+
+def get_riot_pending(user_id: int) -> Optional[dict]:
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM riot_auth_pending WHERE user_id=?",
+                           (int(user_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def clear_riot_pending(user_id: int) -> None:
+    """授权码用过即删：授权码是一次性的，暂存的私钥没必要再留着。"""
+    conn = _conn()
+    try:
+        with conn:
+            conn.execute("DELETE FROM riot_auth_pending WHERE user_id=?", (int(user_id),))
     finally:
         conn.close()
 
@@ -827,10 +976,12 @@ def get_riot_binding(user_id: int) -> Optional[dict]:
 
 
 def clear_riot_binding(user_id: int) -> None:
+    """解绑：连进行中的 DPoP 登录一起清掉（否则半截的私钥还留在库里）。"""
     conn = _conn()
     try:
         with conn:
             conn.execute("DELETE FROM riot_bindings WHERE user_id=?", (int(user_id),))
+            conn.execute("DELETE FROM riot_auth_pending WHERE user_id=?", (int(user_id),))
     finally:
         conn.close()
 

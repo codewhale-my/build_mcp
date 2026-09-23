@@ -483,20 +483,29 @@ async def account_info(access_token: str) -> Dict[str, Any]:
 
 async def _entitlements_token(access_token: str) -> str:
     """取 entitlements JWT —— pd.*.a.pvp.net 的商店接口必须带 X-Riot-Entitlements-JWT，
-    缺了就是 403 MISSING_ENTITLEMENT。两个端点/键名都兼容（官方文档里混用过）。"""
-    for url in ("https://entitlements.auth.riotgames.com/api/token/v1",
-                "https://entitlements.auth.riotgames.com/api/token/entitlements"):
-        st, raw = await _http(url, method="POST",
-                              headers={"Authorization": f"Bearer {access_token}"})
-        if st != 200:
-            continue
-        try:
-            j = json.loads(raw)
-        except Exception:                             # noqa: BLE001
-            continue
-        ent = j.get("entitlements_token") or j.get("token") or ""
-        if ent:
-            return ent
+    缺了就是 403 MISSING_ENTITLEMENT。
+
+    两个端点/键名都兼容（官方文档里混用过）。另外 2026-09-23 补一条：DPoP 路线
+    （client_id=ritoplus）实测要带 `{"urn":"urn:entitlement:%"}` 的 JSON 体才给令牌
+    —— 参考实现 riot-auth-dpop-js 的 fetchEntitlements 就是这么调的，所以空 body
+    拿不到时再带体试一轮。键名多认一个 entitlement_token（它用的就是这个）。
+    """
+    urls = ("https://entitlements.auth.riotgames.com/api/token/v1",
+            "https://entitlements.auth.riotgames.com/api/token/entitlements")
+    hdrs = {"Authorization": f"Bearer {access_token}"}
+    for body in (None, {"urn": "urn:entitlement:%"}):
+        for url in urls:
+            st, raw = await _http(url, method="POST", body=body, headers=hdrs)
+            if st != 200:
+                continue
+            try:
+                j = json.loads(raw)
+            except Exception:                         # noqa: BLE001
+                continue
+            ent = (j.get("entitlements_token") or j.get("token")
+                   or j.get("entitlement_token") or "")
+            if ent:
+                return ent
     return ""
 
 
@@ -577,11 +586,41 @@ async def store_with_token(access_token: str, region: str = "ap") -> Dict[str, A
     }
 
 
+async def _dpop_refresh(row: dict) -> Dict[str, Any]:
+    """用 DPoP 的 refresh_token + 本地私钥换一张新令牌，并把轮换后的凭证回写库里。"""
+    from build_mcp.services import riot_dpop
+    from build_mcp.web import store as _webstore
+    try:
+        jwk = json.loads(row.get("dpop_jwk") or "{}")
+    except Exception:                                 # noqa: BLE001
+        return {"error": "本机存的 DPoP 私钥解析失败，请重新绑定一次"}
+    if not jwk.get("d"):
+        return {"error": "本机存的 DPoP 私钥不完整，请重新绑定一次"}
+    got = await riot_dpop.refresh_tokens(jwk, row.get("refresh_token") or "",
+                                         row.get("id_token") or "")
+    if got.get("access_token"):
+        try:
+            # ★ refresh_token 会轮换，必须回写（不回写下次续期就拿着旧的去撞）
+            _webstore.update_riot_dpop_tokens(int(row["user_id"]), got["access_token"],
+                                              got.get("expires_at") or 0,
+                                              refresh_token=got.get("refresh_token") or None,
+                                              id_token=got.get("id_token") or None)
+        except Exception as e:                        # noqa: BLE001  回写失败不影响本次查询
+            logger.warning("DPoP 续期回写入库失败：%s", e)
+    return got
+
+
 async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]:
     """用已绑定的账号查每日商店。
 
     uid 指定时查那个用户自己的绑定（群里每个人各绑各的）；
     不指定则回退到最近一次绑定（兼容老调用）。
+
+    认证优先级（2026-09-23 起，返回值里的 auth_mode 会写明这次走的哪条）：
+      ① **dpop**：refresh_token + 本地 ES256 私钥 —— 不碰 cookie 的长期续期，首选；
+      ② **cookie**：老的 ssid cookie 路线，保留做兜底；
+      ③ **token**：只有一张 1 小时的短期令牌（最早那种，随时会过期）。
+    DPoP 令牌若过不了商店接口（401/403）而手里还有 ssid，会自动退回 cookie 再试一次。
     """
     try:
         from build_mcp.web import store as _webstore
@@ -595,9 +634,26 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
     region = (region or row.get("region") or "ap").lower()
     token = row.get("access_token") or ""
     ssid = row.get("ssid") or ""
+    dpop_jwk = row.get("dpop_jwk") or ""
+    refresh = row.get("refresh_token") or ""
+    mode = "token"
 
-    # 长期绑定：有 ssid 就每次换一张新令牌（access_token 只有 1 小时，不换必过期）
-    if ssid:
+    # ① DPoP（首选）：令牌没过期就直接用；过期了就用私钥 + refresh_token 换新的
+    if dpop_jwk and refresh:
+        mode = "dpop"
+        expires_at = float(row.get("token_expires_at") or 0)
+        if token and expires_at > time.time() + 60:
+            logger.info("🎮 DPoP 令牌仍有 %d 秒有效期，直接用不续期",
+                        int(expires_at - time.time()))
+        else:
+            got = await _dpop_refresh(row)
+            if got.get("access_token"):
+                token = got["access_token"]
+            elif not token:
+                return {"error": got.get("error") or "登录状态已失效，请重新绑定"}
+    # ② 老路线：ssid cookie 换令牌
+    elif ssid:
+        mode = "cookie"
         got = await cookie_login(ssid)
         if got.get("access_token"):
             token = got["access_token"]
@@ -606,7 +662,7 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
                 #   下一次续期就会因为 ssid 已被轮换而失效。
                 _webstore.update_riot_access_token(int(row["user_id"]), token,
                                                    ssid=got.get("new_cookie"))
-            except Exception as e:                        # noqa: BLE001  刷新不影响本次查询
+            except Exception as e:                            # noqa: BLE001  刷新不影响本次查询
                 logger.warning("刷新 Riot 令牌入库失败：%s", e)
         elif not token:
             return {"error": got.get("error") or "登录状态已失效，请重新绑定"}
@@ -614,7 +670,25 @@ async def bound_daily_store(region: str = "", uid: Any = None) -> Dict[str, Any]
     if not token:
         return {"error": "还没绑定 Riot 账号：请打开绑定链接登录一次"}
     res = await store_with_token(token, region)
+    res["auth_mode"] = mode
+
+    # ③ DPoP 的令牌过不了商店接口时，手里还有 ssid 就退回 cookie 再试一次
+    #    —— 「DPoP 令牌能不能过 pd/glz 那套商店接口」是移植时唯一的未知数，
+    #    别让一个未知数把整块功能拖死。
+    if (res.get("error") and mode == "dpop" and ssid
+            and any(c in str(res.get("error")) for c in ("401", "403"))):
+        logger.warning("⚠️ DPoP 令牌查商店失败（%s），退回 ssid cookie 再试一次",
+                       str(res.get("error"))[:80])
+        got = await cookie_login(ssid)
+        if got.get("access_token"):
+            retry = await store_with_token(got["access_token"], region)
+            if not retry.get("error"):
+                retry["auth_mode"] = "cookie-fallback"
+                return retry
+            res["error"] += "（用 ssid 兜底重试同样失败）"
+
     if res.get("error") and ("401" in str(res.get("error")) or "403" in str(res.get("error"))):
-        res["error"] += ("（登录已彻底失效：请打开绑定页，点「换账号 / 重新绑定」重新登录一次拳头账号即可）" if ssid
-                         else "（如想长期免登录，请在绑定页粘贴一次 ssid）")
+        res["error"] += ("（登录已彻底失效：请打开绑定页，点「换账号 / 重新绑定」重新登录一次拳头账号即可）"
+                         if (ssid or refresh)
+                         else "（如想长期免登录，请在绑定页用「一键登录」重新绑定一次）")
     return res

@@ -69,6 +69,11 @@ from build_mcp.web import im_guard
 from build_mcp.web.store import (
     init_db,
     save_riot_binding,        # 瓦洛兰特：浏览器登录后回填令牌
+    save_riot_dpop_binding,   # 瓦洛兰特：DPoP(OAuth+PKCE) 长期绑定
+    update_riot_dpop_tokens,  # 瓦洛兰特：DPoP 续期后回写令牌
+    save_riot_pending,        # 瓦洛兰特：DPoP 登录中间态(PKCE verifier + 私钥)
+    get_riot_pending,
+    clear_riot_pending,
     get_riot_binding,
     clear_riot_binding,
     get_user_by_id,
@@ -501,6 +506,7 @@ def _check_admin_accounts() -> None:
 TOKEN_TTL = int(os.environ.get("MCP_WEB_TOKEN_TTL", str(12 * 3600)))   # token 有效期(秒)
 LOGIN_WINDOW = int(os.environ.get("MCP_WEB_LOGIN_WINDOW", "300"))       # 登录限流窗口(秒)
 LOGIN_MAX_ATTEMPTS = int(os.environ.get("MCP_WEB_LOGIN_MAX", "20"))     # 窗口内最多尝试次数
+
 INVITE_CODES = os.environ.get("MCP_WEB_INVITE_CODES", "").strip()
 if not INVITE_CODES:
     logger.warning(
@@ -1210,18 +1216,22 @@ def _start_qq_bridge() -> Optional[asyncio.Task]:
             key = f"qq:{host['id']}"
             if b.get("access_token") or b.get("ssid"):
                 who = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#") or "已绑定账号"
-                life = "长期有效（已存长期登录，过期会自动续）" if b.get("ssid") else "只有 1 小时有效，随时可能过期"
+                long_term = _riot_persistent(b)
+                life = ("长期有效（已存长期登录凭证，过期会自动续期，不用再登）" if long_term
+                        else "只有 1 小时有效，随时可能过期")
                 return (f"\n\n[拳头账号] 该用户已绑定 Riot 账号 {who}（区服 {b.get('region','ap')}，"
                         f"授权状态：{life}）。"
                         f"他问每日商店时直接调用 valorant_daily_store(bind_key=\"{key}\")，"
                         "不要向他要账号密码，也不要说没有权限。"
-                        + ("" if b.get("ssid") else
+                        + ("" if long_term else
                            "如果查询报「登录已失效」，把绑定链接再发他一条，"
-                           "并说明这次建议按页面提示粘贴 ssid，之后就长期不用再登了。"))
+                           "并说明这次要在页面上点「一键登录」重新授权一次，之后就长期不用再登了。"))
             url = f"{public_base_url()}/riot.html?t={riot_token.make_token(host['id'])}"
             return ("\n\n[拳头账号] 该用户【还没绑定】Riot 账号。他问每日商店/皮肤时，"
-                    "把下面这条链接原样发给他（30 分钟内有效，手机浏览器或 QQ 内置浏览器打开即可）。"
-                    "页面会引导他完成 curl 绑定，绑好后你就能直接查到他的商店：\n" + url)
+                    "把下面这条链接原样发给他（30 分钟内有效）。"
+                    "页面会引导他点「一键登录」：打开拳头官方登录页登一次，之后长期免登录。"
+                    "提醒他用系统浏览器（Chrome/Edge/Safari）打开，QQ 内置浏览器可能看不到地址栏。"
+                    "绑好后你就能直接查到他的商店：\n" + url)
         except Exception as e:               # noqa: BLE001  绑定信息拿不到不能影响对话
             logger.warning("⚠️ 生成拳头绑定提示失败：%s", e)
             return ""
@@ -2496,6 +2506,108 @@ def public_base_url() -> str:
     return os.environ.get("MCP_PUBLIC_BASE", "https://47.108.234.194").rstrip("/")
 
 
+def _riot_persistent(b: dict) -> bool:
+    """这个绑定是不是「长期免登录」（DPoP 的 refresh_token + 私钥，或老的 ssid cookie）。"""
+    return bool(b.get("ssid") or (b.get("dpop_jwk") and b.get("refresh_token")))
+
+
+# ── DPoP：OAuth 2.0 授权码 + PKCE + 令牌绑定（「登录一次，之后永久免登」的正解）──
+# 老的两条路降为备选：
+#   · ssid cookie：会轮换、登录会话约三周就烂，还必须整包发（少一个 cookie 就被 303 踢回登录页）；
+#   · 贴登录地址：只换来一张 1 小时的令牌。
+# DPoP 把令牌和「本机这把 ES256 私钥」绑死（access_token 的 cnf.jkt），之后只用
+# refresh_token + 私钥续期 —— 不碰 cookie，也不必再开浏览器。
+# 服务器上**不开浏览器**：authorize 链接递给【用户自己的浏览器】打开（Riot 只信任
+# 真实浏览器，机房 IP 一律人机验证）。登录后浏览器跳到 http://localhost/redirect?code=…
+# —— 本机没服务会打不开，但地址栏里留着 code，用户把整条地址粘回来即可。
+# 交互和老的「③ 贴地址」一样，换来的是长期免登。算法细节见 services/riot_dpop.py。
+
+class RiotDpopStartRequest(BaseModel):
+    """发起 DPoP 登录：t = 群友那条一次性链接的令牌（登录了网页的用户不用填）；region = 区服。"""
+    t: str = ""
+    region: str = "ap"
+
+
+class RiotDpopFinishRequest(BaseModel):
+    """收尾：raw = 用户粘贴的 http://localhost/redirect?code=… 整条地址（或光秃秃的 code）。"""
+    t: str = ""
+    raw: str = ""
+    region: str = "ap"
+
+
+async def _riot_dpop_start(uid: int, region: str) -> dict:
+    """生成 PKCE + 本次专用的 DPoP 私钥，暂存起来，返回给用户浏览器打开的登录地址。"""
+    from build_mcp.services import riot_dpop
+    verifier, challenge = riot_dpop.new_pkce()
+    jwk = riot_dpop.new_dpop_key()
+    save_riot_pending(uid, verifier, json.dumps(jwk), region, riot_dpop.REDIRECT_URI)
+    jkt = riot_dpop.jwk_thumbprint(riot_dpop.public_jwk(jwk))
+    logger.info("🎮 [DPoP] 发起登录 uid=%s region=%s jkt=%s…", uid, region, jkt[:10])
+    return {"ok": True, "login_url": riot_dpop.build_authorize_url(challenge),
+            "expires_in": riot_dpop.PENDING_TTL, "jkt": jkt}
+
+
+async def _riot_dpop_finish(uid: int, raw: str, region: str) -> dict:
+    """收尾：授权码 + 暂存的 verifier + DPoP 证明 → 长期令牌入库 → 立刻试查一次商店。"""
+    from build_mcp.services import riot_dpop
+    from build_mcp.services import valorant_sdk
+
+    pend = get_riot_pending(uid) or {}
+    if not pend or (time.time() - float(pend.get("created_at") or 0)) > riot_dpop.PENDING_TTL:
+        clear_riot_pending(uid)
+        raise HTTPException(status_code=400,
+                            detail=f"这次登录已经超时（{riot_dpop.PENDING_TTL // 60} 分钟有效），"
+                                   "请重新点「① 一键登录」发起一次")
+    code = riot_dpop.parse_code(raw)
+    if not code:
+        raise HTTPException(status_code=400,
+                            detail="没识别到授权码：请把登录后地址栏里那条 "
+                                   "http://localhost/redirect?code=… 的**完整地址**复制过来")
+    try:
+        jwk = json.loads(pend.get("dpop_jwk") or "{}")
+    except Exception:                      # noqa: BLE001
+        raise HTTPException(status_code=400, detail="登录会话数据损坏，请重新发起一次")
+
+    got = await riot_dpop.exchange_code(jwk, code, pend.get("code_verifier") or "",
+                                       pend.get("redirect_uri") or riot_dpop.REDIRECT_URI)
+    if got.get("error"):
+        raise HTTPException(status_code=400, detail=got["error"])
+    # 授权码是一次性的，换完立刻把暂存的私钥删掉（正式私钥随绑定入库）
+    clear_riot_pending(uid)
+
+    access_token = got["access_token"]
+    # 账号信息：先走老办法（纯 Bearer），拿不到再带着 DPoP 证明来一次
+    info = await valorant_sdk.account_info(access_token)
+    if info.get("error") or not info.get("puuid"):
+        d = await riot_dpop.userinfo(jwk, access_token)
+        if not d.get("error"):
+            info = d
+    if info.get("error"):
+        raise HTTPException(status_code=400, detail=info["error"])
+
+    exp_jkt = got.get("jkt") or ""
+    my_jkt = riot_dpop.jwk_thumbprint(riot_dpop.public_jwk(jwk))
+    player = f'{info.get("game_name","")}#{info.get("tag_line","")}'.strip("#")
+    save_riot_dpop_binding(uid, region, json.dumps(jwk), access_token,
+                           got.get("refresh_token") or "", got.get("id_token") or "",
+                           got.get("expires_at") or 0, info.get("puuid", ""),
+                           info.get("game_name", ""), info.get("tag_line", ""))
+    logger.info("🎮 [DPoP] uid=%s 绑定 %s（%s）；cnf.jkt 与本地公钥一致=%s；refresh_token=%s",
+                uid, player or "(未知)", region, bool(exp_jkt and exp_jkt == my_jkt),
+                "有" if got.get("refresh_token") else "无")
+
+    store_res = await valorant_sdk.bound_daily_store(region, uid=uid)
+    out = {"ok": True, "player": player, "region": region, "persistent": True,
+           # cnf.jkt 对齐 = 这才是「真的绑上了 DPoP」，出问题时常用来定位
+           "dpop_bound": bool(exp_jkt and exp_jkt == my_jkt), "store": store_res}
+    if not got.get("refresh_token"):
+        out["warn"] = "Riot 这次没发 refresh_token，绑定只能撑到令牌过期，请重新登录一次"
+    elif store_res.get("error"):
+        out["warn"] = ("绑定凭证已经存好了，但用这个令牌查商店失败：" + str(store_res["error"])[:120]
+                       + "（可以退到底部「备选」用 ssid 方式再绑一次）")
+    return out
+
+
 class RiotPubBindRequest(BaseModel):
     """群友/访客用的绑定请求：t = 机器人给的一次性令牌。
 
@@ -2518,8 +2630,29 @@ async def riot_pub_status(t: str = ""):
     b = get_riot_binding(uid) or {}
     name = f'{b.get("game_name","")}#{b.get("tag_line","")}'.strip("#")
     return {"bound": bool(b.get("access_token") or b.get("ssid")), "player": name,
-            "region": b.get("region") or "ap", "persistent": bool(b.get("ssid")),
+            "region": b.get("region") or "ap", "persistent": _riot_persistent(b),
+            "dpop": bool(b.get("dpop_jwk") and b.get("refresh_token")),
+            # DPoP 的 authorize 地址每次点都要现生成（PKCE + 私钥都是一次性的），
+            # 所以这里不给；前端点「①」时再 POST /api/riot/pub/dpop/start 拿。
             "login_url": valorant_sdk.RIOT_AUTH_URL}
+
+
+@app.post("/api/riot/pub/dpop/start")
+async def riot_pub_dpop_start(req: RiotDpopStartRequest):
+    """群友版：发起 DPoP 登录，返回要打开的一次性登录地址。"""
+    uid = riot_token.parse_token(req.t)
+    if not uid:
+        raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
+    return await _riot_dpop_start(uid, (req.region or "ap").strip().lower())
+
+
+@app.post("/api/riot/pub/dpop/finish")
+async def riot_pub_dpop_finish(req: RiotDpopFinishRequest):
+    """群友版：用回贴的地址换长期令牌并绑定。"""
+    uid = riot_token.parse_token(req.t)
+    if not uid:
+        raise HTTPException(status_code=400, detail="链接已失效或过期，请重新获取")
+    return await _riot_dpop_finish(uid, req.raw, (req.region or "ap").strip().lower())
 
 
 @app.post("/api/riot/pub/bind")
@@ -2582,7 +2715,7 @@ async def riot_pub_store(t: str = ""):
         logger.warning("⚠️ [IM] 查商店失败 uid=%s：%s", uid, str(e)[:200])
         raise HTTPException(status_code=400, detail=f"查询失败：{str(e)[:160]}")
     res = dict(res or {})
-    if res.get("error") and "401" in str(res.get("error")) and not b.get("ssid"):
+    if res.get("error") and "401" in str(res.get("error")) and not _riot_persistent(b):
         res["need_rebind"] = True
     return res
 
@@ -2605,10 +2738,23 @@ async def riot_status(user: dict = Depends(require_user)):
         "bound": bool(b.get("access_token") or b.get("ssid")),
         "player": name,
         "region": b.get("region") or "ap",
-        "persistent": bool(b.get("ssid")),
+        "persistent": _riot_persistent(b),
+        "dpop": bool(b.get("dpop_jwk") and b.get("refresh_token")),
         "updated_at": float(b.get("updated_at") or 0),
         "login_url": valorant_sdk.RIOT_AUTH_URL,
     }
+
+
+@app.post("/api/riot/dpop/start")
+async def riot_dpop_start(req: RiotDpopStartRequest, user: dict = Depends(require_user)):
+    """登录网页的用户：发起 DPoP 登录，返回要打开的一次性登录地址。"""
+    return await _riot_dpop_start(user["id"], (req.region or "ap").strip().lower())
+
+
+@app.post("/api/riot/dpop/finish")
+async def riot_dpop_finish(req: RiotDpopFinishRequest, user: dict = Depends(require_user)):
+    """登录网页的用户：用回贴的地址换长期令牌并绑定。"""
+    return await _riot_dpop_finish(user["id"], req.raw, (req.region or "ap").strip().lower())
 
 
 @app.post("/api/riot/bind")
@@ -2653,7 +2799,7 @@ async def riot_store(user: dict = Depends(require_user)):
     if not (b.get("access_token") or b.get("ssid")):
         raise HTTPException(status_code=404, detail="还没绑定 Riot 账号")
     res = dict(await valorant_sdk.bound_daily_store(b.get("region") or "ap", uid=user["id"]) or {})
-    if res.get("error") and "401" in str(res.get("error")) and not b.get("ssid"):
+    if res.get("error") and "401" in str(res.get("error")) and not _riot_persistent(b):
         res["need_rebind"] = True
     return res
 

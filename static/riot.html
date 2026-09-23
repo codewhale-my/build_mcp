@@ -50,6 +50,9 @@ summary{cursor:pointer;color:var(--accent);font-size:13px}
 details .tip{margin-top:8px}
 .hr{height:1px;background:var(--border);margin:16px 0 12px}
 .reco{font-size:12px;color:var(--ok);border:1px solid var(--ok);border-radius:20px;padding:1px 8px;margin-left:6px}
+.step2{display:none}
+.warnbox{margin-top:10px;font-size:13px;line-height:1.7;color:var(--err);
+  border:1px solid var(--err);border-radius:10px;padding:9px 11px}
 </style>
 </head>
 <body>
@@ -57,32 +60,11 @@ details .tip{margin-top:8px}
   <h1>🎮 绑定拳头账号</h1>
 
   <div class="card" id="bindCard">
-    <p class="step">Riot 对服务器 IP 强制人机验证，所以后台不能直接登录。你在<b>自己的浏览器登录一次</b>，
-      把登录凭证交给后台：<b>推荐用 ssid（长期有效，以后不用再登）</b>，拿不到 ssid 也可以只粘登录地址（1 小时）。</p>
+    <p class="step">Riot 对服务器 IP 强制人机验证，所以后台不能直接登录。做法是
+      <b>你在自己浏览器里登录一次</b>，把结果交给后台 —— 之后<b>长期免登录</b>，
+      机器人每天都能直接查你的每日商店。<span class="reco">推荐用①</span></p>
 
-    <p class="step" style="margin-top:14px"><b>①</b> 打开 Riot 官方登录页，登录你的拳头账号（需要能访问 Riot，通常要开代理）。</p>
-    <button class="primary" id="openBtn">① 打开 Riot 登录页</button>
-
-    <p class="step" style="margin-top:16px"><b>②</b> 登录成功后取出 <kbd>ssid</kbd>（长期凭证），粘贴到下面<span class="reco">一次搞定，永久免登</span></p>
-    <details>
-      <summary>怎么拿 ssid？（点开看步骤）</summary>
-      <div class="tip">
-        <b>电脑上（推荐，一次性）：</b><br>
-        1. 浏览器按 <kbd>F12</kbd> 打开开发者工具；<br>
-        2. 切到 <b>Application / 应用</b> → 左侧 <b>Cookies</b> → 点 <kbd>https://auth.riotgames.com</kbd>；<br>
-        3. 在列表里看 <b>「Name / 名称」这一列</b>，找到写 <kbd>ssid</kbd> 的那一行，复制这一行的 <b>Value</b>（约 230 字符）。<br>
-        <b>⚠️ 注意：</b>列表里 <code>ssid</code> 和 <code>tdid</code> 开头几乎一样（都是 <code>eyJhbGciOiJIUzI1Ni…</code>），
-        <b>必须认「Name 列」</b>，别按开头猜。<br>
-        <br>
-        <b>★ 最稳的方式（强推）：Copy as cURL</b> —— 在开发者工具 <b>Network / 网络</b> 里随便点一条 <kbd>auth.riotgames.com</kbd> 的请求 →
-        右键 → <b>Copy → Copy as cURL (bash)</b>，把整段文本直接粘到下面。这样会把登录后的<b>整包 Cookie</b> 一起交给后台，
-        比 单贴 ssid 成功率高得多（实测只发 ssid 可能被 Riot 拒）。<br>
-        <br>
-        <b>只有手机？</b>手机浏览器读不到 ssid，只能用下面「③ 备选」的地址方式（每次要重登）。想长期免登录，借台电脑操作一次即可。
-      </div>
-    </details>
-    <textarea id="ssid" rows="3" placeholder="粘贴 ssid 的值，或整段 Cookie / Copy as cURL 文本"></textarea>
-    <div class="row" style="margin-top:10px">
+    <div class="row" style="margin-bottom:4px">
       <select id="region">
         <option value="ap">亚太 AP</option>
         <option value="na">北美 NA</option>
@@ -93,27 +75,55 @@ details .tip{margin-top:8px}
       </select>
       <span class="tip">区服（国服不支持）</span>
     </div>
-    <button class="primary" id="bindBtn">② 绑定（长期免登录）</button>
+
+    <p class="step" style="margin-top:14px"><b>①</b> 点下面的按钮打开拳头官方登录页
+      （需要能访问 Riot，通常要开代理），登录你的拳头账号。</p>
+    <button class="primary" id="startBtn">① 一键登录（推荐 · 长期免登录）</button>
+
+    <div class="step2" id="step2">
+      <p class="step" style="margin-top:16px"><b>②</b> 登录成功后，浏览器会跳到一个
+        <b>打不开的</b> <kbd>localhost</kbd> 页面 —— <b>这是正常的</b>（你本机没有这个服务）。
+        别关页面，把<b>地址栏里那条完整地址</b>复制下来，粘到下面：</p>
+      <textarea id="code" rows="2" placeholder="粘贴 http://localhost/redirect?code=... 整条地址"></textarea>
+      <button class="primary" id="finishBtn">② 完成绑定</button>
+      <p class="tip" style="margin-top:8px">手机上长按地址栏复制即可；地址里那段
+        <kbd>code=</kbd> 后面的一次性授权码只能使用一次，粘完就别刷新了。</p>
+    </div>
 
     <div class="hr"></div>
-    <p class="step"><b>③ 备选（只有手机 / 拿不到 ssid）：</b>登录成功后地址栏会停在
-      <kbd>playvalorant.com/opt_in#access_token=…</kbd>，把<b>整条地址</b>复制粘贴到这里。</p>
-    <textarea id="raw" rows="2" placeholder="粘贴 https://playvalorant.com/opt_in#access_token=... 整条地址"></textarea>
-    <button id="bindRawBtn">③ 用登录地址绑定（仅 1 小时有效）</button>
+    <details>
+      <summary>备选方式（地址栏拿不到 / 只想绑 1 小时时用）</summary>
+
+      <p class="step" style="margin-top:10px"><b>A) 贴 ssid</b>（长期有效，但要手动翻 Cookie）：
+        打开 <kbd>auth.riotgames.com</kbd> 并登录后，按 <kbd>F12</kbd> →
+        <b>Application / 应用</b> → 左侧 <b>Cookies</b> → 点 <kbd>https://auth.riotgames.com</kbd> →
+        认 <b>「Name / 名称」这一列</b>里写 <kbd>ssid</kbd> 的那行，复制它的 <b>Value</b>。
+        <br>更省事的是在 <b>Network / 网络</b> 里随便点一条 <kbd>auth.riotgames.com</kbd> 的请求 →
+        右键 → <b>Copy → Copy as cURL (bash)</b>，整段文本粘进来。</p>
+      <textarea id="ssid" rows="3" placeholder="粘贴 ssid 的值，或整段 Cookie / Copy as cURL 文本"></textarea>
+      <button id="bindBtn">A) 用 ssid 绑定</button>
+
+      <p class="step" style="margin-top:14px"><b>B) 老的「贴登录地址」</b>：登录成功后地址栏会停在
+        <kbd>playvalorant.com/opt_in#access_token=…</kbd>，把<b>整条地址</b>粘到这里
+        （<b>仅 1 小时有效</b>，过期要重新来）。</p>
+      <textarea id="raw" rows="2" placeholder="粘贴 https://playvalorant.com/opt_in#access_token=... 整条地址"></textarea>
+      <button id="bindRawBtn">B) 用登录地址绑定</button>
+    </details>
+
     <div class="msg" id="msg"></div>
   </div>
 
   <div class="card hide" id="doneCard">
     <div class="acct" id="acct">已绑定</div>
     <div class="tip" id="meta"></div>
+    <div class="warnbox" id="warnbox" style="display:none"></div>
     <button class="primary" id="queryBtn">查一次我的每日商店</button>
     <button id="againBtn">换账号 / 重新绑定</button>
 
     <div class="hr" id="upTip"></div>
     <div id="upBox">
-      <p class="step">想让机器人<b>以后每天直接查、不用再登录</b>？把 ssid 粘到下面升级为长期绑定。</p>
-      <textarea id="ssid2" rows="2" placeholder="粘贴 ssid 的值，或整段 Cookie / Copy as cURL 文本"></textarea>
-      <button id="upBtn">升级为长期免登录</button>
+      <p class="step">想让机器人<b>以后每天直接查、不用再登录</b>？点下面按钮用「一键登录」升级为长期绑定。</p>
+      <button id="upBtn">升级为长期免登录（一键登录）</button>
     </div>
 
     <div class="msg" id="msg2"></div>
@@ -122,7 +132,7 @@ details .tip{margin-top:8px}
 
   <div class="foot">
     链接 30 分钟内有效，只能绑到你自己的账号名下。<br>
-    用 ssid 绑定 = 长期有效（登录过期自动续）；用登录地址绑定 = 1 小时后失效，需再要一条链接。
+    「一键登录」与 ssid 绑定 = 长期有效，过期自动续；「贴登录地址」= 1 小时后失效，需再要一条链接。
   </div>
 </div>
 
@@ -132,6 +142,8 @@ var $=function(id){return document.getElementById(id)};
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function say(el,txt,cls){var e=$(el);e.className='msg '+(cls||'');e.innerHTML=txt||''}
+function warn(txt){var e=$('warnbox');if(!txt){e.style.display='none';e.innerHTML='';return}
+  e.style.display='block';e.innerHTML=txt}
 function left(sec){sec=Number(sec||0);if(!sec)return '—';
   var h=Math.floor(sec/3600),m=Math.floor(sec%3600/60);return (h?h+' 小时 ':'')+m+' 分'}
 function api(path,opt){
@@ -143,7 +155,8 @@ function api(path,opt){
     });
   });
 }
-function loginUrl(u){ if(u) window.open(u,'_blank'); }
+function json(body){return {method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)}}
 function renderStore(d){
   if(!d) return '';
   if(d.need_rebind) return '<div class="msg err">⚠️ '+esc(d.error||'登录已过期')+'</div>';
@@ -159,51 +172,64 @@ function showBound(st){
   $('bindCard').className='card hide';
   $('doneCard').className='card';
   $('acct').innerHTML='🎮 '+esc(st.player||'已绑定')+
-    (st.persistent?'<span class="badge good">长期有效</span>':'<span class="badge">仅 1 小时</span>');
-  $('meta').textContent='区服 '+String(st.region||'ap').toUpperCase()+
-    (st.persistent?' · 已存长期登录，过期自动续，不用再登':' · 登录令牌约 1 小时有效，过期要重新登录');
+    (st.persistent?'<span class="badge good">长期免登录</span>':'<span class="badge">仅 1 小时</span>');
+  var how = st.dpop ? 'DPoP 长期凭证（refresh_token + 本机私钥，不依赖 cookie）'
+          : (st.persistent ? '已存长期登录凭证（ssid），过期自动续'
+                           : '登录令牌约 1 小时有效，过期要重新登录');
+  $('meta').textContent='区服 '+String(st.region||'ap').toUpperCase()+' · '+how;
   var up = st.persistent ? 'none' : 'block';
   $('upBox').style.display=up; $('upTip').style.display=up;
 }
-function bind(payload,msgEl,btn,label){
-  if(btn){btn.disabled=true;}
-  say(msgEl,label||'正在验证并查询商店…');
-  api('/api/riot/pub/bind',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(payload)}).then(function(d){
-      showBound({player:d.player,region:d.region,persistent:d.persistent});
-      say('msg2',d.persistent?'✅ 绑定成功，以后不用再登录了':'✅ 绑定成功（1 小时内有效）','ok');
-      $('items').innerHTML=renderStore(d.store);
-    }).catch(function(e){ say(msgEl,'⚠️ '+esc(e.message),'err'); })
-    .then(function(){ if(btn){btn.disabled=false;} });
-}
-var loginUrlSaved='';
-api('/api/riot/pub?t='+encodeURIComponent(T)).then(function(st){
-  loginUrlSaved=st.login_url||'';
-  if(st.bound){ showBound(st); }
-  else { $('region').value=st.region||'ap'; }
-}).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); });
-
-$('openBtn').onclick=function(){ loginUrl(loginUrlSaved); };
+/* ① 一键登录：先同步开窗（避免被当弹窗拦截），拿到链接再跳 */
+$('startBtn').onclick=function(){
+  var b=$('startBtn'); b.disabled=true; say('msg','正在准备登录链接…');
+  var w=window.open('','_blank');
+  api('/api/riot/pub/dpop/start',json({t:T,region:$('region').value||'ap'})).then(function(d){
+    $('step2').style.display='block';
+    if(w){ w.location.href=d.login_url; } else { window.open(d.login_url,'_blank'); }
+    say('msg','✅ 已打开拳头登录页。登录后会跳到一个打不开的 localhost 页面 —— 那是正常的，'+
+             '把地址栏那条完整地址复制到下面第 ② 步。','ok');
+  }).catch(function(e){
+    if(w){ try{w.close()}catch(_){} }
+    say('msg','⚠️ '+esc(e.message),'err');
+  }).then(function(){ b.disabled=false; });
+};
+/* ② 完成绑定 */
+$('finishBtn').onclick=function(){
+  var raw=$('code').value.trim();
+  if(!raw){ say('msg','请先粘贴地址栏里那条 http://localhost/redirect?code=… 的完整地址','err'); return; }
+  var b=$('finishBtn'); b.disabled=true; warn(''); say('msg','正在用授权码换长期令牌并绑定…（最多十几秒）');
+  api('/api/riot/pub/dpop/finish',json({t:T,raw:raw,region:$('region').value||'ap'})).then(function(d){
+    showBound({player:d.player,region:d.region,persistent:true,dpop:!!d.dpop_bound});
+    if(d.warn){ warn('⚠️ '+esc(d.warn)); }
+    say('msg2', d.warn?'绑定指令已完成，但有一条提醒见上方 ↑':'✅ 绑定成功，以后不用再登录了',
+        d.warn?'':'ok');
+    $('items').innerHTML=renderStore(d.store);
+  }).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); })
+    .then(function(){ b.disabled=false; });
+};
+/* 备选 A：ssid / cURL */
 $('bindBtn').onclick=function(){
   var s=$('ssid').value.trim();
   if(!s){ say('msg','请先粘贴 ssid（或整段 Cookie / cURL）','err'); return; }
-  bind({t:T,ssid:s,region:$('region').value||'ap'},'msg',$('bindBtn'));
+  var b=$('bindBtn'); b.disabled=true; say('msg','正在验证并查询商店…');
+  api('/api/riot/pub/bind',json({t:T,ssid:s,region:$('region').value||'ap'})).then(function(d){
+    showBound({player:d.player,region:d.region,persistent:!!d.persistent,dpop:false});
+    say('msg2',d.persistent?'✅ 绑定成功，以后不用再登录了':'✅ 绑定成功（1 小时内有效）','ok');
+    $('items').innerHTML=renderStore(d.store);
+  }).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); })
+    .then(function(){ b.disabled=false; });
 };
+/* 备选 B：贴登录地址 */
 $('bindRawBtn').onclick=function(){
   var raw=$('raw').value.trim();
   if(!raw){ say('msg','请先粘贴登录后的整条地址','err'); return; }
-  bind({t:T,raw:raw,region:$('region').value||'ap'},'msg',$('bindRawBtn'));
-};
-$('upBtn').onclick=function(){
-  var s=$('ssid2').value.trim();
-  if(!s){ say('msg2','请先粘贴 ssid','err'); return; }
-  var b=$('upBtn'); b.disabled=true; say('msg2','升级中…');
-  api('/api/riot/pub/bind',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({t:T,ssid:s,region:$('region').value||'ap'})}).then(function(d){
-      showBound({player:d.player,region:d.region,persistent:d.persistent});
-      say('msg2','✅ 已升级为长期免登录','ok');
-      if(d.store){ $('items').innerHTML=renderStore(d.store); }
-    }).catch(function(e){ say('msg2','⚠️ '+esc(e.message),'err'); })
+  var b=$('bindRawBtn'); b.disabled=true; say('msg','正在验证并查询商店…');
+  api('/api/riot/pub/bind',json({t:T,raw:raw,region:$('region').value||'ap'})).then(function(d){
+    showBound({player:d.player,region:d.region,persistent:!!d.persistent,dpop:false});
+    say('msg2',d.persistent?'✅ 绑定成功，以后不用再登录了':'✅ 绑定成功（1 小时内有效）','ok');
+    $('items').innerHTML=renderStore(d.store);
+  }).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); })
     .then(function(){ b.disabled=false; });
 };
 $('queryBtn').onclick=function(){
@@ -216,7 +242,16 @@ $('queryBtn').onclick=function(){
 };
 $('againBtn').onclick=function(){
   $('bindCard').className='card'; $('doneCard').className='card hide';
+  warn(''); $('step2').style.display='none'; $('code').value='';
+  say('msg',''); say('msg2','');
 };
+$('upBtn').onclick=function(){ $('againBtn').click(); $('startBtn').focus();
+  say('msg','① 点上面的按钮走一遍「一键登录」，就能升级为长期免登录。'); };
+
+api('/api/riot/pub?t='+encodeURIComponent(T)).then(function(st){
+  if(st.bound){ showBound(st); }
+  else { $('region').value=st.region||'ap'; }
+}).catch(function(e){ say('msg','⚠️ '+esc(e.message),'err'); });
 </script>
 </body>
 </html>
